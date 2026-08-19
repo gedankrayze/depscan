@@ -56,6 +56,17 @@ Alternatively, build and execute the workspace binary directly:
 cargo run -p depscan-cli -- --help
 ```
 
+## Release artifacts
+
+Linux release binaries target musl on both supported architectures:
+
+| Target | Architecture | Runtime contract |
+|---|---|---|
+| `x86_64-unknown-linux-musl` | x86-64 | Statically linked ELF; no glibc or distribution packages required |
+| `aarch64-unknown-linux-musl` | ARM64 | Statically linked ELF; no glibc or distribution packages required |
+
+The static-Linux workflow builds each target natively on its matching GitHub runner, rejects any ELF dynamic-library requirement with `file` and `readelf`, executes `--help`, and runs an offline Cargo fixture in a read-only `scratch` container with networking disabled. The uploaded CI artifact includes the binary and its SHA-256 checksum. macOS and Windows remain native platform binaries; the complete publication workflow and platform matrix are tracked in DS-045.
+
 ## Usage
 
 ```text

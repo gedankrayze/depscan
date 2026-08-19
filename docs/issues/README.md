@@ -64,6 +64,6 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-043](DS-043.md) | P1 | Closed | Show yanked installed versions even when otherwise current |
 | [DS-044](DS-044.md) | P1 | Closed | Strengthen CLI help and typed value parsing |
 | [DS-045](DS-045.md) | P2 | Open | Generate release automation and complete the target matrix |
-| [DS-046](DS-046.md) | P2 | Open | Deliver and verify genuinely static Linux artifacts |
+| [DS-046](DS-046.md) | P2 | In progress | Deliver and verify genuinely static Linux artifacts |
 | [DS-047](DS-047.md) | P1 | Open | Make offline sync publication capability-safe during directory swaps |
 | [DS-048](DS-048.md) | P1 | Open | Make configuration and report file access capability-safe |

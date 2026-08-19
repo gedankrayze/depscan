@@ -1,0 +1,90 @@
+name: Static Linux
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-linux:
+    name: static (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    env:
+      CARGO_TARGET: ${{ matrix.target }}
+      RUST_IMAGE: rust:1.97.1-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install ELF inspection tools
+        run: sudo apt-get update && sudo apt-get install --yes binutils file
+      - name: Build natively against musl
+        run: |
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -v "$PWD:/work" \
+            -w /work \
+            -e CARGO_TARGET_DIR="/work/target/$CARGO_TARGET" \
+            "$RUST_IMAGE" \
+            sh -lc 'export PATH=/usr/local/cargo/bin:$PATH; apk add --no-cache build-base cmake perl; cargo build --release --locked -p depscan-cli'
+      - name: Verify static linkage and CLI startup
+        run: scripts/verify-static-linux.sh "target/$CARGO_TARGET/release/depscan"
+      - name: Prepare an offline smoke fixture
+        id: smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root=$(mktemp -d "${RUNNER_TEMP}/depscan-static-smoke.XXXXXX")
+          mkdir -p "$smoke_root/cache/offline" "$smoke_root/project" "$smoke_root/image"
+          cp fixtures/rust-sample/Cargo.toml fixtures/rust-sample/Cargo.lock "$smoke_root/project/"
+          printf '%s\n' '{"schema_version":1,"owner":"depscan"}' > "$smoke_root/cache/.depscan-cache.json"
+          python3 - "$smoke_root/cache/offline/crates_io.zip" <<'PY'
+          import sys
+          import zipfile
+
+          with zipfile.ZipFile(sys.argv[1], "w", compression=zipfile.ZIP_DEFLATED):
+              pass
+          PY
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > "$smoke_root/cache/offline/crates_io.synced-at"
+          cp "target/$CARGO_TARGET/release/depscan" "$smoke_root/image/depscan"
+          printf '%s\n' 'FROM scratch' 'COPY depscan /depscan' 'ENTRYPOINT ["/depscan"]' > "$smoke_root/image/Dockerfile"
+          printf 'root=%s\n' "$smoke_root" >> "$GITHUB_OUTPUT"
+      - name: Run in an empty container without network access
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root='${{ steps.smoke.outputs.root }}'
+          image="depscan-static-smoke:${CARGO_TARGET}"
+          docker build --tag "$image" "$smoke_root/image"
+          docker run --rm --network none --read-only "$image" --help >/dev/null
+          output=$(docker run --rm --network none --read-only \
+            -e DEPSCAN_CACHE_DIR=/cache \
+            -v "$smoke_root/cache:/cache:ro" \
+            -v "$smoke_root/project:/project:ro" \
+            "$image" scan --offline --format summary /project)
+          printf '%s\n' "$output"
+          grep -F '0 vulns' <<<"$output"
+      - name: Record artifact checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "target/$CARGO_TARGET/release"
+          sha256sum depscan > depscan.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: depscan-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/depscan
+            target/${{ matrix.target }}/release/depscan.sha256
+          if-no-files-found: error
