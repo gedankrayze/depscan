@@ -1,7 +1,7 @@
 //! Stable report renderers for human terminals and CI integrations.
 
 use depscan_core::{ScanDocument, ScanResult, Severity, Staleness};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,10 @@ pub fn render(
 
 pub fn render_table(document: &ScanDocument, color: bool) -> String {
     let totals = Totals::from_document(document);
-    let mut text = format!("depscan: {} packages scanned | {} vulnerable | {} outdated | {} suppressed | {} soft failures\n", totals.packages, totals.vulnerable, totals.outdated, totals.suppressed, totals.errors);
+    let mut text = format!(
+        "depscan: {} packages scanned | {} vulnerable | {} outdated | {} suppressed | {} soft failures\n",
+        totals.packages, totals.vulnerable, totals.outdated, totals.suppressed, totals.errors
+    );
     let mut grouped: BTreeMap<_, Vec<&ScanResult>> = BTreeMap::new();
     for result in &document.results {
         grouped
@@ -95,21 +98,21 @@ pub fn render_table(document: &ScanDocument, color: bool) -> String {
                     vuln.summary.lines().next().unwrap_or("No summary supplied")
                 ));
             }
-            if let Some(latest) = &result.latest {
-                if latest.staleness > Staleness::Current {
-                    let label = staleness_label(latest.staleness, color);
-                    text.push_str(&format!(
-                        "  {label:>8}  {} {} → {} available{}\n",
-                        result.package.display_name,
-                        result.package.version,
-                        latest.latest_stable,
-                        if latest.yanked {
-                            " (installed version yanked)"
-                        } else {
-                            ""
-                        }
-                    ));
-                }
+            if let Some(latest) = &result.latest
+                && latest.staleness > Staleness::Current
+            {
+                let label = staleness_label(latest.staleness, color);
+                text.push_str(&format!(
+                    "  {label:>8}  {} {} → {} available{}\n",
+                    result.package.display_name,
+                    result.package.version,
+                    latest.latest_stable,
+                    if latest.yanked {
+                        " (installed version yanked)"
+                    } else {
+                        ""
+                    }
+                ));
             }
             for error in &result.errors {
                 text.push_str(&format!(
@@ -309,8 +312,10 @@ mod tests {
             errors: vec![],
             suppressed: vec![],
         }]);
-        assert!(render(&doc, OutputFormat::Json, false)
-            .unwrap()
-            .contains("schema_version"));
+        assert!(
+            render(&doc, OutputFormat::Json, false)
+                .unwrap()
+                .contains("schema_version")
+        );
     }
 }

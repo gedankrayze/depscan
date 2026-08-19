@@ -1,8 +1,8 @@
 //! Offline, filesystem-only dependency parsers.
 
 use depscan_core::{DetectedSource, Ecosystem, EcosystemParser, Package, ParseError, SourceKind};
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use serde_json::Value as Json;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -152,17 +152,17 @@ fn node_direct_names(root: &Path) -> HashSet<String> {
         .into_iter()
         .filter(|p| p.file_name().and_then(|x| x.to_str()) == Some("package.json"))
     {
-        if let Ok(text) = fs::read_to_string(path) {
-            if let Ok(value) = serde_json::from_str::<Json>(&text) {
-                for key in [
-                    "dependencies",
-                    "devDependencies",
-                    "optionalDependencies",
-                    "peerDependencies",
-                ] {
-                    if let Some(obj) = value.get(key).and_then(Json::as_object) {
-                        names.extend(obj.keys().cloned());
-                    }
+        if let Ok(text) = fs::read_to_string(path)
+            && let Ok(value) = serde_json::from_str::<Json>(&text)
+        {
+            for key in [
+                "dependencies",
+                "devDependencies",
+                "optionalDependencies",
+                "peerDependencies",
+            ] {
+                if let Some(obj) = value.get(key).and_then(Json::as_object) {
+                    names.extend(obj.keys().cloned());
                 }
             }
         }
@@ -234,12 +234,12 @@ fn parse_bun_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                     .and_then(|a| a.first())
                     .and_then(Json::as_str)
             });
-            if let Some(version) = version {
-                if !name.starts_with("workspace:") {
-                    let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-                    p.direct = direct.contains(name);
-                    output.push(p);
-                }
+            if let Some(version) = version
+                && !name.starts_with("workspace:")
+            {
+                let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
+                p.direct = direct.contains(name);
+                output.push(p);
             }
         }
     }
@@ -299,16 +299,16 @@ fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
         .and_then(serde_yaml::Value::as_mapping)
     {
         for (key, entry) in packages {
-            if let Some(raw) = key.as_str() {
-                if let Some((name, version)) = parse_pnpm_key(raw) {
-                    let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-                    p.direct = direct.contains(&p.name);
-                    p.dev = entry
-                        .get("dev")
-                        .and_then(serde_yaml::Value::as_bool)
-                        .unwrap_or(false);
-                    out.push(p);
-                }
+            if let Some(raw) = key.as_str()
+                && let Some((name, version)) = parse_pnpm_key(raw)
+            {
+                let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
+                p.direct = direct.contains(&p.name);
+                p.dev = entry
+                    .get("dev")
+                    .and_then(serde_yaml::Value::as_bool)
+                    .unwrap_or(false);
+                out.push(p);
             }
         }
     }
@@ -513,13 +513,13 @@ fn parse_requirements(
             );
             p.direct = true;
             out.push(p);
-        } else if let Some(name) = line.split(['<', '>', '~', '!', '=', ';']).next() {
-            if !name.trim().is_empty() {
-                let mut p = Package::new(Ecosystem::PyPI, name.trim(), line, path.to_path_buf());
-                p.direct = true;
-                p.resolved_from_range = true;
-                out.push(p);
-            }
+        } else if let Some(name) = line.split(['<', '>', '~', '!', '=', ';']).next()
+            && !name.trim().is_empty()
+        {
+            let mut p = Package::new(Ecosystem::PyPI, name.trim(), line, path.to_path_buf());
+            p.direct = true;
+            p.resolved_from_range = true;
+            out.push(p);
         }
     }
     Ok(dedup(out))
@@ -696,21 +696,21 @@ fn cargo_direct_names(root: &Path) -> HashSet<String> {
         .into_iter()
         .filter(|p| p.file_name().and_then(|x| x.to_str()) == Some("Cargo.toml"))
     {
-        if let Ok(text) = fs::read_to_string(path) {
-            if let Ok(value) = text.parse::<Toml>() {
-                for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-                    if let Some(tbl) = value.get(section).and_then(Toml::as_table) {
-                        names.extend(tbl.keys().cloned());
-                    }
-                }
-                if let Some(tbl) = value
-                    .get("workspace")
-                    .and_then(Toml::as_table)
-                    .and_then(|x| x.get("dependencies"))
-                    .and_then(Toml::as_table)
-                {
+        if let Ok(text) = fs::read_to_string(path)
+            && let Ok(value) = text.parse::<Toml>()
+        {
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(tbl) = value.get(section).and_then(Toml::as_table) {
                     names.extend(tbl.keys().cloned());
                 }
+            }
+            if let Some(tbl) = value
+                .get("workspace")
+                .and_then(Toml::as_table)
+                .and_then(|x| x.get("dependencies"))
+                .and_then(Toml::as_table)
+            {
+                names.extend(tbl.keys().cloned());
             }
         }
     }

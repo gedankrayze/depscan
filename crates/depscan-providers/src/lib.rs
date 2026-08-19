@@ -4,20 +4,20 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use cvss::Cvss;
 use depscan_core::{
-    classify_staleness, compare_versions, normalize_name, osv_fixed_versions, osv_range_matches,
-    pypi_version_is_prerelease, pypi_version_is_stable, Ecosystem, LatestVersions, Package,
-    ProviderError, Severity, VersionProvider, VulnMap, VulnProvider, Vulnerability,
+    Ecosystem, LatestVersions, Package, ProviderError, Severity, VersionProvider, VulnMap,
+    VulnProvider, Vulnerability, classify_staleness, compare_versions, normalize_name,
+    osv_fixed_versions, osv_range_matches, pypi_version_is_prerelease, pypi_version_is_stable,
 };
 use directories::ProjectDirs;
 use fs2::FileExt;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use rand::Rng;
 use reqwest::{
-    header::{HeaderMap, HeaderValue, ACCEPT, ETAG, RETRY_AFTER},
     Client, StatusCode,
+    header::{ACCEPT, ETAG, HeaderMap, HeaderValue, RETRY_AFTER},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -997,8 +997,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use wiremock::{
-        matchers::{body_json, method, path},
         Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method, path},
     };
     use zip::write::SimpleFileOptions;
 

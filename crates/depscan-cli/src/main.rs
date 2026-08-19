@@ -7,10 +7,10 @@ use depscan_core::{
 };
 use depscan_parsers::ParserSet;
 use depscan_providers::{
-    sync_osv_dumps, Cache, CachePolicy, HttpClient, OsvClient, OsvOffline, RegistryClient,
+    Cache, CachePolicy, HttpClient, OsvClient, OsvOffline, RegistryClient, sync_osv_dumps,
 };
-use depscan_report::{render, OutputFormat};
-use futures::{stream, StreamExt};
+use depscan_report::{OutputFormat, render};
+use futures::{StreamExt, stream};
 use serde::Deserialize;
 use std::{
     collections::HashSet,

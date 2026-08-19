@@ -30,7 +30,7 @@ NuGet's split is intentional: its package identity and flat-container endpoint a
 
 ## Installation
 
-A current stable Rust toolchain is sufficient during development:
+The repository pins its development and release toolchain in `rust-toolchain.toml`:
 
 ```bash
 cargo install --path crates/depscan-cli
@@ -102,6 +102,8 @@ Offline scans use the downloaded per-ecosystem OSV archives. Registry freshness 
 
 ## Development
 
+The pinned toolchain is the latest verified stable patch (Rust 1.97.1 as of 2026-08-19). The supported MSRV follows an N−2 stable policy and is currently Rust 1.95.0. On each stable Rust release, refresh the pin, move the MSRV to the new N−2 release, update CI, and verify both toolchains before merging.
+
 The workspace is divided at its architectural boundaries:
 
 | Crate | Responsibility |
@@ -113,9 +115,9 @@ The workspace is divided at its architectural boundaries:
 | `depscan-cli` | CLI, config, orchestration, filters, and exit policy. |
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace --all-targets
 ```
 
 ## Known v0.1 limitations

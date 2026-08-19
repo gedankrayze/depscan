@@ -416,15 +416,15 @@ pub fn osv_range_matches(
                 || compare_versions(ecosystem, version, introduced) != Ordering::Less;
         }
         if active {
-            if let Some(fixed) = event.get("fixed").and_then(|v| v.as_str()) {
-                if compare_versions(ecosystem, version, fixed) != Ordering::Less {
-                    active = false;
-                }
+            if let Some(fixed) = event.get("fixed").and_then(|v| v.as_str())
+                && compare_versions(ecosystem, version, fixed) != Ordering::Less
+            {
+                active = false;
             }
-            if let Some(last) = event.get("last_affected").and_then(|v| v.as_str()) {
-                if compare_versions(ecosystem, version, last) == Ordering::Greater {
-                    active = false;
-                }
+            if let Some(last) = event.get("last_affected").and_then(|v| v.as_str())
+                && compare_versions(ecosystem, version, last) == Ordering::Greater
+            {
+                active = false;
             }
         }
     }
