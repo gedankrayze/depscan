@@ -1,0 +1,33 @@
+name: Release quality gate
+
+on:
+  workflow_call:
+
+permissions:
+  "contents": "read"
+
+jobs:
+  quality:
+    name: stable tests, lint, and packaging
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy --no-self-update
+      - name: Verify release workflow pins and permissions
+        run: scripts/verify-release-workflow.sh
+      - name: Check formatting
+        run: cargo +1.97.1 fmt --all -- --check
+      - name: Test every target
+        run: cargo +1.97.1 test --workspace --all-targets --locked
+      - name: Lint every target
+        run: cargo +1.97.1 clippy --all-targets -- -D warnings
+      - name: Verify publishable crate archives
+        run: cargo +1.97.1 package --workspace --locked
+      - name: Build and start the release CLI
+        run: |
+          cargo +1.97.1 build --release --locked -p depscan-cli
+          target/release/depscan --help >/dev/null

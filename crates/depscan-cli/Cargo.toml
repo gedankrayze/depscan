@@ -9,9 +9,16 @@ rust-version.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
+authors.workspace = true
 publish.workspace = true
 description = "Dependency vulnerability and version freshness scanner for local development and CI"
 include = ["src/**", "tests/**", "LICENSE"]
+
+[package.metadata.wix]
+upgrade-guid = "B9B1BD89-A7D8-49C1-B38F-BBF45E691458"
+path-guid = "9F6CE3FC-17C4-453C-BBA2-429C45A2C9D7"
+license = false
+eula = false
 
 [[bin]]
 name = "depscan"

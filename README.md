@@ -60,14 +60,29 @@ cargo run -p depscan-cli -- --help
 
 ## Release artifacts
 
-Linux release binaries target musl on both supported architectures:
+The tag-driven release workflow publishes this platform matrix:
 
-| Target | Architecture | Runtime contract |
+| Target | Architecture | Artifact contract |
 |---|---|---|
-| `x86_64-unknown-linux-musl` | x86-64 | Statically linked ELF; no glibc or distribution packages required |
-| `aarch64-unknown-linux-musl` | ARM64 | Statically linked ELF; no glibc or distribution packages required |
+| `x86_64-unknown-linux-musl` | Linux x86-64 | Statically linked ELF; no glibc or distribution packages required |
+| `aarch64-unknown-linux-musl` | Linux ARM64 | Statically linked ELF; no glibc or distribution packages required |
+| `x86_64-apple-darwin` | Intel macOS | Native tar.xz archive |
+| `aarch64-apple-darwin` | Apple-silicon macOS | Native tar.xz archive |
+| `x86_64-pc-windows-msvc` | Windows x86-64 | Native ZIP archive and MSI installer |
 
-The static-Linux workflow builds each target natively on its matching GitHub runner, rejects any ELF dynamic-library requirement with `file` and `readelf`, executes `--help`, and runs an offline Cargo fixture in a read-only `scratch` container with networking disabled. The uploaded CI artifact includes the binary and its SHA-256 checksum. macOS and Windows remain native platform binaries; the complete publication workflow and platform matrix are tracked in DS-045.
+Windows ARM64 is not published because the pinned cargo-dist 0.32.0 target matrix does not support it. It must not be added until the release tool and a Windows ARM64 CI run have both been verified.
+
+The static-Linux workflow builds each Linux target natively on its matching GitHub runner, rejects any ELF dynamic-library requirement with `file` and `readelf`, executes `--help`, and runs an offline Cargo fixture in a read-only `scratch` container with networking disabled. The uploaded CI artifact includes the binary and its SHA-256 checksum.
+
+Cargo-dist 0.32.0 generates the release plan and MSI definition. The checked-in workflow pins every external action by commit, runs formatting, all-target tests, strict Clippy, `cargo package --workspace --locked`, and a release-binary startup check before artifact jobs, then publishes shell and Homebrew installers, the Windows MSI, archives, source, and SHA-256 files. Host-phase GitHub artifact attestations bind every published file to the tag workflow. Workflow permissions default to read-only; only the host job receives `contents: write`, `id-token: write`, and `attestations: write`. `scripts/verify-release-workflow.sh` guards those pins, permissions, attestation scope, and quality dependency.
+
+After a release, verify a downloaded artifact before running it:
+
+```bash
+gh release download v1.1.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
+gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
+```
 
 ## Usage
 
