@@ -27,8 +27,8 @@ zip.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-wiremock = "0.6"
-tempfile = "3.12"
+wiremock = "0.6.5"
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

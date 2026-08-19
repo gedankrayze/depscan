@@ -890,7 +890,7 @@ impl EcosystemParser for PythonParser {
 }
 fn parse_python_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Toml = text.parse().map_err(|e| invalid(path, e))?;
+    let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
     let mut out = Vec::new();
     for item in value
         .get("package")
@@ -941,7 +941,7 @@ fn parse_pipfile_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
 }
 fn parse_pyproject(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Toml = text.parse().map_err(|e| invalid(path, e))?;
+    let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
     let mut deps = Vec::new();
     if let Some(arr) = value
         .get("project")
@@ -1112,7 +1112,7 @@ fn cargo_direct_names(root: &Path) -> HashSet<String> {
         .filter(|p| p.file_name().and_then(|x| x.to_str()) == Some("Cargo.toml"))
     {
         if let Ok(text) = fs::read_to_string(path)
-            && let Ok(value) = text.parse::<Toml>()
+            && let Ok(value) = toml::from_str::<Toml>(&text)
         {
             for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
                 if let Some(tbl) = value.get(section).and_then(Toml::as_table) {
@@ -1133,7 +1133,7 @@ fn cargo_direct_names(root: &Path) -> HashSet<String> {
 }
 fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Toml = text.parse().map_err(|e| invalid(path, e))?;
+    let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
     let direct = cargo_direct_names(path.parent().unwrap_or(Path::new(".")));
     let mut out = Vec::new();
     for item in value
@@ -1160,7 +1160,7 @@ fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
 }
 fn parse_cargo_toml(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Toml = text.parse().map_err(|e| invalid(path, e))?;
+    let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
     let mut out = Vec::new();
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(table) = value.get(section).and_then(Toml::as_table) {

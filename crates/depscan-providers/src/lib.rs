@@ -11,7 +11,7 @@ use depscan_core::{
 use directories::ProjectDirs;
 use fs2::FileExt;
 use futures::{StreamExt, stream};
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{
     Client, StatusCode,
     header::{ACCEPT, ETAG, HeaderMap, HeaderValue, RETRY_AFTER},
@@ -226,7 +226,13 @@ impl Cache {
     }
     fn filename(&self, namespace: &str, key: &str) -> PathBuf {
         let digest = Sha256::digest(key.as_bytes());
-        self.root.join(namespace).join(format!("{:x}.json", digest))
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        self.root.join(namespace).join(format!("{encoded}.json"))
     }
     pub fn get(
         &self,
@@ -368,13 +374,13 @@ impl HttpClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
                     let delay = retry_after
-                        .unwrap_or_else(|| (1u64 << attempt) + rand::thread_rng().gen_range(0..=1));
+                        .unwrap_or_else(|| (1u64 << attempt) + rand::rng().random_range(0..=1));
                     sleep(StdDuration::from_secs(delay)).await;
                 }
                 Err(error) => {
                     last_error = format!("{url}: {error}");
                     if attempt < 2 {
-                        let jitter = rand::thread_rng().gen_range(0..100);
+                        let jitter = rand::rng().random_range(0..100);
                         sleep(StdDuration::from_millis((200 * (1u64 << attempt)) + jitter)).await;
                     }
                 }
