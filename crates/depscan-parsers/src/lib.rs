@@ -146,15 +146,38 @@ impl EcosystemParser for NodeParser {
     }
 }
 
-fn node_direct_names(root: &Path) -> HashSet<String> {
-    let mut names = HashSet::new();
+#[derive(Default)]
+struct NodeDirectDependencies {
+    all: HashSet<String>,
+    by_directory: BTreeMap<PathBuf, HashSet<String>>,
+}
+
+impl NodeDirectDependencies {
+    fn includes(&self, name: &str) -> bool {
+        self.all.contains(name)
+    }
+
+    fn includes_package_at(&self, install_parent: &Path, name: &str) -> bool {
+        if install_parent.as_os_str().is_empty() {
+            return self.includes(name);
+        }
+
+        self.by_directory
+            .get(install_parent)
+            .is_some_and(|names| names.contains(name))
+    }
+}
+
+fn node_direct_dependencies(root: &Path) -> NodeDirectDependencies {
+    let mut direct = NodeDirectDependencies::default();
     for path in sorted_project_files(root, &["json"])
         .into_iter()
         .filter(|p| p.file_name().and_then(|x| x.to_str()) == Some("package.json"))
     {
-        if let Ok(text) = fs::read_to_string(path)
+        if let Ok(text) = fs::read_to_string(&path)
             && let Ok(value) = serde_json::from_str::<Json>(&text)
         {
+            let mut manifest_names = HashSet::new();
             for key in [
                 "dependencies",
                 "devDependencies",
@@ -162,18 +185,76 @@ fn node_direct_names(root: &Path) -> HashSet<String> {
                 "peerDependencies",
             ] {
                 if let Some(obj) = value.get(key).and_then(Json::as_object) {
-                    names.extend(obj.keys().cloned());
+                    manifest_names.extend(obj.keys().cloned());
                 }
             }
+            if let Some(directory) = path
+                .parent()
+                .and_then(|parent| parent.strip_prefix(root).ok())
+            {
+                direct
+                    .by_directory
+                    .entry(directory.to_path_buf())
+                    .or_default()
+                    .extend(manifest_names.iter().cloned());
+            }
+            direct.all.extend(manifest_names);
         }
     }
-    names
+    direct
+}
+
+fn node_direct_names(root: &Path) -> HashSet<String> {
+    node_direct_dependencies(root).all
+}
+
+struct NpmPackageLocation {
+    name: String,
+    install_parent: PathBuf,
+}
+
+fn npm_package_location(location: &str) -> Option<NpmPackageLocation> {
+    let segments: Vec<_> = location.split('/').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+
+    // npm records install locations, not package names. The final node_modules
+    // component identifies nested resolutions without leaking parent paths into
+    // the package identity. Root, workspace-target, and other local descriptors
+    // have no node_modules component and are intentionally not registry-scanned.
+    let node_modules = segments
+        .iter()
+        .rposition(|segment| *segment == "node_modules")?;
+    let package_segments = &segments[node_modules + 1..];
+    let name = match package_segments {
+        [name] if valid_npm_package_segment(name) && !name.starts_with('@') => (*name).to_owned(),
+        [scope, name]
+            if scope.starts_with('@')
+                && scope.len() > 1
+                && valid_npm_package_segment(scope)
+                && valid_npm_package_segment(name)
+                && !name.starts_with('@') =>
+        {
+            format!("{scope}/{name}")
+        }
+        _ => return None,
+    };
+
+    Some(NpmPackageLocation {
+        name,
+        install_parent: segments[..node_modules].iter().collect(),
+    })
+}
+
+fn valid_npm_package_segment(segment: &str) -> bool {
+    !matches!(segment, "" | "." | ".." | "node_modules")
 }
 
 fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let root = path.parent().unwrap_or(Path::new("."));
-    let direct = node_direct_names(root);
+    let direct = node_direct_dependencies(root);
     let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
     let mut packages = Vec::new();
     if let Some(map) = value.get("packages").and_then(Json::as_object) {
@@ -181,19 +262,18 @@ fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
             if key.is_empty() || entry.get("link").and_then(Json::as_bool) == Some(true) {
                 continue;
             }
-            if let Some(version) = entry.get("version").and_then(Json::as_str) {
-                let name = key.strip_prefix("node_modules/").unwrap_or(key);
-                if name.contains("node_modules/") {
-                    continue;
-                }
-                let mut pkg = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-                pkg.direct = direct.contains(name);
+            if let Some(version) = entry.get("version").and_then(Json::as_str)
+                && let Some(location) = npm_package_location(key)
+            {
+                let mut pkg =
+                    Package::new(Ecosystem::Npm, &location.name, version, path.to_path_buf());
+                pkg.direct = direct.includes_package_at(&location.install_parent, &location.name);
                 pkg.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
                 packages.push(pkg);
             }
         }
     } else if let Some(deps) = value.get("dependencies") {
-        parse_legacy_npm_tree(deps, path, &direct, &mut packages);
+        parse_legacy_npm_tree(deps, path, &direct.all, true, &mut packages);
     }
     Ok(dedup(packages))
 }
@@ -201,18 +281,19 @@ fn parse_legacy_npm_tree(
     node: &Json,
     path: &Path,
     direct: &HashSet<String>,
+    top_level: bool,
     out: &mut Vec<Package>,
 ) {
     if let Some(map) = node.as_object() {
         for (name, entry) in map {
             if let Some(version) = entry.get("version").and_then(Json::as_str) {
                 let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-                p.direct = direct.contains(name);
+                p.direct = top_level && direct.contains(name);
                 p.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
                 out.push(p);
             }
             if let Some(children) = entry.get("dependencies") {
-                parse_legacy_npm_tree(children, path, direct, out);
+                parse_legacy_npm_tree(children, path, direct, false, out);
             }
         }
     }
@@ -1166,7 +1247,243 @@ fn dedup(packages: Vec<Package>) -> Vec<Package> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
+
+    fn npm_fixture_packages(fixture: &str) -> Vec<Package> {
+        let lock = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture)
+            .join("package-lock.json");
+        let packages = parse_package_lock(&lock).unwrap();
+        assert!(packages.iter().all(|package| package.source_file == lock));
+        packages
+    }
+
+    fn normalized_npm_packages(packages: &[Package]) -> Json {
+        Json::Array(
+            packages
+                .iter()
+                .map(|package| {
+                    json!({
+                        "name": package.name,
+                        "version": package.version,
+                        "direct": package.direct,
+                        "dev": package.dev,
+                        "source": package
+                            .source_file
+                            .file_name()
+                            .and_then(|name| name.to_str()),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn parses_nested_npm_v2_packages_and_workspace_dependencies() {
+        let packages = npm_fixture_packages("npm-v2-nested");
+
+        insta::assert_json_snapshot!(normalized_npm_packages(&packages), @r#"
+        [
+          {
+            "dev": false,
+            "direct": false,
+            "name": "@nested/tool",
+            "source": "package-lock.json",
+            "version": "1.5.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "@scope/root",
+            "source": "package-lock.json",
+            "version": "3.0.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "alpha",
+            "source": "package-lock.json",
+            "version": "2.0.0"
+          },
+          {
+            "dev": true,
+            "direct": false,
+            "name": "dev-child",
+            "source": "package-lock.json",
+            "version": "1.0.0"
+          },
+          {
+            "dev": true,
+            "direct": true,
+            "name": "dev-tool",
+            "source": "package-lock.json",
+            "version": "4.0.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "duplicate",
+            "source": "package-lock.json",
+            "version": "1.0.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "duplicate",
+            "source": "package-lock.json",
+            "version": "2.0.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "duplicate",
+            "source": "package-lock.json",
+            "version": "3.0.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "shared",
+            "source": "package-lock.json",
+            "version": "5.0.0"
+          },
+          {
+            "dev": true,
+            "direct": true,
+            "name": "workspace-dev",
+            "source": "package-lock.json",
+            "version": "6.0.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "workspace-direct",
+            "source": "package-lock.json",
+            "version": "5.0.0"
+          }
+        ]
+        "#);
+    }
+
+    #[test]
+    fn parses_nested_npm_v3_packages_and_skips_local_descriptors() {
+        let packages = npm_fixture_packages("npm-v3-nested");
+
+        insta::assert_json_snapshot!(normalized_npm_packages(&packages), @r#"
+        [
+          {
+            "dev": false,
+            "direct": false,
+            "name": "@nested/scoped",
+            "source": "package-lock.json",
+            "version": "2.1.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "@scope/direct",
+            "source": "package-lock.json",
+            "version": "2.0.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "producer",
+            "source": "package-lock.json",
+            "version": "1.0.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "repeated",
+            "source": "package-lock.json",
+            "version": "0.8.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "repeated",
+            "source": "package-lock.json",
+            "version": "0.9.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "repeated",
+            "source": "package-lock.json",
+            "version": "1.5.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "workspace-only",
+            "source": "package-lock.json",
+            "version": "7.0.0"
+          }
+        ]
+        "#);
+    }
+
+    #[test]
+    fn keeps_legacy_npm_v1_nested_packages_best_effort() {
+        let packages = npm_fixture_packages("npm-v1-nested");
+
+        insta::assert_json_snapshot!(normalized_npm_packages(&packages), @r#"
+        [
+          {
+            "dev": false,
+            "direct": false,
+            "name": "@scope/child",
+            "source": "package-lock.json",
+            "version": "1.1.0"
+          },
+          {
+            "dev": true,
+            "direct": false,
+            "name": "dev-child",
+            "source": "package-lock.json",
+            "version": "1.0.0"
+          },
+          {
+            "dev": true,
+            "direct": true,
+            "name": "direct-dev",
+            "source": "package-lock.json",
+            "version": "3.0.0"
+          },
+          {
+            "dev": false,
+            "direct": true,
+            "name": "direct-one",
+            "source": "package-lock.json",
+            "version": "1.0.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "duplicate",
+            "source": "package-lock.json",
+            "version": "0.5.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "duplicate",
+            "source": "package-lock.json",
+            "version": "2.0.0"
+          },
+          {
+            "dev": false,
+            "direct": false,
+            "name": "retained-child",
+            "source": "package-lock.json",
+            "version": "4.0.0"
+          }
+        ]
+        "#);
+    }
 
     #[test]
     fn parses_cargo_lock() {

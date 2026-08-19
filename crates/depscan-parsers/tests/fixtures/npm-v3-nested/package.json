@@ -1,0 +1,12 @@
+{
+  "name": "npm-v3-fixture",
+  "private": true,
+  "dependencies": {
+    "producer": "1.0.0",
+    "@scope/direct": "2.0.0",
+    "repeated": "1.5.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}

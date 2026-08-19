@@ -1,0 +1,15 @@
+{
+  "name": "npm-v2-fixture",
+  "private": true,
+  "dependencies": {
+    "@scope/root": "3.0.0",
+    "alpha": "2.0.0",
+    "duplicate": "2.0.0"
+  },
+  "devDependencies": {
+    "dev-tool": "4.0.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}

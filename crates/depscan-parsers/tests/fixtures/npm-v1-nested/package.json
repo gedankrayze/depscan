@@ -1,0 +1,10 @@
+{
+  "name": "npm-v1-fixture",
+  "private": true,
+  "dependencies": {
+    "direct-one": "1.0.0"
+  },
+  "devDependencies": {
+    "direct-dev": "3.0.0"
+  }
+}

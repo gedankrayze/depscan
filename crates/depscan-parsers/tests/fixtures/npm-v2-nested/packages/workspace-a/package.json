@@ -1,0 +1,10 @@
+{
+  "name": "workspace-a",
+  "version": "1.0.0",
+  "dependencies": {
+    "workspace-direct": "5.0.0"
+  },
+  "devDependencies": {
+    "workspace-dev": "6.0.0"
+  }
+}
