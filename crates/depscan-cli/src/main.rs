@@ -15,7 +15,7 @@ use depscan_report::{OutputFormat, render};
 use futures::{StreamExt, stream};
 use serde::Deserialize;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -507,8 +507,7 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
             Err(error) => return Err(CliError::usage(error.to_string())),
         }
     }
-    packages.retain(|p| (!args.no_dev || !p.dev) && (!args.direct_only || p.direct));
-    packages = dedup_packages(packages);
+    packages = consolidate_packages(packages, args.no_dev, args.direct_only);
     if packages.is_empty() {
         return Err(CliError::NoSupportedProject(args.path));
     }
@@ -825,10 +824,28 @@ fn has_outdated_failure(document: &ScanDocument, threshold: OutdatedThreshold) -
         .filter_map(|r| r.latest.as_ref())
         .any(|latest| latest.yanked || latest.staleness >= min)
 }
-fn dedup_packages(mut packages: Vec<Package>) -> Vec<Package> {
-    packages.sort_by_key(Package::key);
-    packages.dedup_by(|a, b| a.key() == b.key());
+fn filter_packages(packages: &mut Vec<Package>, no_dev: bool, direct_only: bool) {
+    packages.retain(|package| {
+        (!no_dev || !package.dev_known || !package.dev)
+            && (!direct_only || !package.direct_known || package.direct)
+    });
+}
+
+fn consolidate_packages(packages: Vec<Package>, no_dev: bool, direct_only: bool) -> Vec<Package> {
+    let mut packages = dedup_packages(packages);
+    filter_packages(&mut packages, no_dev, direct_only);
     packages
+}
+
+fn dedup_packages(packages: Vec<Package>) -> Vec<Package> {
+    let mut merged = BTreeMap::<String, Package>::new();
+    for package in packages {
+        merged
+            .entry(package.key())
+            .and_modify(|existing| existing.merge_metadata(&package))
+            .or_insert(package);
+    }
+    merged.into_values().collect()
 }
 
 async fn sync(args: SyncArgs) -> Result<AppExit, CliError> {
@@ -889,5 +906,38 @@ fn completions(shell: CompletionShell) {
             &mut io::stdout(),
         ),
         CompletionShell::Zsh => generate(shells::Zsh, &mut command, "depscan", &mut io::stdout()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_filters_run_after_conservative_coordinate_merge() {
+        let mut direct_development = Package::new(
+            Ecosystem::PyPI,
+            "shared",
+            "1.0.0",
+            PathBuf::from("development.lock"),
+        );
+        direct_development.direct = true;
+        direct_development.dev = true;
+
+        let transitive_production = Package::new(
+            Ecosystem::PyPI,
+            "shared",
+            "1.0.0",
+            PathBuf::from("production.lock"),
+        );
+
+        let packages =
+            consolidate_packages(vec![direct_development, transitive_production], true, true);
+
+        assert_eq!(packages.len(), 1);
+        assert!(packages[0].direct);
+        assert!(packages[0].direct_known);
+        assert!(!packages[0].dev);
+        assert!(packages[0].dev_known);
     }
 }

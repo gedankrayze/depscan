@@ -1,0 +1,97 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "custom-registry"
+version = "1.0.0"
+source = { registry = "https://packages.example.invalid/simple" }
+
+[[package]]
+name = "dev-direct"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dev-transitive" },
+    { name = "shared-transitive" },
+]
+
+[[package]]
+name = "dev-transitive"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "directory-direct"
+version = "1.0.0"
+source = { directory = "vendor/directory-direct" }
+
+[[package]]
+name = "editable-direct"
+version = "1.0.0"
+source = { editable = "vendor/editable-direct" }
+
+[[package]]
+name = "git-direct"
+version = "1.0.0"
+source = { git = "https://github.com/example/git-direct?rev=main#0123456789abcdef0123456789abcdef01234567" }
+
+[[package]]
+name = "optional-direct"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "optional-transitive" }]
+
+[[package]]
+name = "optional-transitive"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "path-direct"
+version = "1.0.0"
+source = { path = "vendor/path_direct-1.0.0-py3-none-any.whl" }
+
+[[package]]
+name = "runtime-direct"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "runtime-transitive" },
+    { name = "shared-transitive" },
+]
+
+[[package]]
+name = "runtime-transitive"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "shared-transitive"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "url-direct"
+version = "1.0.0"
+source = { url = "https://packages.example.invalid/url_direct-1.0.0-py3-none-any.whl" }
+
+[[package]]
+name = "uv-fixture"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "custom-registry" },
+    { name = "directory-direct" },
+    { name = "editable-direct" },
+    { name = "git-direct" },
+    { name = "path-direct" },
+    { name = "runtime-direct" },
+    { name = "url-direct" },
+]
+
+[package.optional-dependencies]
+feature = [{ name = "optional-direct" }]
+
+[package.dev-dependencies]
+dev = [{ name = "dev-direct" }]

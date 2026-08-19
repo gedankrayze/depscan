@@ -1,0 +1,126 @@
+---
+source: crates/depscan-parsers/tests/python_locks.rs
+expression: snapshot(&packages)
+---
+[
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "custom-registry",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": true,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "dev-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": true,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "dev-transitive",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "directory-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "editable-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "file-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "git-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "optional-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "runtime-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "runtime-transitive",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "shared-transitive",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "url-direct",
+    "source": "poetry.lock",
+    "version": "1.0.0"
+  }
+]

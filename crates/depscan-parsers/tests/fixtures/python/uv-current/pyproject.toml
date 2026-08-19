@@ -1,0 +1,19 @@
+[project]
+name = "uv-fixture"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "runtime-direct==1.0.0",
+    "git-direct",
+    "url-direct",
+    "directory-direct",
+    "editable-direct",
+    "path-direct",
+    "custom-registry==1.0.0",
+]
+
+[project.optional-dependencies]
+feature = ["optional-direct==1.0.0"]
+
+[dependency-groups]
+dev = ["dev-direct==1.0.0"]

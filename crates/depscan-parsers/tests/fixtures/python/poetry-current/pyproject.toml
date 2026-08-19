@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "poetry-fixture"
+version = "0.1.0"
+description = "Current Poetry lock provenance fixture"
+authors = ["depscan contributors"]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+runtime-direct = "1.0.0"
+git-direct = { git = "https://github.com/example/git-direct.git", rev = "0123456789abcdef0123456789abcdef01234567" }
+url-direct = { url = "https://packages.example.invalid/url_direct-1.0.0-py3-none-any.whl" }
+directory-direct = { path = "vendor/directory-direct", develop = false }
+editable-direct = { path = "vendor/editable-direct", develop = true }
+file-direct = { path = "vendor/file_direct-1.0.0-py3-none-any.whl" }
+custom-registry = { version = "1.0.0", source = "private" }
+optional-direct = { version = "1.0.0", optional = true }
+
+[tool.poetry.extras]
+feature = ["optional-direct"]
+
+[tool.poetry.group.test.dependencies]
+dev-direct = "1.0.0"

@@ -643,7 +643,7 @@ mod tests {
         assert!(
             render(&doc, OutputFormat::Json, false)
                 .unwrap()
-                .contains("\"schema_version\": 2")
+                .contains("\"schema_version\": 3")
         );
     }
 

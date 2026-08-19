@@ -18,7 +18,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 #[serde(rename_all = "lowercase")]
@@ -94,7 +94,13 @@ pub struct Package {
     /// A resolved version, or a range in manifest-only mode.
     pub version: String,
     pub direct: bool,
+    /// Whether `direct` is an observed classification rather than a conservative default.
+    #[serde(default = "classification_known")]
+    pub direct_known: bool,
     pub dev: bool,
+    /// Whether `dev` is an observed classification rather than a conservative default.
+    #[serde(default = "classification_known")]
+    pub dev_known: bool,
     pub source_file: PathBuf,
     pub enrichable: bool,
     pub resolved_from_range: bool,
@@ -115,7 +121,9 @@ impl Package {
             display_name,
             version: version.into(),
             direct: false,
+            direct_known: true,
             dev: false,
+            dev_known: true,
             source_file,
             enrichable: true,
             resolved_from_range: false,
@@ -128,6 +136,58 @@ impl Package {
             self.name,
             self.version
         )
+    }
+
+    /// Merge parser metadata for the same package coordinate without turning unknown
+    /// classifications into false certainty.
+    pub fn merge_metadata(&mut self, other: &Self) {
+        merge_directness(
+            &mut self.direct,
+            &mut self.direct_known,
+            other.direct,
+            other.direct_known,
+        );
+        merge_development_scope(
+            &mut self.dev,
+            &mut self.dev_known,
+            other.dev,
+            other.dev_known,
+        );
+        self.enrichable &= other.enrichable;
+        self.resolved_from_range &= other.resolved_from_range;
+    }
+}
+
+const fn classification_known() -> bool {
+    true
+}
+
+fn merge_directness(value: &mut bool, known: &mut bool, other_value: bool, other_known: bool) {
+    if (*known && *value) || (other_known && other_value) {
+        *value = true;
+        *known = true;
+    } else if *known && other_known {
+        *value = false;
+    } else {
+        *value = false;
+        *known = false;
+    }
+}
+
+fn merge_development_scope(
+    value: &mut bool,
+    known: &mut bool,
+    other_value: bool,
+    other_known: bool,
+) {
+    if (*known && !*value) || (other_known && !other_value) {
+        *value = false;
+        *known = true;
+    } else if *known && other_known {
+        *value = true;
+    } else {
+        *value = false;
+        *known = false;
     }
 }
 
@@ -331,7 +391,9 @@ impl ScanDocument {
                 .then_with(|| left.package.display_name.cmp(&right.package.display_name))
                 .then_with(|| left.package.source_file.cmp(&right.package.source_file))
                 .then_with(|| left.package.direct.cmp(&right.package.direct))
+                .then_with(|| left.package.direct_known.cmp(&right.package.direct_known))
                 .then_with(|| left.package.dev.cmp(&right.package.dev))
+                .then_with(|| left.package.dev_known.cmp(&right.package.dev_known))
                 .then_with(|| left.package.enrichable.cmp(&right.package.enrichable))
                 .then_with(|| {
                     left.package
@@ -516,6 +578,41 @@ fn classify_release_segments<T: PartialEq>(installed: &[T], latest: &[T]) -> Sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_metadata_merge_preserves_unknown_classifications_conservatively() {
+        let mut package = Package::new(
+            Ecosystem::PyPI,
+            "demo",
+            "1.0.0",
+            PathBuf::from("poetry.lock"),
+        );
+        package.dev = true;
+
+        let mut unknown = package.clone();
+        unknown.direct_known = false;
+        unknown.dev = false;
+        unknown.dev_known = false;
+        unknown.enrichable = false;
+        package.merge_metadata(&unknown);
+
+        assert!(!package.direct);
+        assert!(!package.direct_known);
+        assert!(!package.dev);
+        assert!(!package.dev_known);
+        assert!(!package.enrichable);
+
+        let mut observed = package.clone();
+        observed.direct = true;
+        observed.direct_known = true;
+        observed.dev_known = true;
+        package.merge_metadata(&observed);
+
+        assert!(package.direct);
+        assert!(package.direct_known);
+        assert!(!package.dev);
+        assert!(package.dev_known);
+    }
 
     #[test]
     fn normalizes_pypi_names() {

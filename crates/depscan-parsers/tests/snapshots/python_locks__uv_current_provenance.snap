@@ -1,0 +1,136 @@
+---
+source: crates/depscan-parsers/tests/python_locks.rs
+expression: snapshot(&packages)
+---
+[
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "custom-registry",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": true,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "dev-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": true,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "dev-transitive",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "directory-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "editable-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "git-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "optional-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "optional-transitive",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "path-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "runtime-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "runtime-transitive",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "enrichable": true,
+    "name": "shared-transitive",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
+    "direct": true,
+    "direct_known": true,
+    "enrichable": false,
+    "name": "url-direct",
+    "source": "uv.lock",
+    "version": "1.0.0"
+  }
+]

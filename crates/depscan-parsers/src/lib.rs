@@ -17,6 +17,7 @@ use std::{
 use toml::Value as Toml;
 use walkdir::WalkDir;
 
+mod python_locks;
 mod requirements;
 
 fn io_error(path: &Path, error: impl ToString) -> ParseError {
@@ -1390,41 +1391,14 @@ impl EcosystemParser for PythonParser {
     }
     fn parse(&self, source: &DetectedSource) -> Result<Vec<Package>, ParseError> {
         match source.kind {
-            SourceKind::UvLock | SourceKind::PoetryLock => parse_python_lock(&source.path),
+            SourceKind::UvLock => python_locks::parse_uv_lock(&source.path),
+            SourceKind::PoetryLock => python_locks::parse_poetry_lock(&source.path),
             SourceKind::PipfileLock => parse_pipfile_lock(&source.path),
             SourceKind::RequirementsTxt => requirements::parse(&source.path),
             SourceKind::PyProject => parse_pyproject(&source.path),
             _ => Err(invalid(&source.path, "unexpected source kind")),
         }
     }
-}
-fn parse_python_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
-    let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
-    let mut out = Vec::new();
-    for item in value
-        .get("package")
-        .and_then(Toml::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let (Some(name), Some(version)) = (
-            item.get("name").and_then(Toml::as_str),
-            item.get("version").and_then(Toml::as_str),
-        ) {
-            let mut p = Package::new(Ecosystem::PyPI, name, version, path.to_path_buf());
-            let source_type = item
-                .get("source")
-                .and_then(Toml::as_table)
-                .and_then(|t| t.get("type"))
-                .and_then(Toml::as_str);
-            if matches!(source_type, Some("git" | "directory" | "url" | "path")) {
-                p.enrichable = false;
-            }
-            out.push(p);
-        }
-    }
-    Ok(dedup(out))
 }
 fn parse_pipfile_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
@@ -2953,11 +2927,7 @@ fn dedup(packages: Vec<Package>) -> Vec<Package> {
     for p in packages {
         let key = p.key();
         map.entry(key)
-            .and_modify(|old| {
-                old.direct |= p.direct;
-                old.dev &= p.dev;
-                old.enrichable |= p.enrichable;
-            })
+            .and_modify(|old| old.merge_metadata(&p))
             .or_insert(p);
     }
     map.into_values().collect()

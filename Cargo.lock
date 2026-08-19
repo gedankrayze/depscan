@@ -428,6 +428,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]
@@ -451,6 +452,7 @@ dependencies = [
  "glob",
  "insta",
  "noyalib",
+ "pep440_rs",
  "quick-xml",
  "semver",
  "serde",
