@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::{generate, shells};
 use depscan_core::{
@@ -18,6 +18,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
+    str::FromStr,
 };
 use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
@@ -70,9 +71,12 @@ impl CliError {
     name = "depscan",
     version,
     about = "Scan dependency lockfiles for known vulnerabilities and version freshness",
+    long_about = "Scan dependency lockfiles and manifests for OSV vulnerabilities, yanked releases, and newer stable versions. By default depscan auto-detects every supported ecosystem in the current directory, writes a human summary to non-interactive stdout, and uses the network plus its local cache.",
+    after_long_help = "Exit status:\n  0  scan completed below both failure thresholds\n  1  vulnerability at or above --fail-on (takes precedence over 2)\n  2  outdated or yanked dependency at or above --fail-on-outdated\n 10  command-line or configuration error\n 20  no supported project or dependency was detected\n 30  provider hard failure without a usable fallback",
     arg_required_else_help = false
 )]
 struct Cli {
+    /// Run an explicit command. With no command, the scan options below scan PATH.
     #[command(subcommand)]
     command: Option<Command>,
     #[command(flatten)]
@@ -80,59 +84,203 @@ struct Cli {
 }
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Scan one project directory (the default command).
+    #[command(
+        after_long_help = "Exit status:\n  0  scan completed below both failure thresholds\n  1  vulnerability at or above --fail-on (takes precedence over 2)\n  2  outdated or yanked dependency at or above --fail-on-outdated\n 10  command-line or configuration error\n 20  no supported project or dependency was detected\n 30  provider hard failure without a usable fallback"
+    )]
     Scan(ScanArgs),
+    /// Download or refresh OSV dumps used by offline scans.
     Sync(SyncArgs),
+    /// Inspect or safely clear the depscan-owned cache.
     Cache(CacheArgs),
+    /// Generate a shell completion script on stdout.
     Completions {
+        /// Shell whose completion syntax should be generated.
         #[arg(value_enum)]
         shell: CompletionShell,
     },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum EcosystemArg {
+    #[value(aliases(["node", "bun"]))]
+    Npm,
+    #[value(name = "pypi", aliases(["python"]))]
+    PyPi,
+    #[value(name = "nuget", aliases(["dotnet", ".net"]))]
+    NuGet,
+    #[value(name = "cargo", aliases(["crates", "crates.io", "rust"]))]
+    Cargo,
+}
+
+impl From<EcosystemArg> for Ecosystem {
+    fn from(value: EcosystemArg) -> Self {
+        match value {
+            EcosystemArg::Npm => Self::Npm,
+            EcosystemArg::PyPi => Self::PyPI,
+            EcosystemArg::NuGet => Self::NuGet,
+            EcosystemArg::Cargo => Self::CratesIo,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ReportFormat {
+    Table,
+    Json,
+    Sarif,
+    Summary,
+}
+
+impl From<ReportFormat> for OutputFormat {
+    fn from(value: ReportFormat) -> Self {
+        match value {
+            ReportFormat::Table => Self::Table,
+            ReportFormat::Json => Self::Json,
+            ReportFormat::Sarif => Self::Sarif,
+            ReportFormat::Summary => Self::Summary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum VulnerabilityThreshold {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Any,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutdatedThreshold {
+    Major,
+    Minor,
+    Patch,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CacheAge(Duration);
+
+impl FromStr for CacheAge {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let split = value
+            .find(|character: char| !character.is_ascii_digit())
+            .ok_or_else(|| format!("duration {value:?} requires one of s, m, h, or d"))?;
+        if split == 0 {
+            return Err(format!(
+                "duration {value:?} must start with a non-negative integer"
+            ));
+        }
+        let amount = value[..split]
+            .parse::<i64>()
+            .map_err(|_| format!("duration {value:?} is outside the supported range"))?;
+        let duration = match &value[split..] {
+            "s" => Duration::try_seconds(amount),
+            "m" => Duration::try_minutes(amount),
+            "h" => Duration::try_hours(amount),
+            "d" => Duration::try_days(amount),
+            _ => {
+                return Err(format!(
+                    "duration {value:?} has an invalid unit; use values such as 30m, 24h, or 7d"
+                ));
+            }
+        }
+        .ok_or_else(|| format!("duration {value:?} is outside the supported range"))?;
+        Ok(Self(duration))
+    }
+}
+
 #[derive(Clone, Debug, Args)]
 struct ScanArgs {
+    /// Project directory to inspect recursively.
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
-    #[arg(short = 'e', long = "ecosystem", value_name = "ECOSYSTEM")]
-    ecosystems: Vec<String>,
+    /// Limit detection to one ecosystem. Repeat the option to select several.
+    #[arg(
+        short = 'e',
+        long = "ecosystem",
+        value_name = "ECOSYSTEM",
+        value_enum,
+        ignore_case = true,
+        action = clap::ArgAction::Append
+    )]
+    ecosystems: Vec<EcosystemArg>,
+    /// Exclude known development/test dependencies; entries with unknown scope are retained.
     #[arg(long)]
     no_dev: bool,
+    /// Exclude known transitive dependencies; entries with unknown directness are retained.
     #[arg(long)]
     direct_only: bool,
-    #[arg(short = 'f', long, value_name = "FORMAT")]
-    format: Option<String>,
-    #[arg(short = 'o', long)]
+    /// Report format. If omitted, infer from --output, then use table on a TTY or summary otherwise.
+    #[arg(short = 'f', long, value_name = "FORMAT", value_enum)]
+    format: Option<ReportFormat>,
+    /// Write the report to FILE instead of stdout. The extension selects a format when -f is absent.
+    #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<PathBuf>,
-    #[arg(long)]
-    fail_on: Option<String>,
-    #[arg(long)]
-    fail_on_outdated: Option<String>,
+    /// Exit 1 when an actionable vulnerability meets this threshold. CLI overrides config; default: high.
+    #[arg(long, value_name = "SEVERITY", value_enum)]
+    fail_on: Option<VulnerabilityThreshold>,
+    /// Exit 2 for this degree of staleness or a yanked release. CLI overrides config; default: never.
+    #[arg(long, value_name = "CLASS", value_enum)]
+    fail_on_outdated: Option<OutdatedThreshold>,
+    /// Disable network access; require locally synced OSV dumps and skip registry freshness lookups.
     #[arg(long)]
     offline: bool,
+    /// Bypass reusable JSON cache reads but continue writing fresh responses. Synced offline dumps remain inputs.
     #[arg(long)]
     no_cache: bool,
-    #[arg(long)]
-    max_cache_age: Option<String>,
+    /// Set the maximum accepted cache-data age (examples: 30m, 24h, 7d).
+    #[arg(long, value_name = "DURATION")]
+    max_cache_age: Option<CacheAge>,
+    /// Include withdrawn OSV advisories in reports and failure evaluation.
     #[arg(long)]
     include_withdrawn: bool,
-    #[arg(long)]
+    /// Suppress an advisory ID or alias. Repeat for multiple IDs; configuration ignores are combined.
+    #[arg(long, value_name = "ID", action = clap::ArgAction::Append)]
     ignore: Vec<String>,
     #[arg(
         long,
         value_name = "FILE",
-        help = "Configuration file (must be a readable regular file; symbolic links are rejected)"
+        help = "Read configuration from FILE; CLI failure thresholds win and ignore lists combine",
+        long_help = "Read configuration from FILE instead of PATH/depscan.toml. FILE must be a readable regular file; symbolic links are rejected. Command-line failure thresholds take precedence over configured thresholds, while ignore rules are combined. Ignore reasons are included in reports, so they must not contain secrets."
     )]
     config: Option<PathBuf>,
-    #[arg(long)]
+    /// Permit explicitly supported package-manager fallbacks.
+    #[arg(
+        long,
+        long_help = "Permit explicitly supported package-manager fallbacks. This may execute bun or dotnet while scanning an attacker-controlled checkout; leave disabled for untrusted projects unless that execution is acceptable."
+    )]
     allow_tools: bool,
-    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    /// Reduce diagnostics. Repeatable; conflicts with --verbose. Reports still use stdout or --output.
+    #[arg(
+        short = 'q',
+        long,
+        action = clap::ArgAction::Count,
+        conflicts_with = "verbose"
+    )]
     quiet: u8,
+    /// Increase diagnostic detail. Repeatable; conflicts with --quiet. Logs always use stderr.
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
 #[derive(Debug, Args)]
 struct SyncArgs {
-    #[arg(short = 'e', long = "ecosystem")]
-    ecosystems: Vec<String>,
+    /// Limit synchronization to one ecosystem. Repeat to select several; default: all ecosystems.
+    #[arg(
+        short = 'e',
+        long = "ecosystem",
+        value_name = "ECOSYSTEM",
+        value_enum,
+        ignore_case = true,
+        action = clap::ArgAction::Append
+    )]
+    ecosystems: Vec<EcosystemArg>,
+    /// Bypass reusable JSON cache reads; selected OSV dumps are always downloaded and written.
     #[arg(long)]
     no_cache: bool,
 }
@@ -143,15 +291,19 @@ struct CacheArgs {
 }
 #[derive(Debug, Subcommand)]
 enum CacheCommand {
+    /// Remove only known content from a validated depscan-owned cache.
     Clear,
+    /// Show the number and total size of cached files.
     Stats,
+    /// Print the canonical cache directory path.
     Path,
 }
-#[derive(Clone, ValueEnum, Debug)]
+#[derive(Clone, Copy, ValueEnum, Debug)]
 enum CompletionShell {
     Bash,
     Elvish,
     Fish,
+    #[value(name = "powershell", alias = "power-shell")]
     PowerShell,
     Zsh,
 }
@@ -267,24 +419,29 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
     }
     let generated_at = scan_timestamp()?;
     let config = load_config(&args.path, args.config.as_deref())?;
-    let fail_on = args
-        .fail_on
-        .as_deref()
-        .or(config.fail_on.as_deref())
-        .unwrap_or("high");
-    let fail_outdated = args
-        .fail_on_outdated
-        .as_deref()
-        .or(config.fail_on_outdated.as_deref())
-        .unwrap_or("never");
-    validate_threshold(fail_on, true).map_err(CliError::usage)?;
-    validate_threshold(fail_outdated, false).map_err(CliError::usage)?;
-    let max_cache_age = args
-        .max_cache_age
-        .as_deref()
-        .map(parse_duration)
-        .transpose()
-        .map_err(CliError::usage)?;
+    let fail_on = args.fail_on.map_or_else(
+        || {
+            config
+                .fail_on
+                .as_deref()
+                .map_or(Ok(VulnerabilityThreshold::High), |value| {
+                    parse_config_threshold(value, "fail-on")
+                })
+        },
+        Ok,
+    )?;
+    let fail_outdated = args.fail_on_outdated.map_or_else(
+        || {
+            config
+                .fail_on_outdated
+                .as_deref()
+                .map_or(Ok(OutdatedThreshold::Never), |value| {
+                    parse_config_threshold(value, "fail-on-outdated")
+                })
+        },
+        Ok,
+    )?;
+    let max_cache_age = args.max_cache_age.map(|age| age.0);
     let format = determine_format(&args).map_err(CliError::usage)?;
     validate_output_path(args.output.as_deref())?;
     let mut suppression_rules = args
@@ -318,7 +475,7 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
     }
     suppression_rules.sort();
     suppression_rules.dedup();
-    let allowed = parse_ecosystems(&args.ecosystems).map_err(CliError::usage)?;
+    let allowed = parse_ecosystems(&args.ecosystems);
     let parsers = ParserSet::default();
     let sources = parsers.detect(&args.path, &allowed);
     if sources.is_empty() {
@@ -561,54 +718,42 @@ fn load_config(root: &Path, explicit: Option<&Path>) -> Result<Config, CliError>
     debug!(path = %path.display(), origin, "configuration loaded");
     Ok(config)
 }
-fn parse_ecosystems(values: &[String]) -> Result<HashSet<Ecosystem>, String> {
-    values
-        .iter()
-        .map(|v| {
-            Ecosystem::from_cli(v)
-                .ok_or_else(|| format!("unknown ecosystem '{v}'; expected npm|pypi|nuget|cargo"))
-        })
-        .collect()
+fn parse_ecosystems(values: &[EcosystemArg]) -> HashSet<Ecosystem> {
+    values.iter().copied().map(Ecosystem::from).collect()
 }
-fn validate_threshold(value: &str, vulnerability: bool) -> Result<(), String> {
-    let valid = if vulnerability {
-        ["critical", "high", "medium", "low", "any", "never"].contains(&value)
-    } else {
-        ["major", "minor", "patch", "never"].contains(&value)
-    };
-    valid
-        .then_some(())
-        .ok_or_else(|| format!("invalid threshold '{value}'"))
-}
-fn parse_duration(value: &str) -> Result<chrono::Duration, String> {
-    let split = value
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| format!("duration '{value}' requires a unit"))?;
-    let amount: i64 = value[..split]
-        .parse()
-        .map_err(|_| format!("invalid duration '{value}'"))?;
-    match &value[split..] {
-        "s" => Ok(chrono::Duration::seconds(amount)),
-        "m" => Ok(chrono::Duration::minutes(amount)),
-        "h" => Ok(chrono::Duration::hours(amount)),
-        "d" => Ok(chrono::Duration::days(amount)),
-        _ => Err(format!("invalid duration unit in '{value}'; use s|m|h|d")),
-    }
+fn parse_config_threshold<T>(value: &str, setting: &str) -> Result<T, CliError>
+where
+    T: ValueEnum + Clone,
+{
+    <T as ValueEnum>::from_str(value, false).map_err(|_| {
+        let allowed = T::value_variants()
+            .iter()
+            .filter_map(ValueEnum::to_possible_value)
+            .map(|possible| possible.get_name().to_owned())
+            .collect::<Vec<_>>()
+            .join("|");
+        CliError::usage(format!(
+            "invalid threshold {value:?} for {setting}; expected {allowed}"
+        ))
+    })
 }
 fn determine_format(args: &ScanArgs) -> Result<OutputFormat, String> {
-    args.format
-        .as_deref()
-        .map(|v| OutputFormat::parse(v).ok_or_else(|| format!("unknown format '{v}'")))
-        .transpose()?
-        .or_else(|| args.output.as_deref().and_then(OutputFormat::infer))
-        .or_else(|| {
-            if std::io::IsTerminal::is_terminal(&io::stdout()) {
-                Some(OutputFormat::Table)
-            } else {
-                Some(OutputFormat::Summary)
-            }
-        })
-        .ok_or_else(|| "could not infer output format".to_owned())
+    if let Some(format) = args.format {
+        return Ok(format.into());
+    }
+    if let Some(path) = args.output.as_deref() {
+        return OutputFormat::infer(path).ok_or_else(|| {
+            format!(
+                "could not infer output format from {}; use --format table|json|sarif|summary",
+                path.display()
+            )
+        });
+    }
+    Ok(if std::io::IsTerminal::is_terminal(&io::stdout()) {
+        OutputFormat::Table
+    } else {
+        OutputFormat::Summary
+    })
 }
 fn validate_output_path(path: Option<&Path>) -> Result<(), CliError> {
     let Some(path) = path else {
@@ -632,15 +777,14 @@ fn validate_output_path(path: Option<&Path>) -> Result<(), CliError> {
     }
     Ok(())
 }
-fn has_vulnerability_failure(document: &ScanDocument, threshold: &str) -> bool {
+fn has_vulnerability_failure(document: &ScanDocument, threshold: VulnerabilityThreshold) -> bool {
     let min = match threshold {
-        "never" => return false,
-        "any" => Severity::Unknown,
-        "low" => Severity::Low,
-        "medium" => Severity::Medium,
-        "high" => Severity::High,
-        "critical" => Severity::Critical,
-        _ => return false,
+        VulnerabilityThreshold::Never => return false,
+        VulnerabilityThreshold::Any => Severity::Unknown,
+        VulnerabilityThreshold::Low => Severity::Low,
+        VulnerabilityThreshold::Medium => Severity::Medium,
+        VulnerabilityThreshold::High => Severity::High,
+        VulnerabilityThreshold::Critical => Severity::Critical,
     };
     document
         .results
@@ -648,13 +792,12 @@ fn has_vulnerability_failure(document: &ScanDocument, threshold: &str) -> bool {
         .flat_map(|r| &r.vulns)
         .any(|v| v.severity.unwrap_or(Severity::Unknown) >= min)
 }
-fn has_outdated_failure(document: &ScanDocument, threshold: &str) -> bool {
+fn has_outdated_failure(document: &ScanDocument, threshold: OutdatedThreshold) -> bool {
     let min = match threshold {
-        "never" => return false,
-        "patch" => Staleness::Patch,
-        "minor" => Staleness::Minor,
-        "major" => Staleness::Major,
-        _ => return false,
+        OutdatedThreshold::Never => return false,
+        OutdatedThreshold::Patch => Staleness::Patch,
+        OutdatedThreshold::Minor => Staleness::Minor,
+        OutdatedThreshold::Major => Staleness::Major,
     };
     document
         .results
@@ -669,7 +812,7 @@ fn dedup_packages(mut packages: Vec<Package>) -> Vec<Package> {
 }
 
 async fn sync(args: SyncArgs) -> Result<AppExit, CliError> {
-    let ecosystems = parse_ecosystems(&args.ecosystems).map_err(CliError::usage)?;
+    let ecosystems = parse_ecosystems(&args.ecosystems);
     let cache = Cache::new(CachePolicy {
         read: !args.no_cache,
         max_age: None,
