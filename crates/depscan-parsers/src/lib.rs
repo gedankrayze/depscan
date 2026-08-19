@@ -1,6 +1,8 @@
 //! Offline, filesystem-only dependency parsers.
 
 use depscan_core::{DetectedSource, Ecosystem, EcosystemParser, Package, ParseError, SourceKind};
+use noyalib::policy::MaxScalarLength;
+use noyalib::{DuplicateKeyPolicy, MergeKeyPolicy, ParserConfig, Value as Yaml};
 use quick_xml::Reader;
 use quick_xml::XmlVersion;
 use quick_xml::escape::unescape;
@@ -9,6 +11,7 @@ use serde_json::Value as Json;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 use toml::Value as Toml;
@@ -27,6 +30,43 @@ fn invalid(path: &Path, error: impl ToString) -> ParseError {
         path: path.to_path_buf(),
         message: error.to_string(),
     }
+}
+
+const YAML_MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+const YAML_MAX_SCALAR_BYTES: usize = 1024 * 1024;
+
+fn read_yaml_text(path: &Path) -> Result<String, ParseError> {
+    let file = fs::File::open(path).map_err(|error| io_error(path, error))?;
+    let mut text = String::new();
+    file.take(YAML_MAX_DOCUMENT_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| io_error(path, error))?;
+    if text.len() > YAML_MAX_DOCUMENT_BYTES {
+        return Err(invalid(
+            path,
+            format!("YAML document exceeds the {YAML_MAX_DOCUMENT_BYTES}-byte input limit"),
+        ));
+    }
+    Ok(text)
+}
+
+fn parse_yaml_document(path: &Path, text: &str) -> Result<Yaml, ParseError> {
+    let config = ParserConfig::new()
+        .max_depth(64)
+        .max_document_length(YAML_MAX_DOCUMENT_BYTES)
+        .max_alias_expansions(64)
+        .max_mapping_keys(100_000)
+        .max_sequence_length(100_000)
+        .max_events(2_000_000)
+        .max_nodes(1_000_000)
+        .max_total_scalar_bytes(YAML_MAX_DOCUMENT_BYTES)
+        .max_documents(1)
+        .alias_anchor_ratio(Some(8.0))
+        .duplicate_key_policy(DuplicateKeyPolicy::Error)
+        .merge_key_policy(MergeKeyPolicy::Error)
+        .with_policy(MaxScalarLength(YAML_MAX_SCALAR_BYTES));
+
+    noyalib::from_str_with_config(text, &config).map_err(|error| invalid(path, error))
 }
 
 pub struct ParserSet {
@@ -791,25 +831,17 @@ fn strip_jsonc(input: &str) -> Result<String, String> {
 }
 
 fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
-    let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| invalid(path, e))?;
+    let text = read_yaml_text(path)?;
+    let value = parse_yaml_document(path, &text)?;
     let root = path.parent().unwrap_or(Path::new("."));
     let direct = node_direct_names(root);
     let mut out = Vec::new();
-    if let Some(packages) = value
-        .get("packages")
-        .and_then(serde_yaml::Value::as_mapping)
-    {
+    if let Some(packages) = value.get("packages").and_then(Yaml::as_mapping) {
         for (key, entry) in packages {
-            if let Some(raw) = key.as_str()
-                && let Some((name, version)) = parse_pnpm_key(raw)
-            {
+            if let Some((name, version)) = parse_pnpm_key(key) {
                 let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
                 p.direct = direct.contains(&p.name);
-                p.dev = entry
-                    .get("dev")
-                    .and_then(serde_yaml::Value::as_bool)
-                    .unwrap_or(false);
+                p.dev = entry.get("dev").and_then(Yaml::as_bool).unwrap_or(false);
                 out.push(p);
             }
         }
@@ -828,7 +860,7 @@ fn parse_pnpm_key(raw: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_yarn_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
-    let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
+    let text = read_yaml_text(path)?;
     let root = path.parent().unwrap_or(Path::new("."));
     let direct = yarn_direct_dependencies(root);
     let has_berry_metadata = text.lines().any(|line| {
@@ -1011,18 +1043,17 @@ fn parse_yarn_berry(
     text: &str,
     direct: &HashMap<String, YarnDirectness>,
 ) -> Result<Vec<Package>, ParseError> {
-    let value: serde_yaml::Value =
-        serde_yaml::from_str(text).map_err(|error| invalid(path, error))?;
+    let value = parse_yaml_document(path, text)?;
     let entries = value
         .as_mapping()
         .ok_or_else(|| invalid(path, "Yarn Berry lockfile root must be a mapping"))?;
     let metadata = value
         .get("__metadata")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(Yaml::as_mapping)
         .ok_or_else(|| invalid(path, "Yarn Berry lockfile is missing a __metadata mapping"))?;
     let lockfile_version = metadata
         .get("version")
-        .and_then(serde_yaml::Value::as_u64)
+        .and_then(Yaml::as_u64)
         .ok_or_else(|| invalid(path, "Yarn Berry __metadata is missing an integer version"))?;
     if !(YARN_BERRY_MIN_LOCKFILE_VERSION..=YARN_BERRY_MAX_LOCKFILE_VERSION)
         .contains(&lockfile_version)
@@ -1037,9 +1068,7 @@ fn parse_yarn_berry(
 
     let mut packages = Vec::new();
     for (raw_key, raw_entry) in entries {
-        let key = raw_key
-            .as_str()
-            .ok_or_else(|| invalid(path, "Yarn Berry lockfile entry keys must be strings"))?;
+        let key = raw_key.as_str();
         if key == "__metadata" {
             continue;
         }
@@ -1060,18 +1089,15 @@ fn parse_yarn_berry(
         let entry = raw_entry
             .as_mapping()
             .ok_or_else(|| invalid(path, format!("Yarn Berry entry {key:?} must be a mapping")))?;
-        let version = entry
-            .get("version")
-            .and_then(serde_yaml::Value::as_str)
-            .ok_or_else(|| {
-                invalid(
-                    path,
-                    format!("Yarn Berry entry {key:?} is missing a string version"),
-                )
-            })?;
+        let version = entry.get("version").and_then(Yaml::as_str).ok_or_else(|| {
+            invalid(
+                path,
+                format!("Yarn Berry entry {key:?} is missing a string version"),
+            )
+        })?;
         let resolution = entry
             .get("resolution")
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(Yaml::as_str)
             .ok_or_else(|| {
                 invalid(
                     path,

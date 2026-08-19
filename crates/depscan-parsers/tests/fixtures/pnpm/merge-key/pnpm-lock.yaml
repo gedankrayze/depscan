@@ -1,0 +1,6 @@
+lockfileVersion: '9.0'
+shared: &shared
+  dev: false
+packages:
+  left-pad@1.3.0:
+    <<: *shared

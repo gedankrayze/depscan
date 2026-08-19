@@ -1,0 +1,10 @@
+{
+  "name": "pnpm-fixture",
+  "private": true,
+  "dependencies": {
+    "left-pad": "1.3.0"
+  },
+  "devDependencies": {
+    "@scope/pkg": "2.0.1"
+  }
+}

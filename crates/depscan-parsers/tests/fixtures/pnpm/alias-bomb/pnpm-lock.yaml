@@ -1,0 +1,4 @@
+lockfileVersion: '9.0'
+shared: &shared {dev: false}
+aliases: [*shared, *shared, *shared, *shared, *shared, *shared, *shared, *shared, *shared]
+packages: {}

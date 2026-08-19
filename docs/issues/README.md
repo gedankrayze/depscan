@@ -45,7 +45,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-024](DS-024.md) | P1 | Open | Make workspace crates publishable |
 | [DS-025](DS-025.md) | P1 | Closed | Modernize the Rust toolchain, edition, resolver, and MSRV policy |
 | [DS-026](DS-026.md) | P1 | Closed | Upgrade direct dependencies to current stable releases |
-| [DS-027](DS-027.md) | P1 | Open | Replace unmaintained `serde_yaml` |
+| [DS-027](DS-027.md) | P1 | Closed | Replace unmaintained `serde_yaml` |
 | [DS-028](DS-028.md) | P1 | Open | Build the required fixture, provider, version, and E2E test matrix |
 | [DS-029](DS-029.md) | P1 | Open | Resolve manifest ranges for `latest_matching` |
 | [DS-030](DS-030.md) | P1 | Open | Enforce offline dump age and use cached registry metadata |
