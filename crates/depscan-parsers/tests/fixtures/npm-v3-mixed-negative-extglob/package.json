@@ -1,0 +1,8 @@
+{
+  "name": "ds063-npm11-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/pre!(bad).js"
+  ]
+}

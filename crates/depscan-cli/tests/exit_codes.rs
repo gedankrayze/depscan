@@ -524,6 +524,82 @@ fn npm_direct_only_uses_lock_edges_and_retains_unbound_unknowns() {
 }
 
 #[test]
+fn npm_extglob_workspace_fixture_accepts_real_link_and_rejects_forged_nonmatches() {
+    let fixture = npm_fixture("npm-v3-mixed-negative-extglob").join("package-lock.json");
+    let valid = TestDirectory::new("npm-extglob-workspace-valid");
+    let valid_cache = valid.path().join("cache");
+    fs::copy(&fixture, valid.path().join("package-lock.json"))
+        .expect("copy npm 11 mixed-extglob fixture");
+    seed_empty_npm_dump(&valid_cache);
+
+    let output = command(&valid_cache)
+        .args([
+            "scan",
+            "--offline",
+            "--format",
+            "json",
+            valid.path().to_str().expect("UTF-8 project path"),
+        ])
+        .output()
+        .expect("scan valid npm 11 mixed-extglob fixture");
+    assert_exit(&output, 0);
+    assert_eq!(
+        report_package_names(&json_report(&output)),
+        BTreeSet::from(["left-pad"])
+    );
+
+    let source: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture).expect("read npm 11 fixture"))
+            .expect("decode npm 11 fixture");
+    for (label, pattern, forged_target) in [
+        (
+            "excluded-negative-suffix",
+            "packages/pre!(bad).js",
+            "packages/prebad.js",
+        ),
+        (
+            "standalone-star-remainder",
+            "packages/!(a)@(*)",
+            "packages/a",
+        ),
+    ] {
+        let directory = TestDirectory::new(&format!("npm-extglob-forged-{label}"));
+        let cache = directory.path().join("cache");
+        let mut forged = source.clone();
+        forged["packages"][""]["workspaces"] = serde_json::json!([pattern]);
+        forged["packages"]["node_modules/@ds063/pregood"]["resolved"] =
+            serde_json::Value::String(forged_target.to_owned());
+        let workspace = forged["packages"]
+            .as_object_mut()
+            .expect("npm packages object")
+            .remove("packages/pregood.js")
+            .expect("real workspace descriptor");
+        forged["packages"]
+            .as_object_mut()
+            .expect("npm packages object")
+            .insert(forged_target.to_owned(), workspace);
+        fs::write(
+            directory.path().join("package-lock.json"),
+            serde_json::to_vec_pretty(&forged).expect("encode forged npm lock"),
+        )
+        .expect("write structurally complete forged npm lock");
+
+        let output = command(&cache)
+            .args([
+                "scan",
+                directory.path().to_str().expect("UTF-8 project path"),
+            ])
+            .output()
+            .expect("scan forged npm extglob link");
+        assert_exit(&output, 10);
+        assert_diagnostic_only_on_stderr(&output, "no matching workspace identity");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(forged_target));
+        assert!(!stderr.contains("provider hard failure"));
+    }
+}
+
+#[test]
 fn cargo_filters_use_exact_locked_identities_and_retain_unknowns() {
     let directory = TestDirectory::new("cargo-exact-graph-filters");
     let cache = directory.path().join("cache");

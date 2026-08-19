@@ -1,0 +1,1449 @@
+{
+  "oracle": {
+    "node": "22.12.0",
+    "npm": "11.0.0",
+    "minimatch": "9.0.5",
+    "unicode": "16.0",
+    "options": "defaults"
+  },
+  "candidates": [
+    "packages/a",
+    "packages/b",
+    "packages/c",
+    "packages/x",
+    "packages/aa",
+    "packages/ab",
+    "packages/ac",
+    "packages/ba",
+    "packages/bb",
+    "packages/bc",
+    "packages/abc",
+    "packages/axc",
+    "packages/pre.js",
+    "packages/prebad.js",
+    "packages/pregood.js",
+    "packages/foo.js",
+    "packages/bar.js",
+    "packages/baz.js",
+    "packages/.x",
+    "packages/.y",
+    "packages/@",
+    "packages/@()",
+    "packages/a@",
+    "packages/b@",
+    "packages/b@()",
+    "packages/1",
+    "packages/λ",
+    "packages/a1",
+    "packages/a-b",
+    "packages/a/b"
+  ],
+  "cases": [
+    {
+      "pattern": "packages/pre!(bad).js",
+      "matches": [
+        "packages/pre.js",
+        "packages/pregood.js"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)*",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)b",
+      "matches": [
+        "packages/b",
+        "packages/bb",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/a!(b)c",
+      "matches": [
+        "packages/ac",
+        "packages/axc"
+      ]
+    },
+    {
+      "pattern": "packages/!(a|b)",
+      "matches": [
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/!(|a)",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/!(a|)",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/!()",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/!(a||b)",
+      "matches": [
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/*@(a|b)",
+      "matches": [
+        "packages/aa",
+        "packages/ab",
+        "packages/ba",
+        "packages/bb",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@(a|b)*",
+      "matches": [
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/**@(a|b)",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/aa",
+        "packages/ab",
+        "packages/ba",
+        "packages/bb",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@(a|b)**",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/*?@(a|b)",
+      "matches": [
+        "packages/aa",
+        "packages/ab",
+        "packages/ba",
+        "packages/bb",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@(a*|b)",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/abc",
+        "packages/axc",
+        "packages/a@",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/a*@(b|c)",
+      "matches": [
+        "packages/ab",
+        "packages/ac",
+        "packages/abc",
+        "packages/axc",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/*+(a|b)",
+      "matches": [
+        "packages/aa",
+        "packages/ab",
+        "packages/ba",
+        "packages/bb",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/+(a|b)*",
+      "matches": [
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/item?(s|z)",
+      "matches": []
+    },
+    {
+      "pattern": "packages/+(ab|c)",
+      "matches": [
+        "packages/c",
+        "packages/ab",
+        "packages/abc"
+      ]
+    },
+    {
+      "pattern": "packages/x*(ab|c)",
+      "matches": [
+        "packages/x"
+      ]
+    },
+    {
+      "pattern": "packages/!(@(foo|bar)).js",
+      "matches": [
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js"
+      ]
+    },
+    {
+      "pattern": "packages/!(@(foo)|bar).js",
+      "matches": [
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/baz.js"
+      ]
+    },
+    {
+      "pattern": "packages/!(bar|@(foo)).js",
+      "matches": [
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js"
+      ]
+    },
+    {
+      "pattern": "packages/@(!(foo)|bar).js",
+      "matches": [
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/bar.js",
+        "packages/baz.js"
+      ]
+    },
+    {
+      "pattern": "packages/!(!(foo)).js",
+      "matches": [
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js"
+      ]
+    },
+    {
+      "pattern": "packages/@(!(a)|b)",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)@(*)",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)@(*|b)",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ"
+      ]
+    },
+    {
+      "pattern": "packages/@(.x|*)",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/.x",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/?(a)@(*)",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/.x",
+        "packages/.y",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/*(a)@(*)",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/.x",
+        "packages/.y",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@(a|)*",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/.x",
+        "packages/.y",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/+(a|)*",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/.x",
+        "packages/.y",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@()",
+      "matches": [
+        "packages/@()"
+      ]
+    },
+    {
+      "pattern": "packages/@(|a)",
+      "matches": [
+        "packages/a"
+      ]
+    },
+    {
+      "pattern": "packages/?(|a)",
+      "matches": [
+        "packages/a"
+      ]
+    },
+    {
+      "pattern": "packages/+(|a)",
+      "matches": [
+        "packages/a",
+        "packages/aa"
+      ]
+    },
+    {
+      "pattern": "packages/*(|a)",
+      "matches": [
+        "packages/a",
+        "packages/aa"
+      ]
+    },
+    {
+      "pattern": "packages/pre!().js",
+      "matches": [
+        "packages/prebad.js",
+        "packages/pregood.js"
+      ]
+    },
+    {
+      "pattern": "packages/pre!(bad|).js",
+      "matches": [
+        "packages/prebad.js",
+        "packages/pregood.js"
+      ]
+    },
+    {
+      "pattern": "packages/pre!(|bad).js",
+      "matches": [
+        "packages/pregood.js"
+      ]
+    },
+    {
+      "pattern": "packages/@(a|@(b|c))",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c"
+      ]
+    },
+    {
+      "pattern": "packages/@(@(a|b)*|c)",
+      "matches": [
+        "packages/c",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@(*@(a|b)|c)",
+      "matches": [
+        "packages/c",
+        "packages/aa",
+        "packages/ab",
+        "packages/ba",
+        "packages/bb",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@(a|!(b))c",
+      "matches": [
+        "packages/c",
+        "packages/ac",
+        "packages/abc",
+        "packages/axc"
+      ]
+    },
+    {
+      "pattern": "packages/a!(@(b|c))d",
+      "matches": []
+    },
+    {
+      "pattern": "packages/!(a*)",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ"
+      ]
+    },
+    {
+      "pattern": "packages/!([ab]|c)",
+      "matches": [
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/@([ab]|?)",
+      "matches": [
+        "packages/a",
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/@",
+        "packages/1",
+        "packages/λ"
+      ]
+    },
+    {
+      "pattern": "packages/a@()b",
+      "matches": [
+        "packages/ab"
+      ]
+    },
+    {
+      "pattern": "packages/@()x",
+      "matches": [
+        "packages/x"
+      ]
+    },
+    {
+      "pattern": "packages/@(@()a|b)",
+      "matches": [
+        "packages/a",
+        "packages/b"
+      ]
+    },
+    {
+      "pattern": "packages/@(@()|b)",
+      "matches": [
+        "packages/b",
+        "packages/@"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)@()",
+      "matches": [
+        "packages/@",
+        "packages/a@",
+        "packages/b@"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)?()",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)+()",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    },
+    {
+      "pattern": "packages/!(a)*()",
+      "matches": [
+        "packages/b",
+        "packages/c",
+        "packages/x",
+        "packages/aa",
+        "packages/ab",
+        "packages/ac",
+        "packages/ba",
+        "packages/bb",
+        "packages/bc",
+        "packages/abc",
+        "packages/axc",
+        "packages/pre.js",
+        "packages/prebad.js",
+        "packages/pregood.js",
+        "packages/foo.js",
+        "packages/bar.js",
+        "packages/baz.js",
+        "packages/@",
+        "packages/@()",
+        "packages/a@",
+        "packages/b@",
+        "packages/b@()",
+        "packages/1",
+        "packages/λ",
+        "packages/a1",
+        "packages/a-b"
+      ]
+    }
+  ],
+  "pairs": [
+    {
+      "pattern": "packages/!()!()",
+      "candidate": "packages/x.",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!()!()",
+      "candidate": "packages/x..",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!()!()",
+      "candidate": "packages/xy",
+      "matches": true
+    },
+    {
+      "pattern": "packages/!()!()",
+      "candidate": "packages/x.y",
+      "matches": true
+    },
+    {
+      "pattern": "packages/!(a|)!()",
+      "candidate": "packages/x.",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!(a|)!(b|)",
+      "candidate": "packages/x.",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!(a|)!(@())",
+      "candidate": "packages/x.",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!()@(*)",
+      "candidate": "packages/a.",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!()+(*)",
+      "candidate": "packages/a.",
+      "matches": false
+    },
+    {
+      "pattern": "packages/+(*)",
+      "candidate": "packages/a.",
+      "matches": true
+    },
+    {
+      "pattern": "packages/+(*)",
+      "candidate": "packages/.a",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!(a)!(a|)b",
+      "candidate": "packages/aab",
+      "matches": true
+    },
+    {
+      "pattern": "packages/!(a)!(b|)b",
+      "candidate": "packages/abb",
+      "matches": true
+    },
+    {
+      "pattern": "packages/!(a)!(@(a)|)b",
+      "candidate": "packages/aab",
+      "matches": true
+    },
+    {
+      "pattern": "packages/😀",
+      "candidate": "packages/😀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@(😀)",
+      "candidate": "packages/😀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/?",
+      "candidate": "packages/😀",
+      "matches": false
+    },
+    {
+      "pattern": "packages/??",
+      "candidate": "packages/😀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@(?)",
+      "candidate": "packages/😀",
+      "matches": false
+    },
+    {
+      "pattern": "packages/[𐀀]",
+      "candidate": "packages/𐀀",
+      "matches": false
+    },
+    {
+      "pattern": "packages/[!𐀀]",
+      "candidate": "packages/𐀀",
+      "matches": false
+    },
+    {
+      "pattern": "packages/*[𐀀]",
+      "candidate": "packages/𐀀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@(?|[[:alpha:]])",
+      "candidate": "packages/😀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@([𐀀]|[[:digit:]])",
+      "candidate": "packages/𐀀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[[:alpha:]]/?",
+      "candidate": "packages/a/😀",
+      "matches": false
+    },
+    {
+      "pattern": "packages/[[:alpha:]]/??",
+      "candidate": "packages/a/😀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[a-[:alpha:]]",
+      "candidate": "packages/a",
+      "matches": false
+    },
+    {
+      "pattern": "packages/[!a[:graph:]]",
+      "candidate": "packages/b",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[.-.]x",
+      "candidate": "packages/.x",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@([a-]|[[:alpha:]])",
+      "candidate": "packages/-",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@(-|[[:ascii:]])",
+      "candidate": "packages/-",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[[:alpha:]]/-",
+      "candidate": "packages/a/-",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@([\n]|[[:alpha:]])",
+      "candidate": "packages/\n",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@([\r]|[[:alpha:]])",
+      "candidate": "packages/\r",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@([\u2028]|[[:alpha:]])",
+      "candidate": "packages/\u2028",
+      "matches": true
+    },
+    {
+      "pattern": "packages/@([\u2029]|[[:alpha:]])",
+      "candidate": "packages/\u2029",
+      "matches": true
+    },
+    {
+      "pattern": "packages/*(?(*)|b)",
+      "candidate": "packages/.a",
+      "matches": true
+    },
+    {
+      "pattern": "packages/*(*(*)|b)",
+      "candidate": "packages/.a",
+      "matches": true
+    },
+    {
+      "pattern": "packages/*(*(?|*)|b)",
+      "candidate": "packages/.a",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[{a,b}]",
+      "candidate": "packages/a",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[{a,b}]",
+      "candidate": "packages/{",
+      "matches": false
+    },
+    {
+      "pattern": "packages/[{a,b}]",
+      "candidate": "packages/,",
+      "matches": false
+    },
+    {
+      "pattern": "packages/[{1..3}]",
+      "candidate": "packages/2",
+      "matches": true
+    },
+    {
+      "pattern": "packages/{[,],x}",
+      "candidate": "packages/,",
+      "matches": false
+    },
+    {
+      "pattern": "packages/{[,],x}",
+      "candidate": "packages/[",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[a[:graph:]][[:alpha:]]",
+      "candidate": "packages/.x",
+      "matches": true
+    },
+    {
+      "pattern": "packages/[!a[:graph:]][[:alpha:]]",
+      "candidate": "packages/.x",
+      "matches": true
+    },
+    {
+      "pattern": "packages/${a,b}",
+      "candidate": "packages/${a,b}",
+      "matches": true
+    },
+    {
+      "pattern": "packages/${a,b}",
+      "candidate": "packages/$a",
+      "matches": false
+    },
+    {
+      "pattern": "packages/x${a,b}y",
+      "candidate": "packages/x${a,b}y",
+      "matches": true
+    },
+    {
+      "pattern": "packages/$x{a,b}",
+      "candidate": "packages/$xa",
+      "matches": true
+    },
+    {
+      "pattern": "packages/{[😀],[[:alpha:]]}",
+      "candidate": "packages/😀",
+      "matches": false
+    },
+    {
+      "pattern": "packages/!(?)",
+      "candidate": "packages/😀",
+      "matches": true
+    },
+    {
+      "pattern": "packages/!(?|[[:alpha:]])",
+      "candidate": "packages/😀",
+      "matches": false
+    }
+  ],
+  "rejects": [
+    {
+      "pattern": "packages/@(?())",
+      "contains": "mixed or nested empty",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(+())",
+      "contains": "mixed or nested empty",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(*())",
+      "contains": "mixed or nested empty",
+      "npmThrows": true
+    },
+    {
+      "pattern": "@(packages/a|packages/b)",
+      "contains": "must not cross path separators",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/@(a/b|c)",
+      "contains": "must not cross path separators",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/!()?()",
+      "contains": "invalid minimatch regular expression",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/!()+()",
+      "contains": "invalid minimatch regular expression",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/!()*()",
+      "contains": "invalid minimatch regular expression",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/!(a|)?()",
+      "contains": "invalid minimatch regular expression",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/!(@(a))?()",
+      "contains": "invalid minimatch regular expression",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(!()?())",
+      "contains": "invalid minimatch regular expression",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/!(a)!()?()",
+      "contains": "invalid minimatch regular expression",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(-|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(,|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(#|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@( |[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@([-]|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@([---]|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(\n|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(\r|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(\u2028|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/@(\u2029|[[:alpha:]])",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/[𐀀-𐀂]",
+      "contains": "non-BMP characters with hyphens",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/[!a😀-a]?",
+      "contains": "non-BMP characters with hyphens",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/@([a-😀]|[[:digit:]])",
+      "contains": "non-BMP characters with hyphens",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/@([😀-\ue000]|[[:digit:]])",
+      "contains": "non-BMP characters with hyphens",
+      "npmThrows": true
+    },
+    {
+      "pattern": "packages/+(@())",
+      "contains": "repeated extglobs containing nested empty @()",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/*(a|@())",
+      "contains": "repeated extglobs containing nested empty @()",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/@(a|b",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/!(a|b",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/?(",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/*(",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/@(!(a)",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/@(?(a)",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/@({a,!(x,y)}|z)",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/**(b",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/**({b,#}",
+      "contains": "unmatched npm workspace extglob openers",
+      "npmThrows": false
+    },
+    {
+      "pattern": "packages/[a-[:alpha:]]#[[:digit:]]",
+      "contains": "invalid under minimatch's Unicode regular-expression rules",
+      "npmThrows": false
+    }
+  ]
+}

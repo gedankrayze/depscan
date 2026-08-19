@@ -135,6 +135,21 @@ fn parses_realistic_nonempty_fixtures_for_every_lock_format() {
 }
 
 #[test]
+fn parses_npm11_mixed_negative_extglob_workspace_fixture() {
+    let path = fixtures().join("npm-v3-mixed-negative-extglob/package-lock.json");
+    let packages = parse(path.clone(), SourceKind::PackageLock).unwrap_or_else(|error| {
+        panic!("{} failed npm 11 workspace parse: {error}", path.display())
+    });
+
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0].name, "left-pad");
+    assert_eq!(packages[0].version, "1.3.0");
+    assert!(packages[0].direct);
+    assert!(packages[0].direct_known);
+    assert_eq!(packages[0].source_file, path);
+}
+
+#[test]
 fn accepts_supported_numeric_pnpm_v6_schema() {
     let format = FORMATS
         .iter()

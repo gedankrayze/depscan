@@ -81,5 +81,5 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-060](DS-060.md) | P1 | In progress | Make requirements include reads capability-safe |
 | [DS-061](DS-061.md) | P1 | In progress | Preserve the verified GitHub Action executable identity |
 | [DS-062](DS-062.md) | P2 | Open | Remove direct use of maintenance-seeking `urlencoding` |
-| [DS-063](DS-063.md) | P1 | Open | Support suffix-aware npm extglobs safely |
+| [DS-063](DS-063.md) | P1 | Closed | Support suffix-aware npm extglobs safely |
 | [DS-064](DS-064.md) | P1 | In progress | Use full-width held-handle identity at filesystem trust boundaries |
