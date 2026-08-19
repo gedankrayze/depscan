@@ -1767,9 +1767,49 @@ fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Option<f32> {
         })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OsvDumpLimits {
+    max_compressed_bytes: u64,
+    max_entry_bytes: u64,
+    max_uncompressed_bytes: u64,
+    max_entries: usize,
+}
+
+impl OsvDumpLimits {
+    fn production() -> Self {
+        Self {
+            max_compressed_bytes: OSV_DUMP_MAX_DOWNLOAD_BYTES,
+            max_entry_bytes: OSV_DUMP_MAX_ENTRY_BYTES,
+            max_uncompressed_bytes: OSV_DUMP_MAX_UNCOMPRESSED_BYTES,
+            max_entries: OSV_DUMP_MAX_ENTRIES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OsvDumpValidationContext<'a> {
+    Sync(Ecosystem),
+    Offline(&'a Path),
+}
+
+impl OsvDumpValidationContext<'_> {
+    fn invalid(self, reason: impl std::fmt::Display) -> ProviderError {
+        match self {
+            Self::Sync(ecosystem) => ProviderError::InvalidResponse(format!(
+                "OSV dump for {} is invalid: {reason}",
+                ecosystem.osv_name()
+            )),
+            Self::Offline(path) => {
+                ProviderError::Offline(format!("OSV dump {} is invalid: {reason}", path.display()))
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OsvOffline {
     cache: Cache,
+    limits: OsvDumpLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1783,7 +1823,10 @@ enum OsvDumpAge {
 
 impl OsvOffline {
     pub fn new(cache: Cache) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            limits: OsvDumpLimits::production(),
+        }
     }
     fn archive_path(&self, ecosystem: Ecosystem) -> PathBuf {
         self.cache
@@ -1939,28 +1982,21 @@ impl OsvOffline {
                     "OSV dump is older than the default seven-day warning age; run `depscan sync`"
                 );
             }
-            let mut archive =
-                ZipArchive::new(file).map_err(|e| ProviderError::Offline(e.to_string()))?;
-            for index in 0..archive.len() {
-                let mut entry = archive
-                    .by_index(index)
-                    .map_err(|e| ProviderError::Offline(e.to_string()))?;
-                if !entry.name().ends_with(".json") {
-                    continue;
-                }
-                let mut text = String::new();
-                entry
-                    .read_to_string(&mut text)
-                    .map_err(|e| ProviderError::Offline(e.to_string()))?;
-                let Ok(document) = serde_json::from_str::<Value>(&text) else {
-                    continue;
-                };
+            let context = OsvDumpValidationContext::Offline(&archive_path);
+            visit_osv_dump_file(file, context, self.limits, true, |entry_name, document| {
                 for package in &scoped {
-                    if let Some(vulnerability) = vulnerability_from_osv(&document, Some(package))? {
+                    if let Some(vulnerability) = vulnerability_from_osv(document, Some(package))
+                        .map_err(|error| {
+                            context.invalid(format_args!(
+                                "entry {entry_name:?} cannot be evaluated: {error}"
+                            ))
+                        })?
+                    {
                         output.entry(package.key()).or_default().push(vulnerability);
                     }
                 }
-            }
+                Ok(())
+            })?;
         }
         Ok(output)
     }
@@ -2043,6 +2079,15 @@ impl OsvSyncConfig {
             attempts: self.attempts,
             backoff_base: self.backoff_base,
             max_delay: self.max_retry_delay,
+        }
+    }
+
+    fn dump_limits(&self) -> OsvDumpLimits {
+        OsvDumpLimits {
+            max_compressed_bytes: self.max_download_bytes,
+            max_entry_bytes: self.max_entry_bytes,
+            max_uncompressed_bytes: self.max_uncompressed_bytes,
+            max_entries: self.max_entries,
         }
     }
 }
@@ -2227,11 +2272,126 @@ impl HttpClient {
     }
 }
 
-#[derive(Deserialize)]
-struct OsvDumpDocumentShape {
-    id: String,
-    #[serde(rename = "modified")]
-    _modified: DateTime<Utc>,
+fn validate_osv_dump_document(entry_name: &str, document: &Value) -> Result<(), String> {
+    let object = document
+        .as_object()
+        .ok_or_else(|| "top-level JSON value is not an object".to_owned())?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "required field `id` is not a string".to_owned())?;
+    if !valid_osv_id(id) {
+        return Err("field `id` is not a valid OSV identifier".to_owned());
+    }
+    let modified = object
+        .get("modified")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "required field `modified` is not a string".to_owned())?;
+    DateTime::parse_from_rfc3339(modified)
+        .map_err(|error| format!("field `modified` is not an RFC 3339 timestamp: {error}"))?;
+    if entry_name != format!("{id}.json") {
+        return Err(format!("filename does not match advisory id {id:?}"));
+    }
+    Ok(())
+}
+
+fn visit_osv_dump_file<F>(
+    file: File,
+    context: OsvDumpValidationContext<'_>,
+    limits: OsvDumpLimits,
+    allow_empty: bool,
+    mut visit: F,
+) -> Result<(), ProviderError>
+where
+    F: FnMut(&str, &Value) -> Result<(), ProviderError>,
+{
+    let compressed_bytes = file
+        .metadata()
+        .map_err(|error| context.invalid(format_args!("cannot inspect archive: {error}")))?
+        .len();
+    if compressed_bytes > limits.max_compressed_bytes {
+        return Err(context.invalid(format_args!(
+            "compressed size exceeds {} bytes",
+            limits.max_compressed_bytes
+        )));
+    }
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| context.invalid(format_args!("bad ZIP: {error}")))?;
+    if archive.len() > limits.max_entries {
+        return Err(context.invalid(format_args!("entry count exceeds {}", limits.max_entries)));
+    }
+
+    let mut json_entries = 0usize;
+    let mut declared_uncompressed_bytes = 0u64;
+    let mut actual_uncompressed_bytes = 0u64;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            context.invalid(format_args!("cannot open entry at index {index}: {error}"))
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_owned();
+        if !name.ends_with(".json") {
+            return Err(context.invalid(format_args!("unexpected non-JSON entry {name:?}")));
+        }
+        if entry.size() > limits.max_entry_bytes {
+            return Err(context.invalid(format_args!(
+                "entry {name:?} exceeds {} declared uncompressed bytes",
+                limits.max_entry_bytes
+            )));
+        }
+        declared_uncompressed_bytes = declared_uncompressed_bytes
+            .checked_add(entry.size())
+            .ok_or_else(|| context.invalid("declared uncompressed size overflowed"))?;
+        if declared_uncompressed_bytes > limits.max_uncompressed_bytes {
+            return Err(context.invalid(format_args!(
+                "declared uncompressed size exceeds {} bytes at entry {name:?}",
+                limits.max_uncompressed_bytes
+            )));
+        }
+
+        let entry_read_limit = limits.max_entry_bytes.saturating_add(1);
+        let mut limited = (&mut entry).take(entry_read_limit);
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
+        let parsed = Value::deserialize(&mut deserializer).and_then(|document| {
+            deserializer.end()?;
+            Ok(document)
+        });
+        drop(deserializer);
+        let actual_entry_bytes = entry_read_limit.saturating_sub(limited.limit());
+        if actual_entry_bytes > limits.max_entry_bytes {
+            return Err(context.invalid(format_args!(
+                "entry {name:?} exceeds {} actual uncompressed bytes",
+                limits.max_entry_bytes
+            )));
+        }
+        actual_uncompressed_bytes = actual_uncompressed_bytes
+            .checked_add(actual_entry_bytes)
+            .ok_or_else(|| context.invalid("actual uncompressed size overflowed"))?;
+        if actual_uncompressed_bytes > limits.max_uncompressed_bytes {
+            return Err(context.invalid(format_args!(
+                "actual uncompressed size exceeds {} bytes at entry {name:?}",
+                limits.max_uncompressed_bytes
+            )));
+        }
+        let document = parsed.map_err(|error| {
+            context.invalid(format_args!(
+                "entry {name:?} is not complete valid UTF-8 JSON: {error}"
+            ))
+        })?;
+        validate_osv_dump_document(&name, &document).map_err(|error| {
+            context.invalid(format_args!(
+                "entry {name:?} is not an OSV document: {error}"
+            ))
+        })?;
+        visit(&name, &document)?;
+        json_entries += 1;
+    }
+    if json_entries == 0 && !allow_empty {
+        return Err(context.invalid("archive contains no JSON entries"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2249,108 +2409,13 @@ fn validate_osv_dump_file(
     ecosystem: Ecosystem,
     config: &OsvSyncConfig,
 ) -> Result<(), ProviderError> {
-    let invalid = |reason: String| {
-        ProviderError::InvalidResponse(format!(
-            "OSV dump for {} is invalid: {reason}",
-            ecosystem.osv_name()
-        ))
-    };
-    let compressed_bytes = file
-        .metadata()
-        .map_err(|error| ProviderError::Cache(error.to_string()))?
-        .len();
-    if compressed_bytes > config.max_download_bytes {
-        return Err(invalid(format!(
-            "compressed size exceeds {} bytes",
-            config.max_download_bytes
-        )));
-    }
-    let mut archive = ZipArchive::new(file).map_err(|error| invalid(error.to_string()))?;
-    if archive.len() > config.max_entries {
-        return Err(invalid(format!(
-            "entry count exceeds {}",
-            config.max_entries
-        )));
-    }
-
-    let mut json_entries = 0usize;
-    let mut declared_uncompressed_bytes = 0u64;
-    let mut actual_uncompressed_bytes = 0u64;
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| invalid(error.to_string()))?;
-        if entry.is_dir() {
-            continue;
-        }
-        if !entry.name().ends_with(".json") {
-            return Err(invalid(format!(
-                "unexpected non-JSON entry {:?}",
-                entry.name()
-            )));
-        }
-        if entry.size() > config.max_entry_bytes {
-            return Err(invalid(format!(
-                "entry {:?} exceeds {} uncompressed bytes",
-                entry.name(),
-                config.max_entry_bytes
-            )));
-        }
-        declared_uncompressed_bytes = declared_uncompressed_bytes
-            .checked_add(entry.size())
-            .ok_or_else(|| invalid("uncompressed size overflowed".to_owned()))?;
-        if declared_uncompressed_bytes > config.max_uncompressed_bytes {
-            return Err(invalid(format!(
-                "declared uncompressed size exceeds {} bytes",
-                config.max_uncompressed_bytes
-            )));
-        }
-
-        let name = entry.name().to_owned();
-        let entry_read_limit = config.max_entry_bytes.saturating_add(1);
-        let mut limited = (&mut entry).take(entry_read_limit);
-        let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
-        let parsed = OsvDumpDocumentShape::deserialize(&mut deserializer).and_then(|document| {
-            deserializer.end()?;
-            Ok(document)
-        });
-        drop(deserializer);
-        let actual_entry_bytes = entry_read_limit.saturating_sub(limited.limit());
-        if actual_entry_bytes > config.max_entry_bytes {
-            return Err(invalid(format!(
-                "entry {name:?} exceeds {} actual uncompressed bytes",
-                config.max_entry_bytes
-            )));
-        }
-        actual_uncompressed_bytes = actual_uncompressed_bytes
-            .checked_add(actual_entry_bytes)
-            .ok_or_else(|| invalid("actual uncompressed size overflowed".to_owned()))?;
-        if actual_uncompressed_bytes > config.max_uncompressed_bytes {
-            return Err(invalid(format!(
-                "actual uncompressed size exceeds {} bytes",
-                config.max_uncompressed_bytes
-            )));
-        }
-        let document = parsed.map_err(|error| {
-            invalid(format!(
-                "entry {name:?} is not a complete OSV document: {error}"
-            ))
-        })?;
-        if !valid_osv_id(&document.id) {
-            return Err(invalid(format!("entry {name:?} has an invalid OSV id")));
-        }
-        if name != format!("{}.json", document.id) {
-            return Err(invalid(format!(
-                "entry {name:?} does not match OSV id {:?}",
-                document.id
-            )));
-        }
-        json_entries += 1;
-    }
-    if json_entries == 0 {
-        return Err(invalid("archive contains no JSON entries".to_owned()));
-    }
-    Ok(())
+    visit_osv_dump_file(
+        file,
+        OsvDumpValidationContext::Sync(ecosystem),
+        config.dump_limits(),
+        false,
+        |_, _| Ok(()),
+    )
 }
 
 fn validate_owned_offline_directory(root: &Path) -> Result<PathBuf, ProviderError> {
@@ -3748,6 +3813,40 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn valid_offline_document(id: &str, details: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": id,
+            "modified": TEST_OSV_MODIFIED,
+            "details": details,
+            "affected": []
+        }))
+        .unwrap()
+    }
+
+    fn scan_offline_archive(
+        archive_bytes: &[u8],
+        limits: OsvDumpLimits,
+    ) -> Result<VulnMap, ProviderError> {
+        let directory = tempfile::tempdir().unwrap();
+        let cache =
+            Cache::from_root(directory.path().join("cache"), CachePolicy::default()).unwrap();
+        let archive = cache.root().join("offline/npm.zip");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::write(&archive, archive_bytes).unwrap();
+        fs::write(archive.with_extension("synced-at"), TEST_OSV_MODIFIED).unwrap();
+        let provider = OsvOffline { cache, limits };
+        let package = Package::new(
+            Ecosystem::Npm,
+            "offline-fixture",
+            "1.0.0",
+            PathBuf::from("package-lock.json"),
+        );
+        provider.query_blocking_at(
+            std::slice::from_ref(&package),
+            test_timestamp("2026-08-19T12:00:00Z"),
+        )
+    }
+
     #[test]
     fn offline_dump_age_handles_fresh_stale_missing_malformed_and_future_markers() {
         let directory = tempfile::tempdir().unwrap();
@@ -3805,6 +3904,123 @@ mod tests {
             .validate_dump_age_at(&archive, Ecosystem::Npm, now)
             .unwrap_err();
         assert!(future.to_string().contains("is in the future"));
+    }
+
+    #[test]
+    fn offline_dump_rejects_malformed_utf8_schema_and_truncated_entries_with_context() {
+        let limits = OsvDumpLimits::production();
+        let cases = [
+            (
+                "malformed JSON",
+                archive_with_entry("TEST-MALFORMED.json", br#"{not-json}"#),
+                "valid UTF-8 JSON",
+            ),
+            (
+                "truncated JSON entry",
+                archive_with_entry("TEST-TRUNCATED.json", br#"{"id":"TEST-TRUNCATED""#),
+                "valid UTF-8 JSON",
+            ),
+            (
+                "invalid UTF-8",
+                archive_with_entry("TEST-UTF8.json", &[0xff, 0xfe, 0xfd]),
+                "valid UTF-8 JSON",
+            ),
+            (
+                "schema-invalid object",
+                archive_with_entry("TEST-SCHEMA.json", br#"{}"#),
+                "not an OSV document",
+            ),
+            (
+                "trailing data",
+                archive_with_entry(
+                    "TEST-TRAILING.json",
+                    br#"{"id":"TEST-TRAILING","modified":"2026-08-19T00:00:00Z"} trailing"#,
+                ),
+                "valid UTF-8 JSON",
+            ),
+        ];
+
+        for (case, archive, expected) in cases {
+            let error = scan_offline_archive(&archive, limits).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("npm.zip"), "{case}: {message}");
+            assert!(message.contains("entry \"TEST-"), "{case}: {message}");
+            assert!(message.contains(expected), "{case}: {message}");
+        }
+
+        let valid = valid_offline_document("TEST-TRUNCATED-ZIP", "fixture");
+        let mut truncated_zip = archive_with_entry("TEST-TRUNCATED-ZIP.json", &valid);
+        truncated_zip.truncate(truncated_zip.len() - 10);
+        let error = scan_offline_archive(&truncated_zip, limits).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("npm.zip"), "{message}");
+        assert!(message.contains("bad ZIP"), "{message}");
+    }
+
+    #[test]
+    fn offline_dump_enforces_entry_aggregate_count_and_actual_decompression_limits() {
+        let bomb = valid_offline_document("TEST-BOMB", &"x".repeat(8 * 1024));
+        let bomb_archive = archive_with_entries(
+            &[("TEST-BOMB.json", bomb.as_slice())],
+            zip::CompressionMethod::Deflated,
+        );
+        let mut limits = OsvDumpLimits::production();
+        limits.max_entry_bytes = 1024;
+        let error = scan_offline_archive(&bomb_archive, limits).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("npm.zip"), "{message}");
+        assert!(message.contains("TEST-BOMB.json"), "{message}");
+        assert!(message.contains("declared uncompressed"), "{message}");
+
+        let first = valid_offline_document("TEST-AGGREGATE-1", "first");
+        let second = valid_offline_document("TEST-AGGREGATE-2", "second");
+        let aggregate = archive_with_entries(
+            &[
+                ("TEST-AGGREGATE-1.json", first.as_slice()),
+                ("TEST-AGGREGATE-2.json", second.as_slice()),
+            ],
+            zip::CompressionMethod::Stored,
+        );
+        limits = OsvDumpLimits::production();
+        limits.max_uncompressed_bytes = first.len() as u64 + second.len() as u64 - 1;
+        let error = scan_offline_archive(&aggregate, limits).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("declared uncompressed size"), "{message}");
+        assert!(message.contains("TEST-AGGREGATE-2.json"), "{message}");
+
+        limits = OsvDumpLimits::production();
+        limits.max_entries = 1;
+        let error = scan_offline_archive(&aggregate, limits).unwrap_err();
+        assert!(error.to_string().contains("entry count exceeds 1"));
+
+        limits = OsvDumpLimits::production();
+        limits.max_compressed_bytes = aggregate.len() as u64 - 1;
+        let error = scan_offline_archive(&aggregate, limits).unwrap_err();
+        assert!(error.to_string().contains("compressed size exceeds"));
+
+        let actual = valid_offline_document("TEST-ACTUAL", "forged declared size");
+        let mut forged = archive_with_entry("TEST-ACTUAL.json", &actual);
+        let central_header = forged
+            .windows(4)
+            .rposition(|window| window == b"PK\x01\x02")
+            .unwrap();
+        let forged_declared_size = u32::try_from(actual.len() - 2).unwrap();
+        forged[central_header + 24..central_header + 28]
+            .copy_from_slice(&forged_declared_size.to_le_bytes());
+        limits = OsvDumpLimits::production();
+        limits.max_entry_bytes = actual.len() as u64 - 1;
+        let error = scan_offline_archive(&forged, limits).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("TEST-ACTUAL.json"), "{message}");
+        assert!(message.contains("actual uncompressed"), "{message}");
+    }
+
+    #[test]
+    fn offline_dump_accepts_a_valid_empty_ecosystem_archive() {
+        let archive = archive_with_entries(&[], zip::CompressionMethod::Stored);
+        let result = scan_offline_archive(&archive, OsvDumpLimits::production()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.values().all(Vec::is_empty));
     }
 
     #[test]
@@ -4182,11 +4398,16 @@ mod tests {
                 .filter(|fixture| Ecosystem::from_cli(&fixture.ecosystem) == Some(ecosystem))
             {
                 let id = fixture.document.get("id").and_then(Value::as_str).unwrap();
+                let mut document = fixture.document.clone();
+                document
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("modified".to_owned(), json!(TEST_OSV_MODIFIED));
                 archive
                     .start_file(format!("{id}.json"), SimpleFileOptions::default())
                     .unwrap();
                 archive
-                    .write_all(serde_json::to_string(&fixture.document).unwrap().as_bytes())
+                    .write_all(serde_json::to_string(&document).unwrap().as_bytes())
                     .unwrap();
             }
             archive.finish().unwrap();
@@ -4656,15 +4877,24 @@ mod tests {
     }
 
     fn archive_with_entry(name: &str, contents: &[u8]) -> Vec<u8> {
+        archive_with_entries(&[(name, contents)], zip::CompressionMethod::Stored)
+    }
+
+    fn archive_with_entries(
+        entries: &[(&str, &[u8])],
+        compression: zip::CompressionMethod,
+    ) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
         let mut archive = zip::ZipWriter::new(cursor);
-        archive
-            .start_file(
-                name,
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
-            )
-            .unwrap();
-        archive.write_all(contents).unwrap();
+        for (name, contents) in entries {
+            archive
+                .start_file(
+                    *name,
+                    SimpleFileOptions::default().compression_method(compression),
+                )
+                .unwrap();
+            archive.write_all(contents).unwrap();
+        }
         archive.finish().unwrap().into_inner()
     }
 
@@ -7753,6 +7983,7 @@ mod tests {
             .write_all(
                 serde_json::to_string(&json!({
                     "id": "GHSA-5crp-9r3c-p9vr",
+                    "modified": TEST_OSV_MODIFIED,
                     "summary": "test advisory",
                     "affected": [{
                         "package": {

@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
@@ -322,6 +323,26 @@ fn seed_empty_osv_dump(cache: &Path, ecosystem: &str) {
         Utc::now().to_rfc3339(),
     )
     .expect("write offline dump timestamp");
+}
+
+fn seed_malformed_cargo_dump(cache: &Path) {
+    let offline = cache.join("offline");
+    fs::create_dir_all(&offline).expect("create offline cache directory");
+    let mut archive = zip::ZipWriter::new(
+        fs::File::create(offline.join("crates_io.zip")).expect("create offline dump"),
+    );
+    archive
+        .start_file(
+            "RUSTSEC-MALFORMED.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("start malformed advisory entry");
+    archive
+        .write_all(br#"{"id":"RUSTSEC-MALFORMED""#)
+        .expect("write malformed advisory entry");
+    archive.finish().expect("finish malformed offline dump");
+    fs::write(offline.join("crates_io.synced-at"), Utc::now().to_rfc3339())
+        .expect("write offline dump timestamp");
 }
 
 fn report_packages(report: &serde_json::Value) -> &[serde_json::Value] {
@@ -1702,6 +1723,27 @@ fn provider_hard_failure_exits_thirty() {
 
     assert_exit(&output, 30);
     assert_diagnostic_only_on_stderr(&output, "provider hard failure");
+}
+
+#[test]
+fn malformed_offline_advisory_cannot_produce_a_clean_report() {
+    let project = TestProject::rust("malformed-offline-advisory");
+    seed_malformed_cargo_dump(&project.cache);
+
+    let output = project.run(&[
+        "scan",
+        "--offline",
+        "--format",
+        "json",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 30);
+    assert_diagnostic_only_on_stderr(&output, "provider hard failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("crates_io.zip"), "{stderr}");
+    assert!(stderr.contains("RUSTSEC-MALFORMED.json"), "{stderr}");
+    assert!(stderr.contains("valid UTF-8 JSON"), "{stderr}");
 }
 
 #[test]

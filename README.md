@@ -147,6 +147,8 @@ depscan scan --offline .
 
 Offline scans use the downloaded per-ecosystem OSV archives and never construct an HTTP provider. Each archive must have the valid `*.synced-at` marker written by `depscan sync`; a missing, malformed, or future marker fails safely. Without `--max-cache-age`, archives older than seven days remain usable but emit a warning. With `--max-cache-age <duration>`, an older archive is rejected as stale and must be synchronized again.
 
+Every archive is revalidated while it is scanned, using the same ZIP, OSV document-shape, per-entry, entry-count, compressed-size, and aggregate decompression limits applied before a synchronized dump is published. A malformed, truncated, invalid UTF-8, schema-invalid, or oversized entry is reported with its archive and entry name as a provider hard failure (exit `30`), never as an empty vulnerability result. A structurally valid archive with no advisory entries is accepted as a valid empty ecosystem dump.
+
 Version freshness is evaluated from cached registry metadata when a usable entry exists. The normal six-hour registry TTL applies by default; an explicit `--max-cache-age` selects the age that an offline scan is willing to tolerate. Missing, stale, future-dated, corrupt, or `--no-cache` entries produce an `Unknown` freshness result and an explicit per-package reason in the report. No registry request is attempted in any of those cases.
 
 ## Development
