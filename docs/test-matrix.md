@@ -162,6 +162,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-047 | capability-relative sync race tests at acquisition, lock, cleanup, staging, archive/marker publication, rollback and error boundaries |
 | DS-048 | `secure_fs.rs` config/root/parent/final swap, symlink, atomic creation/replacement and permission-preservation tests plus CLI process checks |
 | DS-049 | `verify-github-action.sh`, typed argument-vector probes, and the Linux `uses: ./` CI smoke; real per-runner release download remains recorded in the issue |
+| DS-050 | online cached-registry and offline-dump manifest-to-OSV process tests, including exact/ranged constraints, shared-coordinate mapping, vulnerability exit `1`, and unresolved-cache errors |
 
 ## Platform and external evidence boundary
 

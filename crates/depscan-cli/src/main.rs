@@ -1,4 +1,5 @@
 mod secure_fs;
+mod vulnerability_resolution;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -29,6 +30,7 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
+use vulnerability_resolution::VulnerabilityQueryPlan;
 
 mod external_tools;
 
@@ -583,22 +585,24 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
     })
     .map_err(CliError::provider)?;
     let (vulnerability_outcome, freshness) = if args.offline {
-        let vulnerabilities = OsvOffline::new(cache.clone())
-            .query(&packages)
+        let registry = RegistryOffline::new(cache.clone());
+        let freshness = fetch_latest(&registry, &packages, true).await;
+        let plan = VulnerabilityQueryPlan::new(&packages, &freshness);
+        let vulnerabilities = OsvOffline::new(cache)
+            .query(plan.packages())
             .await
             .map_err(CliError::provider)?;
-        let registry = RegistryOffline::new(cache);
-        let freshness = fetch_latest(&registry, &packages, true).await;
-        (vulnerabilities, freshness)
+        (plan.remap(vulnerabilities), freshness)
     } else {
         let http = HttpClient::new().map_err(CliError::provider)?;
-        let vulnerabilities = OsvClient::new(http.clone(), cache.clone())
-            .query(&packages)
+        let registry = RegistryClient::new(http.clone(), cache.clone());
+        let freshness = fetch_latest(&registry, &packages, false).await;
+        let plan = VulnerabilityQueryPlan::new(&packages, &freshness);
+        let vulnerabilities = OsvClient::new(http, cache)
+            .query(plan.packages())
             .await
             .map_err(CliError::provider)?;
-        let registry = RegistryClient::new(http, cache);
-        let freshness = fetch_latest(&registry, &packages, false).await;
-        (vulnerabilities, freshness)
+        (plan.remap(vulnerabilities), freshness)
     };
     let vulnerabilities = vulnerability_outcome.vulnerabilities;
     let mut vulnerability_errors = vulnerability_outcome.errors;

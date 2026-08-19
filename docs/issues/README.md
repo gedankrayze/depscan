@@ -68,3 +68,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-047](DS-047.md) | P1 | In progress | Make offline sync publication capability-safe during directory swaps |
 | [DS-048](DS-048.md) | P1 | In progress | Make configuration and report file access capability-safe |
 | [DS-049](DS-049.md) | P2 | In progress | Deliver the M6 composite GitHub Action |
+| [DS-050](DS-050.md) | P1 | Closed | Scan registry-resolved manifest dependencies for vulnerabilities |
