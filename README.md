@@ -77,6 +77,8 @@ In that mode, equivalent scan results have canonical package, vulnerability, ali
 | 20 | No supported dependency source was detected. |
 | 30 | A provider or scan operation failed. |
 
+An installed version reported as yanked or deprecated is an independent freshness risk: it is shown even when version ordering classifies it as current, contributes once to the outdated total, and triggers exit code `2` for any active `--fail-on-outdated` threshold (`patch`, `minor`, or `major`). Use `never` to report without failing. The `yanked` field always describes the installed version, not `latest_stable`; PyPI releases are considered yanked only when every published file for that release is yanked.
+
 ## Configuration and suppressions
 
 `depscan.toml` is read from the scan root unless `--config` is supplied. Command-line values take precedence.

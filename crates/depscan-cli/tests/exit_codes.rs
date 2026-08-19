@@ -78,6 +78,24 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
         );
     }
 
+    fn seed_yanked_current(&self) {
+        self.seed_cache("osv/query", QUERY_DIGEST, "[]");
+        self.seed_cache(
+            "registry",
+            REGISTRY_DIGEST,
+            r#"{"schema_version":1,"entries":[{"name":"demo","vers":"0.9.0","yanked":false},{"name":"demo","vers":"1.0.0","yanked":true}]}"#,
+        );
+    }
+
+    fn seed_yanked_outdated(&self) {
+        self.seed_cache("osv/query", QUERY_DIGEST, "[]");
+        self.seed_cache(
+            "registry",
+            REGISTRY_DIGEST,
+            r#"{"schema_version":1,"entries":[{"name":"demo","vers":"1.0.0","yanked":true},{"name":"demo","vers":"2.0.0","yanked":false}]}"#,
+        );
+    }
+
     fn seed_vulnerability(&self) {
         self.seed_cache("osv/query", QUERY_DIGEST, r#"["RUSTSEC-TEST"]"#);
         self.seed_cache(
@@ -281,6 +299,61 @@ fn outdated_threshold_exits_two_and_writes_report_to_stdout() {
 
     assert_exit(&output, 2);
     assert_report_only_on_stdout(&output);
+}
+
+#[test]
+fn yanked_current_is_reported_in_every_format_and_obeys_failure_policy() {
+    let project = TestProject::rust("yanked-current");
+    project.seed_yanked_current();
+    let root = project.directory.path().to_str().expect("UTF-8 path");
+    let cases = [
+        ("table", "YANKED"),
+        ("json", "\"yanked\": true"),
+        ("sarif", "DEPSCAN-YANKED"),
+        ("summary", "1 yanked"),
+    ];
+
+    for (format, expected) in cases {
+        let output = project.run(&["scan", "--format", format, root]);
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "{format} did not contain {expected:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let failing = project.run(&[
+        "scan",
+        "--format",
+        "json",
+        "--fail-on-outdated",
+        "major",
+        root,
+    ]);
+    assert_exit(&failing, 2);
+    assert_report_only_on_stdout(&failing);
+}
+
+#[test]
+fn yanked_outdated_process_report_shows_both_signals_without_double_counting() {
+    let project = TestProject::rust("yanked-outdated");
+    project.seed_yanked_outdated();
+
+    let output = project.run(&[
+        "scan",
+        "--format",
+        "table",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty());
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(report.matches("YANKED").count(), 1);
+    assert_eq!(report.matches("MAJOR").count(), 1);
+    assert!(report.contains("1 outdated | 1 yanked"));
 }
 
 #[test]

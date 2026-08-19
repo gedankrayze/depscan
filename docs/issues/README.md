@@ -61,7 +61,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-040](DS-040.md) | P1 | Open | Reject malformed or unsupported lockfile schemas instead of returning empty |
 | [DS-041](DS-041.md) | P1 | Closed | Error when an explicitly requested config file is missing |
 | [DS-042](DS-042.md) | P1 | Closed | Make JSON output reproducible when requested |
-| [DS-043](DS-043.md) | P1 | Open | Show yanked installed versions even when otherwise current |
+| [DS-043](DS-043.md) | P1 | Closed | Show yanked installed versions even when otherwise current |
 | [DS-044](DS-044.md) | P1 | Open | Strengthen CLI help and typed value parsing |
 | [DS-045](DS-045.md) | P2 | Open | Generate release automation and complete the target matrix |
 | [DS-046](DS-046.md) | P2 | Open | Deliver and verify genuinely static Linux artifacts |

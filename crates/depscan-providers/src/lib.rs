@@ -2162,17 +2162,19 @@ mod tests {
     }
 
     #[test]
-    fn excludes_fully_yanked_pypi_releases() {
+    fn excludes_fully_yanked_but_keeps_partially_yanked_pypi_releases() {
         let data = json!({
             "2.34.2": [{"yanked": true}, {"yanked": true}],
+            "2.33.1": [{"yanked": true}, {"yanked": false}],
             "2.33.0": [{"yanked": false}]
         });
 
         assert_eq!(
             select_pypi_release(data.as_object().unwrap(), "2.32.5"),
-            Some("2.33.0".to_owned())
+            Some("2.33.1".to_owned())
         );
         assert!(pypi_release_is_yanked(&data["2.34.2"]));
+        assert!(!pypi_release_is_yanked(&data["2.33.1"]));
         assert!(!pypi_release_is_yanked(&data["2.33.0"]));
     }
 

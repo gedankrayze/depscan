@@ -1,6 +1,6 @@
 //! Stable report renderers for human terminals and CI integrations.
 
-use depscan_core::{ScanDocument, ScanResult, Severity, Staleness};
+use depscan_core::{LatestVersions, ScanDocument, ScanResult, Severity, Staleness};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 
@@ -47,8 +47,13 @@ pub fn render(
 pub fn render_table(document: &ScanDocument, color: bool) -> String {
     let totals = Totals::from_document(document);
     let mut text = format!(
-        "depscan: {} packages scanned | {} vulnerable | {} outdated | {} suppressed | {} soft failures\n",
-        totals.packages, totals.vulnerable, totals.outdated, totals.suppressed, totals.errors
+        "depscan: {} packages scanned | {} vulnerable | {} outdated | {} yanked | {} suppressed | {} soft failures\n",
+        totals.packages,
+        totals.vulnerable,
+        totals.outdated,
+        totals.yanked,
+        totals.suppressed,
+        totals.errors
     );
     let mut grouped: BTreeMap<_, Vec<&ScanResult>> = BTreeMap::new();
     for result in &document.results {
@@ -62,18 +67,19 @@ pub fn render_table(document: &ScanDocument, color: bool) -> String {
         let vulnerable = results.iter().filter(|r| !r.vulns.is_empty()).count();
         let outdated = results
             .iter()
-            .filter(|r| {
-                r.latest
-                    .as_ref()
-                    .is_some_and(|l| l.staleness > Staleness::Current)
-            })
+            .filter(|r| r.latest.as_ref().is_some_and(latest_requires_action))
+            .count();
+        let yanked = results
+            .iter()
+            .filter(|result| result.latest.as_ref().is_some_and(|latest| latest.yanked))
             .count();
         text.push_str(&format!(
-            "\n{} ({} packages, {} vulnerable, {} outdated)\n",
+            "\n{} ({} packages, {} vulnerable, {} outdated, {} yanked)\n",
             ecosystem.display_name(),
             results.len(),
             vulnerable,
-            outdated
+            outdated,
+            yanked
         ));
         for result in results {
             for vuln in result.vulns.iter().filter(|v| !v.withdrawn) {
@@ -98,21 +104,23 @@ pub fn render_table(document: &ScanDocument, color: bool) -> String {
                     vuln.summary.lines().next().unwrap_or("No summary supplied")
                 ));
             }
-            if let Some(latest) = &result.latest
-                && latest.staleness > Staleness::Current
-            {
-                let label = staleness_label(latest.staleness, color);
-                text.push_str(&format!(
-                    "  {label:>8}  {} {} → {} available{}\n",
-                    result.package.display_name,
-                    result.package.version,
-                    latest.latest_stable,
-                    if latest.yanked {
-                        " (installed version yanked)"
-                    } else {
-                        ""
-                    }
-                ));
+            if let Some(latest) = &result.latest {
+                if latest.yanked {
+                    let label = paint("YANKED", 31, color);
+                    text.push_str(&format!(
+                        "  {label:>8}  {} {} is yanked/deprecated; latest non-yanked stable is {}\n",
+                        result.package.display_name,
+                        result.package.version,
+                        latest.latest_stable
+                    ));
+                }
+                if latest.staleness > Staleness::Current {
+                    let label = staleness_label(latest.staleness, color);
+                    text.push_str(&format!(
+                        "  {label:>8}  {} {} → {} available\n",
+                        result.package.display_name, result.package.version, latest.latest_stable
+                    ));
+                }
             }
             for error in &result.errors {
                 text.push_str(&format!(
@@ -124,7 +132,7 @@ pub fn render_table(document: &ScanDocument, color: bool) -> String {
     }
     text
 }
-fn result_sort_key(result: &ScanResult) -> (Severity, Staleness) {
+fn result_sort_key(result: &ScanResult) -> (Severity, bool, Staleness) {
     (
         result
             .vulns
@@ -133,12 +141,17 @@ fn result_sort_key(result: &ScanResult) -> (Severity, Staleness) {
             .map(|v| v.severity.unwrap_or(Severity::Unknown))
             .max()
             .unwrap_or(Severity::Unknown),
+        result.latest.as_ref().is_some_and(|latest| latest.yanked),
         result
             .latest
             .as_ref()
             .map(|l| l.staleness)
             .unwrap_or(Staleness::Unknown),
     )
+}
+
+fn latest_requires_action(latest: &LatestVersions) -> bool {
+    latest.yanked || latest.staleness > Staleness::Current
 }
 fn severity_label(severity: Severity, color: bool) -> String {
     let raw = match severity {
@@ -222,7 +235,7 @@ pub fn render_summary(document: &ScanDocument) -> String {
         })
         .count();
     format!(
-        "depscan: {} packages | {} vulns{} | {} outdated ({} major) | {} suppressed\n",
+        "depscan: {} packages | {} vulns{} | {} outdated ({} major, {} yanked) | {} suppressed\n",
         t.packages,
         t.vulns,
         if detail.is_empty() {
@@ -232,6 +245,7 @@ pub fn render_summary(document: &ScanDocument) -> String {
         },
         t.outdated,
         major,
+        t.yanked,
         t.suppressed
     )
 }
@@ -244,6 +258,36 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
             rules.entry(vuln.id.clone()).or_insert_with(|| json!({"id": vuln.id, "shortDescription": {"text": vuln.summary}, "helpUri": vuln.references.first()}));
             results.push(json!({"ruleId": vuln.id, "level": vuln.severity.unwrap_or(Severity::Unknown).sarif_level(), "message": {"text": format!("{} {} is affected by {}: {}", result.package.display_name, result.package.version, vuln.id, vuln.summary)}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": result.package.source_file.to_string_lossy()}}}], "properties": {"ecosystem": result.package.ecosystem.osv_name(), "package": result.package.name, "version": result.package.version, "fixed_in": vuln.fixed_in}}));
         }
+        if let Some(latest) = &result.latest
+            && latest.yanked
+        {
+            let rule_id = "DEPSCAN-YANKED";
+            rules.entry(rule_id.to_owned()).or_insert_with(|| json!({
+                "id": rule_id,
+                "shortDescription": {"text": "Installed dependency version is yanked or deprecated"}
+            }));
+            results.push(json!({
+                "ruleId": rule_id,
+                "level": "warning",
+                "message": {"text": format!(
+                    "{} {} is yanked or deprecated; latest non-yanked stable version is {}",
+                    result.package.display_name,
+                    result.package.version,
+                    latest.latest_stable
+                )},
+                "locations": [{"physicalLocation": {"artifactLocation": {
+                    "uri": result.package.source_file.to_string_lossy()
+                }}}],
+                "properties": {
+                    "ecosystem": result.package.ecosystem.osv_name(),
+                    "package": result.package.name,
+                    "version": result.package.version,
+                    "latest_stable": latest.latest_stable,
+                    "staleness": latest.staleness,
+                    "yanked": true
+                }
+            }));
+        }
     }
     json!({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [{"tool": {"driver": {"name": "depscan", "informationUri": "https://github.com/gedankrayze/depscan", "rules": rules.into_values().collect::<Vec<_>>() }}, "results": results}]})
 }
@@ -254,6 +298,7 @@ pub struct Totals {
     pub vulnerable: usize,
     pub vulns: usize,
     pub outdated: usize,
+    pub yanked: usize,
     pub suppressed: usize,
     pub errors: usize,
 }
@@ -274,11 +319,12 @@ impl Totals {
         let outdated = document
             .results
             .iter()
-            .filter(|r| {
-                r.latest
-                    .as_ref()
-                    .is_some_and(|l| l.staleness > Staleness::Current)
-            })
+            .filter(|r| r.latest.as_ref().is_some_and(latest_requires_action))
+            .count();
+        let yanked = document
+            .results
+            .iter()
+            .filter(|result| result.latest.as_ref().is_some_and(|latest| latest.yanked))
             .count();
         let suppressed = document.results.iter().map(|r| r.suppressed.len()).sum();
         let errors = document.results.iter().map(|r| r.errors.len()).sum();
@@ -287,6 +333,7 @@ impl Totals {
             vulnerable,
             vulns,
             outdated,
+            yanked,
             suppressed,
             errors,
         }
@@ -296,8 +343,33 @@ impl Totals {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use depscan_core::{Ecosystem, Package, ScanResult};
+    use depscan_core::{Ecosystem, LatestVersions, Package, ScanResult};
     use std::path::PathBuf;
+
+    fn freshness_document(staleness: Staleness, yanked: bool) -> ScanDocument {
+        ScanDocument::new(vec![ScanResult {
+            package: Package::new(
+                Ecosystem::CratesIo,
+                "example",
+                "2.0.0",
+                PathBuf::from("Cargo.lock"),
+            ),
+            vulns: vec![],
+            latest: Some(LatestVersions {
+                latest_stable: if staleness > Staleness::Current {
+                    "3.0.0".to_owned()
+                } else {
+                    "1.9.0".to_owned()
+                },
+                latest_matching: None,
+                staleness,
+                yanked,
+            }),
+            errors: vec![],
+            suppressed: vec![],
+        }])
+    }
+
     #[test]
     fn emits_schema_version_json() {
         let doc = ScanDocument::new(vec![ScanResult {
@@ -317,5 +389,58 @@ mod tests {
                 .unwrap()
                 .contains("schema_version")
         );
+    }
+
+    #[test]
+    fn yanked_current_is_visible_in_every_format_and_counted_once() {
+        let document = freshness_document(Staleness::Current, true);
+        let table = render(&document, OutputFormat::Table, false).unwrap();
+        let json = render(&document, OutputFormat::Json, false).unwrap();
+        let sarif = render(&document, OutputFormat::Sarif, false).unwrap();
+        let summary = render(&document, OutputFormat::Summary, false).unwrap();
+
+        assert!(table.contains("YANKED"));
+        assert!(table.contains("latest non-yanked stable is 1.9.0"));
+        assert!(!table.contains("CURRENT"));
+        assert!(json.contains("\"yanked\": true"));
+        assert!(sarif.contains("DEPSCAN-YANKED"));
+        assert!(sarif.contains("\"level\": \"warning\""));
+        assert!(summary.contains("1 outdated (0 major, 1 yanked)"));
+
+        let totals = Totals::from_document(&document);
+        assert_eq!(totals.outdated, 1);
+        assert_eq!(totals.yanked, 1);
+    }
+
+    #[test]
+    fn yanked_outdated_renders_both_risks_without_double_counting() {
+        let document = freshness_document(Staleness::Major, true);
+        let table = render(&document, OutputFormat::Table, false).unwrap();
+
+        assert_eq!(table.matches("YANKED").count(), 1);
+        assert_eq!(table.matches("MAJOR").count(), 1);
+        assert!(table.contains("3.0.0 available"));
+        let totals = Totals::from_document(&document);
+        assert_eq!(totals.outdated, 1);
+        assert_eq!(totals.yanked, 1);
+    }
+
+    #[test]
+    fn non_yanked_current_release_has_no_risk_signal() {
+        let document = freshness_document(Staleness::Current, false);
+
+        for format in [
+            OutputFormat::Table,
+            OutputFormat::Json,
+            OutputFormat::Sarif,
+            OutputFormat::Summary,
+        ] {
+            let rendered = render(&document, format, false).unwrap();
+            assert!(!rendered.contains("DEPSCAN-YANKED"));
+            assert!(!rendered.contains("YANKED"));
+        }
+        let totals = Totals::from_document(&document);
+        assert_eq!(totals.outdated, 0);
+        assert_eq!(totals.yanked, 0);
     }
 }

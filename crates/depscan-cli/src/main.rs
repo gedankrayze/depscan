@@ -577,7 +577,7 @@ fn has_outdated_failure(document: &ScanDocument, threshold: &str) -> bool {
         .results
         .iter()
         .filter_map(|r| r.latest.as_ref())
-        .any(|l| l.staleness >= min)
+        .any(|latest| latest.yanked || latest.staleness >= min)
 }
 fn dedup_packages(mut packages: Vec<Package>) -> Vec<Package> {
     packages.sort_by_key(Package::key);
