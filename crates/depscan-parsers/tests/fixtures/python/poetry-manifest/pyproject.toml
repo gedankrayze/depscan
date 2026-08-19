@@ -1,0 +1,59 @@
+[project]
+name = "poetry-manifest-fixture"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "hybrid>=2.0,<3.0",
+  "Project_Extra[feature]>=1.0,<2.0 ; python_version >= '3.10'",
+  "parenthesized (>=3,<4)",
+  "project-git @ git+https://github.com/example/project-git.git@main",
+]
+
+[project.optional-dependencies]
+feature = ["optional-project~=2.0"]
+
+[dependency-groups]
+lint = ["ruff>=0.6,<1"]
+qa = [{ include-group = "lint" }, "coverage>=7,<8"]
+main = [{ include-group = "shared" }]
+shared = ["shared-tool==1.0"]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+requests = "^2.31.0"
+attrs = "~23.1"
+django = "5.*"
+exact = "1.2.3"
+anything = "*"
+table-dep = { version = "^1.2", extras = ["socks"], optional = true, python = ">=3.9", markers = "sys_platform != 'win32'" }
+hybrid = { source = "private" }
+git-dep = { git = "https://github.com/example/git-dep.git", rev = "0123456789abcdef", subdirectory = "python" }
+path-dep = { path = "../path-dep", develop = true }
+url-dep = { url = "https://packages.example.invalid/url-dep-1.0.0.tar.gz" }
+private-dep = { version = "^4.0", source = "private" }
+pypi-explicit = { version = "~1", source = "pypi" }
+
+[[tool.poetry.source]]
+name = "private"
+url = "https://packages.example.invalid/simple/"
+priority = "explicit"
+
+[tool.poetry.extras]
+feature = ["table-dep"]
+
+[tool.poetry.dev-dependencies]
+legacy-dev = "^1.0"
+
+[tool.poetry.group.main.dependencies]
+prod-group = "1.0.*"
+
+[tool.poetry.group.test.dependencies.pytest]
+version = "~8.1"
+markers = "python_version >= '3.9'"
+
+[tool.poetry.group.docs]
+optional = true
+include-groups = ["test"]
+
+[tool.poetry.group.docs.dependencies]
+sphinx = { version = "^7.2", extras = ["docs"] }

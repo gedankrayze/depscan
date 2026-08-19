@@ -1819,6 +1819,72 @@ fn online_osv_partial_outage_is_visible_without_a_false_clean_cache_entry() {
 }
 
 #[test]
+fn poetry_metadata_and_nonregistry_packages_do_not_require_provider_state() {
+    let directory = TestDirectory::new("poetry-nonregistry-provider-skip");
+    let project = directory.path().join("project");
+    let cache = directory.path().join("cache");
+    fs::create_dir(&project).expect("create Poetry project");
+    fs::create_dir(&cache).expect("create empty cache");
+    fs::write(
+        cache.join(".depscan-cache.json"),
+        r#"{"schema_version":1,"owner":"depscan"}"#,
+    )
+    .expect("write cache ownership sentinel");
+    fs::write(
+        project.join("pyproject.toml"),
+        r#"[tool.poetry.dependencies]
+python = "^3.12"
+git-dep = { git = "https://github.com/example/git-dep.git", rev = "abc123" }
+private-dep = { version = "^1", source = "private" }
+
+[[tool.poetry.source]]
+name = "private"
+url = "https://packages.example.invalid/simple/"
+priority = "explicit"
+"#,
+    )
+    .expect("write Poetry manifest");
+
+    let output = command(&cache)
+        .args([
+            "scan",
+            "--offline",
+            "--format",
+            "json",
+            project.to_str().expect("UTF-8 project path"),
+        ])
+        .output()
+        .expect("run provider-free Poetry scan");
+
+    assert_exit(&output, 0);
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json_report(&output);
+    assert_eq!(
+        report_package_names(&report),
+        BTreeSet::from(["git-dep", "private-dep"])
+    );
+    assert!(
+        report_packages(&report).iter().all(|result| {
+            result.get("latest").is_some_and(serde_json::Value::is_null)
+                && result
+                    .get("vulns")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                && result
+                    .get("errors")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+        }),
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap()
+    );
+}
+
+#[test]
 fn malformed_offline_advisory_cannot_produce_a_clean_report() {
     let project = TestProject::rust("malformed-offline-advisory");
     seed_malformed_cargo_dump(&project.cache);

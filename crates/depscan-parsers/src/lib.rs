@@ -20,6 +20,7 @@ use toml::Value as Toml;
 use walkdir::WalkDir;
 
 mod python_locks;
+mod python_manifest;
 mod requirements;
 
 fn io_error(path: &Path, error: impl ToString) -> ParseError {
@@ -1490,50 +1491,7 @@ fn pipfile_section_names(value: &Toml, section: &str) -> Option<HashSet<String>>
         .collect()
 }
 fn parse_pyproject(path: &Path) -> Result<Vec<Package>, ParseError> {
-    let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
-    let mut deps = Vec::new();
-    if let Some(arr) = value
-        .get("project")
-        .and_then(Toml::as_table)
-        .and_then(|t| t.get("dependencies"))
-        .and_then(Toml::as_array)
-    {
-        deps.extend(arr.iter().filter_map(Toml::as_str).map(str::to_owned));
-    }
-    if let Some(tbl) = value
-        .get("tool")
-        .and_then(Toml::as_table)
-        .and_then(|t| t.get("poetry"))
-        .and_then(Toml::as_table)
-        .and_then(|t| t.get("dependencies"))
-        .and_then(Toml::as_table)
-    {
-        deps.extend(
-            tbl.iter()
-                .filter_map(|(k, v)| v.as_str().map(|x| format!("{k}{x}"))),
-        );
-    }
-    let mut out = Vec::new();
-    for spec in deps {
-        let name = spec
-            .split(['<', '>', '~', '!', '=', ';', '['])
-            .next()
-            .unwrap_or("")
-            .trim();
-        if !name.is_empty() {
-            let mut p = Package::new(
-                Ecosystem::PyPI,
-                name,
-                spec[name.len()..].trim(),
-                path.to_path_buf(),
-            );
-            p.direct = true;
-            p.set_manifest_constraint(spec[name.len()..].trim());
-            out.push(p);
-        }
-    }
-    Ok(dedup(out))
+    python_manifest::parse_pyproject(path)
 }
 
 pub struct NugetParser;

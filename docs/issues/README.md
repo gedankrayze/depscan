@@ -54,7 +54,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-033](DS-033.md) | P1 | Closed | Reject malformed crates.io sparse-index lines |
 | [DS-034](DS-034.md) | P1 | Closed | Make cache clearing safe for arbitrary configured paths |
 | [DS-035](DS-035.md) | P1 | Closed | Isolate partial OSV failures as per-package soft errors |
-| [DS-036](DS-036.md) | P1 | Open | Parse Poetry constraints without inventing packages |
+| [DS-036](DS-036.md) | P1 | Closed | Parse Poetry constraints without inventing packages |
 | [DS-037](DS-037.md) | P1 | Closed | Distinguish direct and transitive Pipfile.lock packages |
 | [DS-038](DS-038.md) | P1 | Closed | Parse requirements options, includes, and extras correctly |
 | [DS-039](DS-039.md) | P1 | Closed | Implement NuGet prerelease precedence correctly |
