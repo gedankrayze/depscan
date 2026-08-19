@@ -8,7 +8,7 @@ use depscan_core::{
     VulnMap, VulnProvider, Vulnerability, classify_staleness, compare_versions,
     evaluate_osv_affected, normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
 };
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use fs2::FileExt;
 use futures::{StreamExt, stream};
 use rand::RngExt;
@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
@@ -46,6 +46,10 @@ const CRATES_IO_MAX_NAME_LEN: usize = 64;
 const CRATES_IO_MAX_INDEX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const CRATES_IO_MAX_INDEX_LINE_BYTES: usize = 1024 * 1024;
 const CRATES_IO_INDEX_CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SENTINEL_FILE: &str = ".depscan-cache.json";
+const CACHE_SENTINEL_SCHEMA_VERSION: u32 = 1;
+const CACHE_SENTINEL_OWNER: &str = "depscan";
+const CACHE_CONTENT_DIRECTORIES: [&str; 3] = ["offline", "osv", "registry"];
 
 fn osv_query_name(package: &Package) -> &str {
     match package.ecosystem {
@@ -314,6 +318,260 @@ fn nuget_registry_url(package: &Package) -> String {
     )
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheSentinel {
+    schema_version: u32,
+    owner: String,
+}
+
+fn expected_cache_sentinel() -> CacheSentinel {
+    CacheSentinel {
+        schema_version: CACHE_SENTINEL_SCHEMA_VERSION,
+        owner: CACHE_SENTINEL_OWNER.to_owned(),
+    }
+}
+
+fn cache_path_error(root: &Path, message: impl std::fmt::Display) -> ProviderError {
+    ProviderError::Cache(format!("refusing cache path {}: {message}", root.display()))
+}
+
+fn validate_cache_scope_with(
+    root: &Path,
+    current_directory: &Path,
+    home_directory: Option<&Path>,
+) -> Result<(), ProviderError> {
+    if !root.is_absolute() {
+        return Err(cache_path_error(root, "resolved path is not absolute"));
+    }
+    if root.parent().is_none() {
+        return Err(cache_path_error(
+            root,
+            "filesystem roots are not cache directories",
+        ));
+    }
+    if current_directory.starts_with(root) {
+        return Err(cache_path_error(
+            root,
+            "path is the current workspace or one of its ancestors",
+        ));
+    }
+    if home_directory.is_some_and(|home| home.starts_with(root)) {
+        return Err(cache_path_error(
+            root,
+            "path is the home directory or one of its ancestors",
+        ));
+    }
+    if [".git", ".hg", ".svn"]
+        .iter()
+        .any(|marker| root.join(marker).exists())
+    {
+        return Err(cache_path_error(
+            root,
+            "path is a version-control workspace",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cache_scope(root: &Path) -> Result<(), ProviderError> {
+    let current_directory = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(|error| cache_path_error(root, format_args!("cannot resolve cwd: {error}")))?;
+    let home_directory = BaseDirs::new().and_then(|dirs| {
+        fs::canonicalize(dirs.home_dir())
+            .ok()
+            .or_else(|| Some(dirs.home_dir().to_path_buf()))
+    });
+    validate_cache_scope_with(root, &current_directory, home_directory.as_deref())
+}
+
+fn validate_cache_sentinel(root: &Path) -> Result<(), ProviderError> {
+    let sentinel_path = root.join(CACHE_SENTINEL_FILE);
+    let metadata = fs::symlink_metadata(&sentinel_path).map_err(|error| {
+        cache_path_error(
+            root,
+            format_args!("missing ownership sentinel {CACHE_SENTINEL_FILE}: {error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(cache_path_error(
+            root,
+            format_args!("ownership sentinel {CACHE_SENTINEL_FILE} is not a regular file"),
+        ));
+    }
+    if metadata.len() > 1024 {
+        return Err(cache_path_error(
+            root,
+            format_args!("ownership sentinel {CACHE_SENTINEL_FILE} is oversized"),
+        ));
+    }
+    let bytes = fs::read(&sentinel_path).map_err(|error| {
+        cache_path_error(
+            root,
+            format_args!("cannot read ownership sentinel: {error}"),
+        )
+    })?;
+    let sentinel = serde_json::from_slice::<CacheSentinel>(&bytes).map_err(|error| {
+        cache_path_error(root, format_args!("invalid ownership sentinel: {error}"))
+    })?;
+    if sentinel != expected_cache_sentinel() {
+        return Err(cache_path_error(
+            root,
+            "ownership sentinel has an unsupported owner or schema version",
+        ));
+    }
+    Ok(())
+}
+
+fn write_cache_sentinel(root: &Path) -> Result<(), ProviderError> {
+    let sentinel_path = root.join(CACHE_SENTINEL_FILE);
+    let bytes = serde_json::to_vec(&expected_cache_sentinel())
+        .map_err(|error| ProviderError::Cache(error.to_string()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&sentinel_path)
+        .map_err(|error| cache_path_error(root, format_args!("cannot create sentinel: {error}")))?;
+    std::io::Write::write_all(&mut file, &bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| cache_path_error(root, format_args!("cannot persist sentinel: {error}")))
+}
+
+fn legacy_cache_layout_is_owned(root: &Path) -> Result<bool, ProviderError> {
+    let mut entries = fs::read_dir(root).map_err(|error| {
+        cache_path_error(root, format_args!("cannot inspect legacy cache: {error}"))
+    })?;
+    let mut found_entry = false;
+    for entry in &mut entries {
+        let entry = entry.map_err(|error| {
+            cache_path_error(root, format_args!("cannot inspect legacy cache: {error}"))
+        })?;
+        found_entry = true;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+        if !CACHE_CONTENT_DIRECTORIES.contains(&name) {
+            return Ok(false);
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            cache_path_error(root, format_args!("cannot inspect legacy cache: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(found_entry)
+}
+
+fn initialize_cache_root(
+    requested: &Path,
+    allow_legacy_migration: bool,
+) -> Result<PathBuf, ProviderError> {
+    if requested.as_os_str().is_empty() {
+        return Err(ProviderError::Cache(
+            "refusing an empty cache directory path".to_owned(),
+        ));
+    }
+    let absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| ProviderError::Cache(error.to_string()))?
+            .join(requested)
+    };
+    match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(cache_path_error(&absolute, "directory is a symbolic link"));
+            }
+            if !metadata.is_dir() {
+                return Err(cache_path_error(&absolute, "path is not a directory"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&absolute).map_err(|error| {
+                cache_path_error(&absolute, format_args!("cannot create directory: {error}"))
+            })?;
+        }
+        Err(error) => {
+            return Err(cache_path_error(
+                &absolute,
+                format_args!("cannot inspect directory: {error}"),
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+        cache_path_error(&absolute, format_args!("cannot inspect directory: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(cache_path_error(
+            &absolute,
+            "created path is not a real directory",
+        ));
+    }
+    let root = fs::canonicalize(&absolute).map_err(|error| {
+        cache_path_error(&absolute, format_args!("cannot resolve directory: {error}"))
+    })?;
+    validate_cache_scope(&root)?;
+
+    let sentinel_path = root.join(CACHE_SENTINEL_FILE);
+    match fs::symlink_metadata(&sentinel_path) {
+        Ok(_) => validate_cache_sentinel(&root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut entries = fs::read_dir(&root).map_err(|error| {
+                cache_path_error(&root, format_args!("cannot inspect directory: {error}"))
+            })?;
+            let has_entries = entries
+                .next()
+                .transpose()
+                .map_err(|error| {
+                    cache_path_error(&root, format_args!("cannot inspect directory: {error}"))
+                })?
+                .is_some();
+            if has_entries && !(allow_legacy_migration && legacy_cache_layout_is_owned(&root)?) {
+                return Err(cache_path_error(
+                    &root,
+                    "directory is non-empty and has no depscan ownership sentinel",
+                ));
+            }
+            write_cache_sentinel(&root)?;
+            validate_cache_sentinel(&root)?;
+        }
+        Err(error) => {
+            return Err(cache_path_error(
+                &root,
+                format_args!("cannot inspect ownership sentinel: {error}"),
+            ));
+        }
+    }
+    Ok(root)
+}
+
+fn validate_owned_cache_root(root: &Path) -> Result<(), ProviderError> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        cache_path_error(root, format_args!("cannot inspect directory: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(cache_path_error(
+            root,
+            "directory was replaced or is not real",
+        ));
+    }
+    let canonical = fs::canonicalize(root).map_err(|error| {
+        cache_path_error(root, format_args!("cannot resolve directory: {error}"))
+    })?;
+    if canonical != root {
+        return Err(cache_path_error(
+            root,
+            format_args!("directory now resolves to {}", canonical.display()),
+        ));
+    }
+    validate_cache_scope(root)?;
+    validate_cache_sentinel(root)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CachePolicy {
     pub read: bool,
@@ -370,15 +628,19 @@ pub struct Cache {
 }
 impl Cache {
     pub fn new(policy: CachePolicy) -> Result<Self, ProviderError> {
-        let root = std::env::var_os("DEPSCAN_CACHE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                ProjectDirs::from("dev", "depscan", "depscan").map(|d| d.cache_dir().to_path_buf())
-            })
+        if let Some(requested) = std::env::var_os("DEPSCAN_CACHE_DIR") {
+            return Self::from_root(requested.into(), policy);
+        }
+        let requested = ProjectDirs::from("dev", "depscan", "depscan")
+            .map(|dirs| dirs.cache_dir().to_path_buf())
             .ok_or_else(|| {
                 ProviderError::Cache("could not determine cache directory".to_owned())
             })?;
-        fs::create_dir_all(&root).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        let root = initialize_cache_root(&requested, true)?;
+        Ok(Self { root, policy })
+    }
+    fn from_root(requested: PathBuf, policy: CachePolicy) -> Result<Self, ProviderError> {
+        let root = initialize_cache_root(&requested, false)?;
         Ok(Self { root, policy })
     }
     pub fn root(&self) -> &Path {
@@ -495,10 +757,50 @@ impl Cache {
         Ok(CacheCommit::Written)
     }
     pub fn clear(&self) -> Result<(), ProviderError> {
-        if self.root.exists() {
-            fs::remove_dir_all(&self.root).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        validate_owned_cache_root(&self.root)?;
+        let mut targets = Vec::new();
+        for name in CACHE_CONTENT_DIRECTORIES {
+            let target = self.root.join(name);
+            let metadata = match fs::symlink_metadata(&target) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(cache_path_error(
+                        &self.root,
+                        format_args!("cannot inspect cache content {name:?}: {error}"),
+                    ));
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(cache_path_error(
+                    &self.root,
+                    format_args!("cache content {name:?} is not a real directory"),
+                ));
+            }
+            let canonical = fs::canonicalize(&target).map_err(|error| {
+                cache_path_error(
+                    &self.root,
+                    format_args!("cannot resolve cache content {name:?}: {error}"),
+                )
+            })?;
+            if canonical.parent() != Some(self.root.as_path()) {
+                return Err(cache_path_error(
+                    &self.root,
+                    format_args!("cache content {name:?} resolves outside the owned directory"),
+                ));
+            }
+            targets.push(canonical);
         }
-        fs::create_dir_all(&self.root).map_err(|e| ProviderError::Cache(e.to_string()))
+        validate_owned_cache_root(&self.root)?;
+        for target in targets {
+            fs::remove_dir_all(&target).map_err(|error| {
+                cache_path_error(
+                    &self.root,
+                    format_args!("cannot remove {}: {error}", target.display()),
+                )
+            })?;
+        }
+        Ok(())
     }
     pub fn stats(&self) -> Result<CacheStats, ProviderError> {
         fn visit(path: &Path, stats: &mut CacheStats) -> std::io::Result<()> {
@@ -1976,6 +2278,179 @@ mod tests {
         let mut entry = read_cache_entry(cache, namespace, key);
         entry.stored_at = Utc::now() - age;
         write_cache_entry(cache, namespace, key, &entry);
+    }
+
+    #[test]
+    fn owned_cache_clear_removes_only_known_cache_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let requested = temp.path().join("owned-cache");
+        let cache = Cache::from_root(requested, CachePolicy::default()).unwrap();
+        cache
+            .put("registry", "fixture", &json!({"ok": true}), None)
+            .unwrap();
+        cache.put("osv/query", "fixture", &json!([]), None).unwrap();
+        fs::create_dir_all(cache.root().join("offline")).unwrap();
+        fs::write(cache.root().join("offline/npm.zip"), b"fixture").unwrap();
+        fs::write(cache.root().join("unrelated.txt"), b"preserve me").unwrap();
+
+        cache.clear().unwrap();
+
+        for directory in CACHE_CONTENT_DIRECTORIES {
+            assert!(!cache.root().join(directory).exists());
+        }
+        assert!(cache.root().join(CACHE_SENTINEL_FILE).is_file());
+        assert_eq!(
+            fs::read(cache.root().join("unrelated.txt")).unwrap(),
+            b"preserve me"
+        );
+        cache.clear().unwrap();
+    }
+
+    #[test]
+    fn cache_initialization_rejects_empty_broad_and_nonowned_paths() {
+        let empty = Cache::from_root(PathBuf::new(), CachePolicy::default()).unwrap_err();
+        assert!(empty.to_string().contains("empty cache directory"));
+
+        let current = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let filesystem_root = current.ancestors().last().unwrap();
+        let broad =
+            Cache::from_root(filesystem_root.to_path_buf(), CachePolicy::default()).unwrap_err();
+        assert!(broad.to_string().contains("filesystem roots"));
+        assert!(
+            validate_cache_scope_with(&current, &current, None)
+                .unwrap_err()
+                .to_string()
+                .contains("current workspace")
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake_home = fs::canonicalize(temp.path()).unwrap();
+        assert!(
+            validate_cache_scope_with(&fake_home, &current, Some(fake_home.as_path()),)
+                .unwrap_err()
+                .to_string()
+                .contains("home directory")
+        );
+        let nonowned = temp.path().join("nonowned");
+        fs::create_dir(&nonowned).unwrap();
+        let unrelated = nonowned.join("important.txt");
+        fs::write(&unrelated, b"do not delete").unwrap();
+
+        let error = Cache::from_root(nonowned.clone(), CachePolicy::default()).unwrap_err();
+
+        assert!(error.to_string().contains("non-empty"));
+        assert_eq!(fs::read(&unrelated).unwrap(), b"do not delete");
+        assert!(!nonowned.join(CACHE_SENTINEL_FILE).exists());
+    }
+
+    #[test]
+    fn cache_initialization_canonicalizes_safe_path_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let alias_component = temp.path().join("alias");
+        fs::create_dir(&alias_component).unwrap();
+        let requested = alias_component.join("..").join("cache");
+
+        let cache = Cache::from_root(requested, CachePolicy::default()).unwrap();
+
+        assert_eq!(
+            cache.root(),
+            fs::canonicalize(temp.path().join("cache")).unwrap()
+        );
+        assert!(cache.root().join(CACHE_SENTINEL_FILE).is_file());
+    }
+
+    #[test]
+    fn exact_default_cache_layout_can_be_migrated_to_the_ownership_sentinel() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy-default-cache");
+        fs::create_dir_all(legacy.join("osv/query")).unwrap();
+        fs::create_dir(legacy.join("registry")).unwrap();
+        fs::write(legacy.join("osv/query/fixture.json"), b"{}").unwrap();
+
+        let migrated = initialize_cache_root(&legacy, true).unwrap();
+
+        assert!(migrated.join(CACHE_SENTINEL_FILE).is_file());
+        assert!(migrated.join("osv/query/fixture.json").is_file());
+
+        let unrelated = temp.path().join("unrelated-default-cache");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("important.txt"), b"preserve").unwrap();
+        let error = initialize_cache_root(&unrelated, true).unwrap_err();
+        assert!(error.to_string().contains("non-empty"));
+        assert_eq!(
+            fs::read(unrelated.join("important.txt")).unwrap(),
+            b"preserve"
+        );
+        assert!(!unrelated.join(CACHE_SENTINEL_FILE).exists());
+    }
+
+    #[test]
+    fn missing_or_invalid_cache_sentinel_refuses_clear_without_deleting_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache =
+            Cache::from_root(temp.path().join("owned-cache"), CachePolicy::default()).unwrap();
+        cache
+            .put("registry", "fixture", &json!({"preserve": true}), None)
+            .unwrap();
+        let registry = cache.root().join("registry");
+        fs::remove_file(cache.root().join(CACHE_SENTINEL_FILE)).unwrap();
+
+        let missing = cache.clear().unwrap_err();
+
+        assert!(missing.to_string().contains("missing ownership sentinel"));
+        assert!(registry.is_dir());
+        fs::write(
+            cache.root().join(CACHE_SENTINEL_FILE),
+            br#"{"schema_version":2,"owner":"depscan"}"#,
+        )
+        .unwrap();
+        let invalid = cache.clear().unwrap_err();
+        assert!(invalid.to_string().contains("unsupported owner or schema"));
+        assert!(registry.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_swaps_and_symlinked_cache_content_are_refused_without_deletion() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let requested = temp.path().join("owned-cache");
+        let cache = Cache::from_root(requested.clone(), CachePolicy::default()).unwrap();
+        cache
+            .put("registry", "fixture", &json!({"preserve": true}), None)
+            .unwrap();
+        let backup = temp.path().join("owned-cache-backup");
+        fs::rename(cache.root(), &backup).unwrap();
+        let replacement = Cache::from_root(
+            temp.path().join("replacement-cache"),
+            CachePolicy::default(),
+        )
+        .unwrap();
+        replacement
+            .put("registry", "victim", &json!({"important": true}), None)
+            .unwrap();
+        symlink(replacement.root(), &requested).unwrap();
+
+        let swapped = cache.clear().unwrap_err();
+
+        assert!(swapped.to_string().contains("replaced or is not real"));
+        assert!(replacement.root().join("registry").is_dir());
+
+        let content_cache =
+            Cache::from_root(temp.path().join("content-cache"), CachePolicy::default()).unwrap();
+        fs::create_dir(content_cache.root().join("offline")).unwrap();
+        fs::write(content_cache.root().join("offline/preserve.zip"), b"keep").unwrap();
+        let external = temp.path().join("external-registry");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("important.txt"), b"keep").unwrap();
+        symlink(&external, content_cache.root().join("registry")).unwrap();
+
+        let content_swap = content_cache.clear().unwrap_err();
+
+        assert!(content_swap.to_string().contains("not a real directory"));
+        assert!(content_cache.root().join("offline/preserve.zip").is_file());
+        assert!(external.join("important.txt").is_file());
     }
 
     #[derive(Debug, Deserialize)]

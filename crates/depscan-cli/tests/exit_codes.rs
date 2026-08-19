@@ -53,6 +53,11 @@ impl TestProject {
         let cache = directory.path().join("cache");
         fs::create_dir(&cache).expect("create cache directory");
         fs::write(
+            cache.join(".depscan-cache.json"),
+            r#"{"schema_version":1,"owner":"depscan"}"#,
+        )
+        .expect("write cache ownership sentinel");
+        fs::write(
             directory.path().join("Cargo.lock"),
             r#"version = 3
 
@@ -918,4 +923,21 @@ fn provider_hard_failure_exits_thirty() {
 
     assert_exit(&output, 30);
     assert_diagnostic_only_on_stderr(&output, "provider hard failure");
+}
+
+#[test]
+fn cache_clear_preserves_the_owned_root_and_unrelated_files() {
+    let project = TestProject::rust("safe-cache-clear");
+    project.seed_clean("1.0.0");
+    let unrelated = project.cache.join("unrelated.txt");
+    fs::write(&unrelated, b"preserve me").expect("write unrelated cache-root file");
+
+    let output = project.run(&["cache", "clear"]);
+
+    assert_exit(&output, 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("cache cleared:"));
+    assert!(project.cache.join(".depscan-cache.json").is_file());
+    assert_eq!(fs::read(&unrelated).unwrap(), b"preserve me");
+    assert!(!project.cache.join("osv").exists());
+    assert!(!project.cache.join("registry").exists());
 }
