@@ -1,4 +1,4 @@
-use crate::{Ecosystem, Package, compare_versions, normalize_name};
+use crate::{Ecosystem, NuGetVersion, Package, normalize_name};
 use pep440_rs::Version as Pep440Version;
 use semver::Version as SemverVersion;
 use serde::Deserialize;
@@ -98,7 +98,7 @@ impl EventVersion {
 enum ParsedVersion {
     Semver(SemverVersion),
     Pep440(Pep440Version),
-    NuGet(String),
+    NuGet(NuGetVersion),
 }
 
 impl ParsedVersion {
@@ -106,9 +106,7 @@ impl ParsedVersion {
         match (self, other) {
             (Self::Semver(left), Self::Semver(right)) => left.cmp_precedence(right),
             (Self::Pep440(left), Self::Pep440(right)) => left.cmp(right),
-            (Self::NuGet(left), Self::NuGet(right)) => {
-                compare_versions(Ecosystem::NuGet, left, right)
-            }
+            (Self::NuGet(left), Self::NuGet(right)) => left.cmp(right),
             _ => unreachable!("a range is parsed with one version ordering"),
         }
     }
@@ -147,10 +145,9 @@ impl VersionOrdering {
                 .parse::<Pep440Version>()
                 .map(ParsedVersion::Pep440)
                 .map_err(|error| invalid(error.to_string())),
-            Self::Ecosystem(Ecosystem::NuGet) => {
-                validate_nuget_version(version).map_err(invalid)?;
-                Ok(ParsedVersion::NuGet(version.to_owned()))
-            }
+            Self::Ecosystem(Ecosystem::NuGet) => NuGetVersion::parse(version)
+                .map(ParsedVersion::NuGet)
+                .map_err(|error| invalid(error.reason().to_owned())),
         }
     }
 }
@@ -384,49 +381,6 @@ fn parse_event(event: &AffectedEvent) -> Result<(EventKind, String), OsvEvaluati
     Ok((kind, version.to_owned()))
 }
 
-fn validate_nuget_version(version: &str) -> Result<(), String> {
-    if version.is_empty() {
-        return Err("version is empty".to_owned());
-    }
-    let (core, build) = version.split_once('+').unwrap_or((version, ""));
-    if build.contains('+') {
-        return Err("version contains more than one build metadata separator".to_owned());
-    }
-    if version.contains('+') {
-        validate_nuget_identifiers(build, "build metadata")?;
-    }
-
-    let (release, prerelease) = core.split_once('-').unwrap_or((core, ""));
-    if core.contains('-') {
-        validate_nuget_identifiers(prerelease, "prerelease")?;
-    }
-
-    let release = release.split('.').collect::<Vec<_>>();
-    if release.is_empty() || release.len() > 4 {
-        return Err("release must contain between one and four numeric components".to_owned());
-    }
-    if release.iter().any(|component| {
-        component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit())
-    }) {
-        return Err("release components must be non-empty decimal integers".to_owned());
-    }
-    Ok(())
-}
-
-fn validate_nuget_identifiers(value: &str, label: &str) -> Result<(), String> {
-    if value.split('.').any(|identifier| {
-        identifier.is_empty()
-            || !identifier
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
-        return Err(format!(
-            "{label} identifiers must be non-empty ASCII alphanumeric or hyphen strings"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +486,34 @@ mod tests {
         assert!(!evaluate(&at, range("2.0.0.0")).affected);
         let future = package(Ecosystem::NuGet, "example.package", "999.0.0");
         assert!(evaluate(&future, range("2.*")).affected);
+    }
+
+    #[test]
+    fn nuget_ranges_use_numeric_prerelease_and_metadata_precedence() {
+        let range = json!([{
+            "package": {"ecosystem": "NuGet", "name": "Example.Package"},
+            "ranges": [{
+                "type": "ECOSYSTEM",
+                "events": [
+                    {"introduced": "1.0.0-rc.2+advisory"},
+                    {"fixed": "1.0.0-rc.10+fixed-build"}
+                ]
+            }]
+        }]);
+
+        let affected = package(
+            Ecosystem::NuGet,
+            "example.package",
+            "1.0.0-RC.9+installed-build",
+        );
+        assert!(evaluate(&affected, range.clone()).affected);
+
+        let fixed = package(
+            Ecosystem::NuGet,
+            "example.package",
+            "1.0.0-rc.10+different-build",
+        );
+        assert!(!evaluate(&fixed, range).affected);
     }
 
     #[test]

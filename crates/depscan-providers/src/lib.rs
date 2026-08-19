@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use cvss::Cvss;
 use depscan_core::{
-    Ecosystem, LatestVersions, Package, ProviderError, Severity, VersionProvider, VulnMap,
-    VulnProvider, Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
-    normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
+    Ecosystem, LatestVersions, NuGetVersion, Package, ProviderError, Severity, VersionProvider,
+    VulnMap, VulnProvider, Vulnerability, classify_staleness, compare_versions,
+    evaluate_osv_affected, normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
 };
 use directories::ProjectDirs;
 use fs2::FileExt;
@@ -1030,14 +1030,12 @@ impl RegistryClient {
         let url = nuget_registry_url(p);
         let cache_key = nuget_registry_cache_key(p);
         let data = self.metadata(&cache_key, &url, HeaderMap::new()).await?;
-        let latest = maximum_version(
-            Ecosystem::NuGet,
+        let latest = select_nuget_release(
             data.get("versions")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(Value::as_str)
-                .filter(|v| !is_prerelease(Ecosystem::NuGet, v)),
+                .filter_map(Value::as_str),
         )
         .ok_or_else(|| {
             ProviderError::InvalidResponse(format!("NuGet has no stable version for {}", p.name))
@@ -1110,6 +1108,21 @@ fn maximum_version<'a>(
         .map(str::to_owned)
 }
 
+fn select_nuget_release<'a>(versions: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    versions
+        .into_iter()
+        .filter_map(|raw| {
+            NuGetVersion::parse(raw)
+                .ok()
+                .filter(|version| !version.is_prerelease())
+                .map(|version| (raw, version))
+        })
+        .max_by(|(left_raw, left), (right_raw, right)| {
+            left.cmp(right).then_with(|| left_raw.cmp(right_raw))
+        })
+        .map(|(raw, _)| raw.to_owned())
+}
+
 fn select_pypi_release(
     releases: &serde_json::Map<String, Value>,
     installed: &str,
@@ -1138,7 +1151,10 @@ fn pypi_release_is_yanked(files: &Value) -> bool {
 
 fn is_prerelease(eco: Ecosystem, version: &str) -> bool {
     match eco {
-        Ecosystem::Npm | Ecosystem::CratesIo | Ecosystem::NuGet => version.contains('-'),
+        Ecosystem::Npm | Ecosystem::CratesIo => version.contains('-'),
+        Ecosystem::NuGet => {
+            NuGetVersion::parse(version).is_ok_and(|version| version.is_prerelease())
+        }
         Ecosystem::PyPI => pypi_version_is_prerelease(version),
     }
 }
@@ -2478,6 +2494,27 @@ mod tests {
         assert_eq!(
             select_pypi_release(releases, "3.0b1"),
             Some("3.0rc1".to_owned())
+        );
+    }
+
+    #[test]
+    fn selects_latest_valid_stable_nuget_release() {
+        let versions = [
+            "1.9.0",
+            "2.0.0-rc.10",
+            "not-a-version",
+            "1.10.0",
+            "2.0.0+build-sha",
+            "2147483648.0.0",
+        ];
+
+        assert_eq!(
+            select_nuget_release(versions),
+            Some("2.0.0+build-sha".to_owned())
+        );
+        assert_eq!(
+            select_nuget_release(["1.0.0-rc.2", "1.0.0-rc.10", "bad"]),
+            None
         );
     }
 }

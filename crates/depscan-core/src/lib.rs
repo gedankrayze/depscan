@@ -1,7 +1,9 @@
 //! Shared domain model and ecosystem-aware version/range logic for depscan.
 
+mod nuget;
 mod osv;
 
+pub use nuget::{NuGetVersion, NuGetVersionError};
 pub use osv::{OsvAffectedEvaluation, OsvEvaluationError, evaluate_osv_affected};
 
 use async_trait::async_trait;
@@ -426,25 +428,16 @@ pub fn compare_versions(ecosystem: Ecosystem, a: &str, b: &str) -> Ordering {
 }
 
 fn compare_nuget(a: &str, b: &str) -> Ordering {
-    let (an, ap) = a.split_once('-').unwrap_or((a, ""));
-    let (bn, bp) = b.split_once('-').unwrap_or((b, ""));
-    let av: Vec<u64> = an.split('.').map(|s| s.parse().unwrap_or(0)).collect();
-    let bv: Vec<u64> = bn.split('.').map(|s| s.parse().unwrap_or(0)).collect();
-    for i in 0..av.len().max(bv.len()).max(4) {
-        match av
-            .get(i)
-            .copied()
-            .unwrap_or(0)
-            .cmp(&bv.get(i).copied().unwrap_or(0))
-        {
-            Ordering::Equal => {}
-            x => return x,
-        }
-    }
-    match (ap.is_empty(), bp.is_empty()) {
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        _ => ap.cmp(bp),
+    match (NuGetVersion::parse(a), NuGetVersion::parse(b)) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        // A malformed registry version must never displace a valid NuGet version.
+        (Ok(_), Err(_)) => Ordering::Greater,
+        (Err(_), Ok(_)) => Ordering::Less,
+        (Err(_), Err(_)) => a
+            .trim()
+            .to_ascii_lowercase()
+            .cmp(&b.trim().to_ascii_lowercase())
+            .then_with(|| a.cmp(b)),
     }
 }
 
@@ -479,6 +472,16 @@ pub fn pypi_version_is_stable(version: &str) -> bool {
 }
 
 pub fn classify_staleness(ecosystem: Ecosystem, installed: &str, latest: &str) -> Staleness {
+    if ecosystem == Ecosystem::NuGet {
+        return match (NuGetVersion::parse(installed), NuGetVersion::parse(latest)) {
+            (Ok(installed), Ok(latest)) if installed >= latest => Staleness::Current,
+            (Ok(installed), Ok(latest)) => {
+                classify_release_segments(installed.release_segments(), latest.release_segments())
+            }
+            _ => Staleness::Unknown,
+        };
+    }
+
     if compare_versions(ecosystem, installed, latest) != Ordering::Less {
         return Staleness::Current;
     }
@@ -491,11 +494,7 @@ pub fn classify_staleness(ecosystem: Ecosystem, installed: &str, latest: &str) -
                 _ => Staleness::Unknown,
             }
         }
-        Ecosystem::NuGet => {
-            let a = numeric_release(installed);
-            let b = numeric_release(latest);
-            classify_release_segments(&a, &b)
-        }
+        Ecosystem::NuGet => unreachable!("NuGet staleness is handled using parsed versions"),
         Ecosystem::PyPI => match (parse_pep440(installed), parse_pep440(latest)) {
             (Some(a), Some(b)) if a.epoch() != b.epoch() => Staleness::Major,
             (Some(a), Some(b)) => classify_release_segments(a.release(), b.release()),
@@ -504,7 +503,7 @@ pub fn classify_staleness(ecosystem: Ecosystem, installed: &str, latest: &str) -
     }
 }
 
-fn classify_release_segments(installed: &[u64], latest: &[u64]) -> Staleness {
+fn classify_release_segments<T: PartialEq>(installed: &[T], latest: &[T]) -> Staleness {
     if installed.first() != latest.first() {
         Staleness::Major
     } else if installed.get(1) != latest.get(1) {
@@ -512,13 +511,6 @@ fn classify_release_segments(installed: &[u64], latest: &[u64]) -> Staleness {
     } else {
         Staleness::Patch
     }
-}
-
-fn numeric_release(v: &str) -> Vec<u64> {
-    v.split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap_or(0))
-        .collect()
 }
 
 #[cfg(test)]
@@ -564,6 +556,44 @@ mod tests {
             classify_staleness(Ecosystem::CratesIo, "1.2.3", "1.2.4"),
             Staleness::Patch
         );
+    }
+
+    #[test]
+    fn orders_and_classifies_nuget_versions_with_parsed_precedence() {
+        let order_cases = [
+            ("1.0.0-rc.2", "1.0.0-rc.10", Ordering::Less),
+            ("1.0.0-alpha.1", "1.0.0-alpha.beta", Ordering::Less),
+            ("1.0.0-alpha", "1.0.0-Alpha", Ordering::Equal),
+            ("1.0.0-rc.10", "1.0.0", Ordering::Less),
+            ("1.0.0+left", "1.0.0+right", Ordering::Equal),
+            ("1.0.0.4", "1.0.0.5", Ordering::Less),
+            ("1.00", "1.0.0.0", Ordering::Equal),
+        ];
+
+        for (left, right, expected) in order_cases {
+            assert_eq!(
+                compare_versions(Ecosystem::NuGet, left, right),
+                expected,
+                "unexpected ordering for {left:?} and {right:?}"
+            );
+        }
+
+        let staleness_cases = [
+            ("1.0.0-rc.2", "1.0.0", Staleness::Patch),
+            ("1.0.0.4", "1.0.0.5", Staleness::Patch),
+            ("1.0.0", "1.1.0", Staleness::Minor),
+            ("1.0.0", "2.0.0", Staleness::Major),
+            ("not-a-version", "2.0.0", Staleness::Unknown),
+            ("1.0.0", "not-a-version", Staleness::Unknown),
+        ];
+
+        for (installed, latest, expected) in staleness_cases {
+            assert_eq!(
+                classify_staleness(Ecosystem::NuGet, installed, latest),
+                expected,
+                "unexpected staleness for {installed:?} -> {latest:?}"
+            );
+        }
     }
 
     #[test]
