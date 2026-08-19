@@ -3,6 +3,7 @@
 `depscan` is a Rust CLI that scans resolved project dependencies for **known vulnerabilities** through [OSV.dev](https://osv.dev) and for **available updates** through the corresponding native package registries. It is designed for local development and CI: reports are deterministic, diagnostics are sent to standard error, and the scanner returns documented exit codes.
 
 > This repository implements the version 0.1 development direction. The command is intentionally report-only; it never rewrites lockfiles or upgrades dependencies.
+> Normative corrections to that draft are recorded in the [development specification errata](docs/specification-errata.md).
 
 ## Supported sources
 
