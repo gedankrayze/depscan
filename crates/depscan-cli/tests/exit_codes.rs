@@ -119,6 +119,14 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
             .output()
             .expect("run depscan")
     }
+
+    fn run_reproducible(&self, epoch: &str, arguments: &[&str]) -> Output {
+        command(&self.cache)
+            .env("SOURCE_DATE_EPOCH", epoch)
+            .args(arguments)
+            .output()
+            .expect("run reproducible depscan")
+    }
 }
 
 fn command(cache: &Path) -> Command {
@@ -126,7 +134,8 @@ fn command(cache: &Path) -> Command {
     command
         .env("DEPSCAN_CACHE_DIR", cache)
         .env("NO_COLOR", "1")
-        .env_remove("RUST_LOG");
+        .env_remove("RUST_LOG")
+        .env_remove("SOURCE_DATE_EPOCH");
     command
 }
 
@@ -195,6 +204,48 @@ fn clean_scan_exits_zero_and_writes_report_to_stdout() {
 
     assert_exit(&output, 0);
     assert_report_only_on_stdout(&output);
+}
+
+#[test]
+fn source_date_epoch_makes_repeated_json_scans_byte_identical() {
+    let project = TestProject::rust("reproducible-json");
+    project.seed_clean("1.0.0");
+    let arguments = [
+        "scan",
+        "--format",
+        "json",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ];
+
+    let first = project.run_reproducible("1700000000", &arguments);
+    let second = project.run_reproducible("1700000000", &arguments);
+
+    assert_exit(&first, 0);
+    assert_exit(&second, 0);
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(first.stderr, second.stderr);
+    assert!(
+        String::from_utf8_lossy(&first.stdout)
+            .contains("\"generated_at\": \"2023-11-14T22:13:20Z\"")
+    );
+}
+
+#[test]
+fn invalid_source_date_epoch_exits_ten_before_provider_access() {
+    let project = TestProject::rust("invalid-source-date-epoch");
+
+    let output = project.run_reproducible(
+        "not-a-timestamp",
+        &[
+            "scan",
+            "--offline",
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ],
+    );
+
+    assert_exit(&output, 10);
+    assert_diagnostic_only_on_stderr(&output, "SOURCE_DATE_EPOCH");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("provider hard failure"));
 }
 
 #[test]

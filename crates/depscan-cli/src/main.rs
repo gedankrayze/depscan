@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::{generate, shells};
 use depscan_core::{
@@ -232,6 +232,7 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
             args.path.display()
         )));
     }
+    let generated_at = scan_timestamp()?;
     let config = load_config(&args.path, args.config.as_deref())?;
     let fail_on = args
         .fail_on
@@ -350,7 +351,7 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
             suppressed,
         });
     }
-    let document = ScanDocument::new(results);
+    let document = ScanDocument::at(results, generated_at);
     let use_color = matches!(format, OutputFormat::Table)
         && std::env::var_os("NO_COLOR").is_none()
         && args.output.is_none();
@@ -369,6 +370,28 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
     } else {
         Ok(AppExit::Clean)
     }
+}
+
+fn scan_timestamp() -> Result<DateTime<Utc>, CliError> {
+    let value = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(Utc::now()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(CliError::usage(
+                "SOURCE_DATE_EPOCH must be a UTF-8 integer number of seconds since the Unix epoch",
+            ));
+        }
+    };
+    let seconds = value.parse::<i64>().map_err(|_| {
+        CliError::usage(
+            "SOURCE_DATE_EPOCH must be an integer number of seconds since the Unix epoch",
+        )
+    })?;
+    let timestamp = DateTime::<Utc>::from_timestamp(seconds, 0).ok_or_else(|| {
+        CliError::usage("SOURCE_DATE_EPOCH is outside the supported UTC timestamp range")
+    })?;
+    debug!(%timestamp, "reproducible scan timestamp selected from SOURCE_DATE_EPOCH");
+    Ok(timestamp)
 }
 
 async fn fetch_latest(

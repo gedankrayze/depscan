@@ -257,9 +257,70 @@ pub struct ScanDocument {
 
 impl ScanDocument {
     pub fn new(results: Vec<ScanResult>) -> Self {
+        Self::at(results, Utc::now())
+    }
+
+    /// Build a scan document with an orchestration-supplied timestamp and canonical collection
+    /// ordering. Supplying the time makes byte-reproducible JSON possible without weakening the
+    /// default, real-time timestamp used by [`Self::new`].
+    pub fn at(mut results: Vec<ScanResult>, generated_at: DateTime<Utc>) -> Self {
+        for result in &mut results {
+            for vulnerability in &mut result.vulns {
+                vulnerability.aliases.sort();
+                vulnerability.aliases.dedup();
+                vulnerability.fixed_in.sort_by(|left, right| {
+                    compare_versions(result.package.ecosystem, left, right)
+                        .then_with(|| left.cmp(right))
+                });
+                vulnerability.fixed_in.dedup();
+                vulnerability.references.sort();
+                vulnerability.references.dedup();
+            }
+            result.vulns.sort_by(|left, right| {
+                left.id
+                    .cmp(&right.id)
+                    .then_with(|| left.withdrawn.cmp(&right.withdrawn))
+                    .then_with(|| left.severity.cmp(&right.severity))
+                    .then_with(|| match (left.cvss_score, right.cvss_score) {
+                        (Some(left), Some(right)) => left.total_cmp(&right),
+                        (None, Some(_)) => Ordering::Less,
+                        (Some(_), None) => Ordering::Greater,
+                        (None, None) => Ordering::Equal,
+                    })
+                    .then_with(|| left.summary.cmp(&right.summary))
+                    .then_with(|| left.aliases.cmp(&right.aliases))
+                    .then_with(|| left.fixed_in.cmp(&right.fixed_in))
+                    .then_with(|| left.references.cmp(&right.references))
+            });
+            result.errors.sort_by(|left, right| {
+                left.provider
+                    .cmp(&right.provider)
+                    .then_with(|| left.message.cmp(&right.message))
+            });
+            result.suppressed.sort();
+            result.suppressed.dedup();
+        }
+        results.sort_by(|left, right| {
+            left.package
+                .ecosystem
+                .cmp(&right.package.ecosystem)
+                .then_with(|| left.package.name.cmp(&right.package.name))
+                .then_with(|| left.package.version.cmp(&right.package.version))
+                .then_with(|| left.package.display_name.cmp(&right.package.display_name))
+                .then_with(|| left.package.source_file.cmp(&right.package.source_file))
+                .then_with(|| left.package.direct.cmp(&right.package.direct))
+                .then_with(|| left.package.dev.cmp(&right.package.dev))
+                .then_with(|| left.package.enrichable.cmp(&right.package.enrichable))
+                .then_with(|| {
+                    left.package
+                        .resolved_from_range
+                        .cmp(&right.package.resolved_from_range)
+                })
+        });
+
         Self {
             schema_version: SCHEMA_VERSION,
-            generated_at: Utc::now(),
+            generated_at,
             results,
         }
     }
@@ -543,5 +604,85 @@ mod tests {
                 "unexpected staleness for {installed:?} -> {latest:?}"
             );
         }
+    }
+
+    #[test]
+    fn scan_document_uses_an_injected_clock_and_canonical_collection_order() {
+        fn result(name: &str, aliases: &[&str]) -> ScanResult {
+            ScanResult {
+                package: Package::new(
+                    Ecosystem::Npm,
+                    name,
+                    "1.0.0",
+                    PathBuf::from("package-lock.json"),
+                ),
+                vulns: vec![Vulnerability {
+                    id: format!("OSV-{name}"),
+                    aliases: aliases.iter().map(|value| (*value).to_owned()).collect(),
+                    summary: "fixture".to_owned(),
+                    severity: Some(Severity::High),
+                    cvss_score: Some(8.0),
+                    fixed_in: vec!["1.2.0".to_owned(), "1.1.0".to_owned()],
+                    references: vec![
+                        "https://b.example".to_owned(),
+                        "https://a.example".to_owned(),
+                    ],
+                    withdrawn: false,
+                }],
+                latest: None,
+                errors: vec![
+                    EnrichError {
+                        provider: "z-provider".to_owned(),
+                        message: "last".to_owned(),
+                    },
+                    EnrichError {
+                        provider: "a-provider".to_owned(),
+                        message: "first".to_owned(),
+                    },
+                ],
+                suppressed: vec!["Z-SUPPRESSED".to_owned(), "A-SUPPRESSED".to_owned()],
+            }
+        }
+
+        let timestamp = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let first = ScanDocument::at(
+            vec![
+                result("z-package", &["Z-ALIAS", "A-ALIAS"]),
+                result("a-package", &["A-ALIAS", "Z-ALIAS"]),
+            ],
+            timestamp,
+        );
+        let second = ScanDocument::at(
+            vec![
+                result("a-package", &["Z-ALIAS", "A-ALIAS"]),
+                result("z-package", &["A-ALIAS", "Z-ALIAS"]),
+            ],
+            timestamp,
+        );
+
+        assert_eq!(
+            serde_json::to_string_pretty(&first).unwrap(),
+            serde_json::to_string_pretty(&second).unwrap()
+        );
+        assert_eq!(first.generated_at, timestamp);
+        assert_eq!(first.results[0].package.name, "a-package");
+        assert_eq!(first.results[0].vulns[0].aliases, ["A-ALIAS", "Z-ALIAS"]);
+        assert_eq!(first.results[0].vulns[0].fixed_in, ["1.1.0", "1.2.0"]);
+        assert_eq!(first.results[0].errors[0].provider, "a-provider");
+        assert_eq!(
+            first.results[0].suppressed,
+            ["A-SUPPRESSED", "Z-SUPPRESSED"]
+        );
+    }
+
+    #[test]
+    fn scan_document_new_uses_a_current_utc_timestamp() {
+        let before = Utc::now();
+        let document = ScanDocument::new(Vec::new());
+        let after = Utc::now();
+
+        assert!(document.generated_at >= before);
+        assert!(document.generated_at <= after);
+        assert_eq!(document.generated_at.timezone(), Utc);
     }
 }

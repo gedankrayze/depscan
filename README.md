@@ -60,6 +60,14 @@ depscan scan . --format sarif --output depscan.sarif --fail-on high
 
 The supported report formats are `table`, `json`, `sarif`, and `summary`. When no format is specified, terminal output uses a table and redirected output uses a one-line summary. A file extension of `.json`, `.sarif`, `.txt`, or `.log` selects a matching format unless `--format` overrides it.
 
+JSON reports contain one RFC 3339 UTC `generated_at` timestamp captured by the scan orchestration. By default it is the real scan time. For byte-reproducible CI evidence, set the standard `SOURCE_DATE_EPOCH` environment variable to an integer number of seconds since the Unix epoch:
+
+```bash
+SOURCE_DATE_EPOCH=1700000000 depscan scan . --format json --output depscan.json
+```
+
+In that mode, equivalent scan results have canonical package, vulnerability, alias, fix, reference, suppression, and error ordering. An invalid or out-of-range epoch is a configuration error and exits with code `10`.
+
 | Exit code | Meaning |
 |---:|---|
 | 0 | Completed without a finding at the configured failure thresholds. |
