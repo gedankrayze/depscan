@@ -23,5 +23,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
-[lints]
-workspace = true
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# Windows file identity requires one audited FILE_ID_INFO call. The scoped module permits that
+# FFI while every other unsafe use in this crate remains an error.
+unsafe_code = "deny"

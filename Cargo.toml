@@ -45,7 +45,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-same-file = "1.0.6"
 noyalib = { version = "0.0.24", default-features = false, features = ["std"] }
 js-semver = "0.3.0"
 sha2 = "0.11.0"

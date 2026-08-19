@@ -491,7 +491,6 @@ dependencies = [
  "depscan-providers",
  "depscan-report",
  "futures",
- "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -515,7 +514,9 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -541,7 +542,6 @@ dependencies = [
  "unicode-general-category",
  "url",
  "walkdir",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -560,7 +560,6 @@ dependencies = [
  "httpdate",
  "rand 0.10.2",
  "reqwest",
- "same-file",
  "semver",
  "serde",
  "serde_json",

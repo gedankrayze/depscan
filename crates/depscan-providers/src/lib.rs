@@ -11,7 +11,7 @@ use cap_std::{
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use cvss::Cvss;
 use depscan_core::{
-    Ecosystem, EnrichError, LatestVersions, NuGetVersion, Package, ProviderError,
+    Ecosystem, EnrichError, FileIdentity, LatestVersions, NuGetVersion, Package, ProviderError,
     RegistryEnrichment, Severity, VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome,
     Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
     latest_matching_version, normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
@@ -27,7 +27,6 @@ use reqwest::{
     Client, StatusCode, Url,
     header::{ACCEPT, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, RETRY_AFTER},
 };
-use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -2316,8 +2315,8 @@ struct OfflineDumpRead {
     marker_name: OsString,
     archive_path: PathBuf,
     marker_path: PathBuf,
-    archive_identity: Handle,
-    marker_identity: Handle,
+    archive_identity: FileIdentity,
+    marker_identity: FileIdentity,
 }
 
 fn offline_capability_error(error: ProviderError) -> ProviderError {
@@ -2936,20 +2935,23 @@ fn validate_osv_dump_file(
     )
 }
 
-fn capability_directory_identity(directory: &CapDir, path: &Path) -> Result<Handle, ProviderError> {
+fn capability_directory_identity(
+    directory: &CapDir,
+    path: &Path,
+) -> Result<FileIdentity, ProviderError> {
     let file = directory
         .try_clone()
         .map_err(|error| cache_path_error(path, format_args!("cannot clone directory: {error}")))?
         .into_std_file();
-    Handle::from_file(file)
+    FileIdentity::from_owned_file(file)
         .map_err(|error| cache_path_error(path, format_args!("cannot identify directory: {error}")))
 }
 
-fn std_file_identity(file: &File, path: &Path) -> Result<Handle, ProviderError> {
+fn std_file_identity(file: &File, path: &Path) -> Result<FileIdentity, ProviderError> {
     let clone = file
         .try_clone()
         .map_err(|error| cache_path_error(path, format_args!("cannot clone file: {error}")))?;
-    Handle::from_file(clone)
+    FileIdentity::from_owned_file(clone)
         .map_err(|error| cache_path_error(path, format_args!("cannot identify file: {error}")))
 }
 
@@ -3002,6 +3004,14 @@ fn open_capability_regular_file(
 }
 
 fn validate_capability_sentinel(root: &CapDir, root_path: &Path) -> Result<(), ProviderError> {
+    validate_capability_sentinel_with(root, root_path, || {})
+}
+
+fn validate_capability_sentinel_with(
+    root: &CapDir,
+    root_path: &Path,
+    before_reopen: impl FnOnce(),
+) -> Result<(), ProviderError> {
     let sentinel_path = root_path.join(CACHE_SENTINEL_FILE);
     let mut file =
         open_capability_regular_file(root, OsStr::new(CACHE_SENTINEL_FILE), &sentinel_path, false)?
@@ -3043,6 +3053,7 @@ fn validate_capability_sentinel(root: &CapDir, root_path: &Path) -> Result<(), P
             "ownership sentinel does not identify a supported depscan cache",
         ));
     }
+    before_reopen();
     let current =
         open_capability_regular_file(root, OsStr::new(CACHE_SENTINEL_FILE), &sentinel_path, false)?
             .ok_or_else(|| {
@@ -3060,7 +3071,7 @@ fn validate_capability_sentinel(root: &CapDir, root_path: &Path) -> Result<(), P
 fn validate_root_capability_attachment(
     root: &CapDir,
     root_path: &Path,
-    expected_identity: &Handle,
+    expected_identity: &FileIdentity,
 ) -> Result<(), ProviderError> {
     let metadata = fs::symlink_metadata(root_path).map_err(|error| {
         cache_path_error(
@@ -3081,7 +3092,7 @@ fn validate_root_capability_attachment(
                 format_args!("cannot reopen cache root during revalidation: {error}"),
             )
         })?;
-    if capability_directory_identity(&current_root, root_path)? != *expected_identity {
+    if &capability_directory_identity(&current_root, root_path)? != expected_identity {
         return Err(cache_path_error(
             root_path,
             "cache root changed while synchronizing",
@@ -3093,10 +3104,10 @@ fn validate_root_capability_attachment(
 struct OfflineDirectory {
     root: CapDir,
     root_path: PathBuf,
-    root_identity: Handle,
+    root_identity: FileIdentity,
     directory: CapDir,
     path: PathBuf,
-    identity: Handle,
+    identity: FileIdentity,
 }
 
 impl OfflineDirectory {
@@ -3238,7 +3249,7 @@ impl OfflineDirectory {
         &self,
         name: &OsStr,
         path: &Path,
-        expected_identity: &Handle,
+        expected_identity: &FileIdentity,
     ) -> Result<(), ProviderError> {
         let current = open_capability_regular_file(&self.directory, name, path, false)
             .map_err(offline_capability_error)?
@@ -3250,7 +3261,7 @@ impl OfflineDirectory {
             })?;
         let current_identity =
             std_file_identity(&current, path).map_err(offline_capability_error)?;
-        if current_identity != *expected_identity {
+        if &current_identity != expected_identity {
             return Err(ProviderError::Offline(format!(
                 "OSV dump file {} changed while it was being read; refusing offline scan",
                 path.display()
@@ -6244,9 +6255,28 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[derive(Debug)]
+    enum RegularNamespaceSwap {
+        Denied(std::io::ErrorKind),
+        Swapped {
+            original: PathBuf,
+            moved: PathBuf,
+            replacement: PathBuf,
+        },
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug)]
     enum OfflineReadSwap {
         Directory(NamespaceSwap),
         File(FileNamespaceSwap),
+        Regular(RegularNamespaceSwap),
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug, Clone, Copy)]
+    enum OfflineReadSwapKind {
+        Symlink,
+        Regular,
     }
 
     #[cfg(any(unix, windows))]
@@ -6362,6 +6392,27 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    fn attempt_regular_file_swap(
+        original: &Path,
+        moved: &Path,
+        replacement: &Path,
+    ) -> FileNamespaceSwap {
+        match fs::rename(original, moved) {
+            Ok(()) => match fs::rename(replacement, original) {
+                Ok(()) => FileNamespaceSwap::Swapped {
+                    original: original.to_path_buf(),
+                    moved: moved.to_path_buf(),
+                },
+                Err(error) => {
+                    fs::rename(moved, original).expect("restore file after replacement denial");
+                    FileNamespaceSwap::Denied(error.kind())
+                }
+            },
+            Err(error) => FileNamespaceSwap::Denied(error.kind()),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     fn restore_file_namespace_swap(outcome: FileNamespaceSwap) -> bool {
         match outcome {
             FileNamespaceSwap::Swapped { original, moved } => {
@@ -6390,6 +6441,60 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    fn attempt_regular_namespace_swap(
+        original: &Path,
+        moved: &Path,
+        replacement: &Path,
+    ) -> RegularNamespaceSwap {
+        match fs::rename(original, moved) {
+            Ok(()) => match fs::rename(replacement, original) {
+                Ok(()) => RegularNamespaceSwap::Swapped {
+                    original: original.to_path_buf(),
+                    moved: moved.to_path_buf(),
+                    replacement: replacement.to_path_buf(),
+                },
+                Err(error) => {
+                    fs::rename(moved, original).expect("restore object after replacement denial");
+                    RegularNamespaceSwap::Denied(error.kind())
+                }
+            },
+            Err(error) => RegularNamespaceSwap::Denied(error.kind()),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn restore_regular_namespace_swap(outcome: RegularNamespaceSwap) -> bool {
+        match outcome {
+            RegularNamespaceSwap::Swapped {
+                original,
+                moved,
+                replacement,
+            } => {
+                fs::rename(&original, replacement).expect("restore replacement object");
+                fs::rename(moved, original).expect("restore original object");
+                true
+            }
+            #[cfg(unix)]
+            RegularNamespaceSwap::Denied(kind) => {
+                panic!("regular namespace swap unexpectedly failed on Unix: {kind:?}")
+            }
+            #[cfg(windows)]
+            RegularNamespaceSwap::Denied(kind) => {
+                assert!(
+                    matches!(
+                        kind,
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::Unsupported
+                            | std::io::ErrorKind::Other
+                    ),
+                    "unexpected Windows regular namespace-swap error: {kind:?}"
+                );
+                false
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     fn seed_external_offline_read_cache(root: &Path, archive: &[u8], marker: &str) {
         fs::write(
             root.join(CACHE_SENTINEL_FILE),
@@ -6404,12 +6509,46 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     fn attempt_offline_read_swap(
+        kind: OfflineReadSwapKind,
         target: OfflineReadSwapTarget,
         cache: &Cache,
         external_root: &Path,
     ) -> OfflineReadSwap {
         let offline = cache.root().join("offline");
         let external_offline = external_root.join("offline");
+        if matches!(kind, OfflineReadSwapKind::Regular) {
+            let (original, moved, replacement) = match target {
+                OfflineReadSwapTarget::Root => {
+                    let original = cache.root().to_path_buf();
+                    let moved = original.parent().unwrap().join(format!(
+                        "{}.ds064-read-held",
+                        original.file_name().unwrap().to_string_lossy()
+                    ));
+                    (original, moved, external_root.to_path_buf())
+                }
+                OfflineReadSwapTarget::OfflineDirectory => (
+                    offline.clone(),
+                    cache.root().join("offline.ds064-read-held"),
+                    external_offline.clone(),
+                ),
+                OfflineReadSwapTarget::Archive => (
+                    offline.join("npm.zip"),
+                    offline.join("npm.zip.ds064-read-held"),
+                    external_offline.join("npm.zip"),
+                ),
+                OfflineReadSwapTarget::Marker => (
+                    offline.join("npm.synced-at"),
+                    offline.join("npm.synced-at.ds064-read-held"),
+                    external_offline.join("npm.synced-at"),
+                ),
+            };
+            return OfflineReadSwap::Regular(attempt_regular_namespace_swap(
+                &original,
+                &moved,
+                &replacement,
+            ));
+        }
+
         match target {
             OfflineReadSwapTarget::Root => {
                 let original = cache.root();
@@ -6453,6 +6592,7 @@ mod tests {
         match outcome {
             OfflineReadSwap::Directory(outcome) => restore_namespace_swap(outcome),
             OfflineReadSwap::File(outcome) => restore_file_namespace_swap(outcome),
+            OfflineReadSwap::Regular(outcome) => restore_regular_namespace_swap(outcome),
         }
     }
 
@@ -6930,6 +7070,32 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn cache_sentinel_regular_replacement_is_denied_or_detected() {
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_root.path());
+        let sentinel = cache.root().join(CACHE_SENTINEL_FILE);
+        let moved = cache.root().join(".depscan-cache.original.json");
+        let replacement = cache.root().join(".depscan-cache.replacement.json");
+        let original_bytes = fs::read(&sentinel).unwrap();
+        fs::write(&replacement, &original_bytes).unwrap();
+        let root = CapDir::open_ambient_dir(cache.root(), ambient_authority()).unwrap();
+        let mut outcome = None;
+
+        let result = validate_capability_sentinel_with(&root, cache.root(), || {
+            outcome = Some(attempt_regular_file_swap(&sentinel, &moved, &replacement));
+        });
+        let swapped = restore_file_namespace_swap(outcome.expect("replacement was attempted"));
+
+        if swapped {
+            assert!(matches!(result, Err(ProviderError::Cache(_))));
+        } else {
+            result.expect("denied replacement keeps the owned cache usable");
+        }
+        assert_eq!(fs::read(sentinel).unwrap(), original_bytes);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn capability_relative_offline_reads_reject_root_child_and_final_name_swaps() {
         let package = Package::new(
             Ecosystem::Npm,
@@ -6954,12 +7120,19 @@ mod tests {
         let empty_archive = archive_with_entries(&[], zip::CompressionMethod::Stored);
         let now = test_timestamp("2026-08-19T12:00:00Z");
 
-        for target in [
-            OfflineReadSwapTarget::Root,
-            OfflineReadSwapTarget::OfflineDirectory,
-            OfflineReadSwapTarget::Archive,
-            OfflineReadSwapTarget::Marker,
-        ] {
+        for (kind, target) in [OfflineReadSwapKind::Symlink, OfflineReadSwapKind::Regular]
+            .into_iter()
+            .flat_map(|kind| {
+                [
+                    OfflineReadSwapTarget::Root,
+                    OfflineReadSwapTarget::OfflineDirectory,
+                    OfflineReadSwapTarget::Archive,
+                    OfflineReadSwapTarget::Marker,
+                ]
+                .into_iter()
+                .map(move |target| (kind, target))
+            })
+        {
             let cache_root = tempfile::tempdir().unwrap();
             let cache = cache_for_sync(cache_root.path());
             seed_sync_files(&cache, &vulnerable_archive, TEST_OSV_MODIFIED);
@@ -6994,6 +7167,7 @@ mod tests {
                         let mut outcome = hook_swap.lock().unwrap();
                         if outcome.is_none() {
                             *outcome = Some(attempt_offline_read_swap(
+                                kind,
                                 target,
                                 &hook_cache,
                                 &external_root,
@@ -7012,14 +7186,14 @@ mod tests {
             if swapped {
                 assert!(
                     matches!(result, Err(ProviderError::Offline(_))),
-                    "successful {target:?} swap did not fail the offline scan closed: {result:?}"
+                    "successful {kind:?} {target:?} swap did not fail the offline scan closed: {result:?}"
                 );
             } else {
                 let output = result.expect("a denied Windows swap must leave the scan usable");
                 assert_eq!(
                     output[&package.key()].len(),
                     1,
-                    "denied {target:?} swap produced a false-clean result"
+                    "denied {kind:?} {target:?} swap produced a false-clean result"
                 );
             }
             let (archive_path, marker_path) = sync_paths(&cache);
@@ -7028,12 +7202,12 @@ mod tests {
             assert_eq!(
                 fs::read(external.path().join("offline/npm.zip")).unwrap(),
                 empty_archive,
-                "external empty archive changed during {target:?} swap"
+                "external empty archive changed during {kind:?} {target:?} swap"
             );
             assert_eq!(
                 fs::read(external.path().join("offline/npm.synced-at")).unwrap(),
                 TEST_OSV_MODIFIED.as_bytes(),
-                "external marker changed during {target:?} swap"
+                "external marker changed during {kind:?} {target:?} swap"
             );
         }
     }

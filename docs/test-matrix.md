@@ -176,6 +176,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-061 | installer environment-handoff guards, installed/override argument-vector probes, PATH decoy rejection, and a native Windows workspace-executable decoy regression |
 | DS-062 | pending provider path-segment encoding table, endpoint request paths, dependency-tree proof, and registration URL-confinement coverage |
 | DS-063 | pending suffix-aware positive/negative-extglob differential corpus and real npm workspace fixture |
+| DS-064 | core `file_identity::{retained_handle_identity_distinguishes_replacement_files,retained_handle_identity_matches_a_hard_link_alias,borrowed_and_owned_constructors_identify_the_same_handle,windows_identity_compares_all_file_id_bytes,unsupported_platform_fails_closed}`; CLI `secure_fs::{config_regular_file_replacement_is_denied_or_detected,output_regular_file_replacement_is_denied_or_detected_before_publication}`; provider `cache_sentinel_regular_replacement_is_denied_or_detected` plus `capability_relative_offline_reads_reject_root_child_and_final_name_swaps`; native Linux/Windows runtime remains pending |
 
 ## Platform and external evidence boundary
 

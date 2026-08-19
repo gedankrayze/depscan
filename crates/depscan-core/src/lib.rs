@@ -1,10 +1,13 @@
 //! Shared domain model and ecosystem-aware version/range logic for depscan.
 
 mod constraint;
+mod file_identity;
 mod nuget;
 mod osv;
 
 pub use constraint::{VersionConstraintError, latest_matching_version};
+#[doc(hidden)]
+pub use file_identity::FileIdentity;
 pub use nuget::{NuGetVersion, NuGetVersionError};
 pub use osv::{OsvAffectedEvaluation, OsvEvaluationError, evaluate_osv_affected};
 

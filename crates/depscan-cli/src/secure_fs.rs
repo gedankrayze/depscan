@@ -4,7 +4,7 @@ use cap_std::{
     fs::{Dir, File, OpenOptions, Permissions},
 };
 use cap_tempfile::TempFile;
-use same_file::Handle;
+use depscan_core::FileIdentity;
 use std::{
     ffi::{OsStr, OsString},
     fmt,
@@ -43,26 +43,27 @@ fn io_error(action: &'static str, path: impl Into<PathBuf>, source: io::Error) -
     }
 }
 
-fn directory_identity(dir: &Dir, path: &Path) -> Result<Handle, SecureFsError> {
+fn directory_identity(dir: &Dir, path: &Path) -> Result<FileIdentity, SecureFsError> {
     let file = dir
         .try_clone()
         .map_err(|error| io_error("cloning directory handle for", path, error))?
         .into_std_file();
-    Handle::from_file(file).map_err(|error| io_error("identifying directory", path, error))
+    FileIdentity::from_owned_file(file)
+        .map_err(|error| io_error("identifying directory", path, error))
 }
 
-fn file_identity(file: &File, path: &Path) -> Result<Handle, SecureFsError> {
+fn file_identity(file: &File, path: &Path) -> Result<FileIdentity, SecureFsError> {
     let file = file
         .try_clone()
         .map_err(|error| io_error("cloning file handle for", path, error))?
         .into_std();
-    Handle::from_file(file).map_err(|error| io_error("identifying file", path, error))
+    FileIdentity::from_owned_file(file).map_err(|error| io_error("identifying file", path, error))
 }
 
 pub(crate) struct ScanRoot {
     dir: Dir,
     path: PathBuf,
-    identity: Handle,
+    identity: FileIdentity,
 }
 
 impl fmt::Debug for ScanRoot {
@@ -277,7 +278,7 @@ where
 enum TargetState {
     Missing,
     Existing {
-        identity: Handle,
+        identity: FileIdentity,
         permissions: Permissions,
     },
 }
@@ -310,7 +311,7 @@ pub(crate) struct ConfinedOutput {
     root: ScanRoot,
     parent: Dir,
     parent_relative: PathBuf,
-    parent_identity: Handle,
+    parent_identity: FileIdentity,
     name: OsString,
     target_state: TargetState,
     display_path: PathBuf,
@@ -600,28 +601,89 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[derive(Debug)]
+    enum RegularFileSwap {
+        Denied(io::ErrorKind),
+        Swapped { original: PathBuf, moved: PathBuf },
+    }
+
+    #[cfg(any(unix, windows))]
+    fn attempt_regular_file_swap(
+        original: &Path,
+        moved: &Path,
+        replacement: &Path,
+    ) -> RegularFileSwap {
+        match fs::rename(original, moved) {
+            Ok(()) => match fs::rename(replacement, original) {
+                Ok(()) => RegularFileSwap::Swapped {
+                    original: original.to_path_buf(),
+                    moved: moved.to_path_buf(),
+                },
+                Err(error) => {
+                    fs::rename(moved, original).expect("restore original after replacement denial");
+                    RegularFileSwap::Denied(error.kind())
+                }
+            },
+            Err(error) => RegularFileSwap::Denied(error.kind()),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn restore_regular_file_swap(outcome: RegularFileSwap) -> bool {
+        match outcome {
+            RegularFileSwap::Swapped { original, moved } => {
+                fs::remove_file(&original).expect("remove installed replacement");
+                fs::rename(moved, original).expect("restore original file");
+                true
+            }
+            #[cfg(unix)]
+            RegularFileSwap::Denied(kind) => {
+                panic!("regular-file replacement unexpectedly failed on Unix: {kind:?}")
+            }
+            #[cfg(windows)]
+            RegularFileSwap::Denied(kind) => {
+                assert!(
+                    matches!(
+                        kind,
+                        io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::Unsupported
+                            | io::ErrorKind::Other
+                    ),
+                    "unexpected Windows regular-file replacement error: {kind:?}"
+                );
+                false
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
-    fn config_swap_after_open_is_detected_without_reading_replacement() {
+    fn config_regular_file_replacement_is_denied_or_detected() {
         let directory = tempdir().expect("tempdir");
         let config = directory.path().join("depscan.toml");
+        let moved = directory.path().join("depscan.original.toml");
         let replacement = directory.path().join("replacement.toml");
         fs::write(&config, "fail-on = 'never'\n").expect("write config");
         fs::write(&replacement, "allow-tools = true\n").expect("write replacement");
-        let barrier = Arc::new(Barrier::new(2));
-        let worker_barrier = barrier.clone();
-        let config_for_worker = config.clone();
-        let replacement_for_worker = replacement.clone();
-        let worker = thread::spawn(move || {
-            worker_barrier.wait();
-            fs::rename(replacement_for_worker, config_for_worker).expect("replace config");
+        let mut outcome = None;
+        let result = read_config_nofollow_impl(&config, false, || {
+            outcome = Some(attempt_regular_file_swap(&config, &moved, &replacement));
         });
+        let swapped = restore_regular_file_swap(outcome.expect("replacement was attempted"));
 
-        let error = read_config_nofollow_impl(&config, false, || {
-            barrier.wait();
-            worker.join().expect("join swap worker");
-        })
-        .expect_err("swapped config must fail");
-        assert!(matches!(error, SecureFsError::Changed { .. }));
+        if swapped {
+            assert!(matches!(result, Err(SecureFsError::Changed { .. })));
+        } else {
+            assert_eq!(
+                result.expect("denied replacement keeps config readable"),
+                Some("fail-on = 'never'\n".to_owned())
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&config).expect("read restored config"),
+            "fail-on = 'never'\n"
+        );
     }
 
     #[cfg(not(windows))]
@@ -859,39 +921,39 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
-    fn output_regular_file_swap_is_detected_before_atomic_replacement() {
+    fn output_regular_file_replacement_is_denied_or_detected_before_publication() {
         let directory = tempdir().expect("tempdir");
         let root = directory.path().join("project");
         let reports = root.join("reports");
         fs::create_dir_all(&reports).expect("create reports");
         let output = reports.join("audit.json");
+        let moved = reports.join("audit.original.json");
         let replacement = reports.join("replacement.json");
         fs::write(&output, "original").expect("write original output");
         fs::write(&replacement, "concurrent replacement").expect("write replacement output");
         let capability = prepare_output(&root, Path::new("reports/audit.json"), &output);
 
-        let barrier = Arc::new(Barrier::new(2));
-        let worker_barrier = barrier.clone();
-        let replacement_for_worker = replacement.clone();
-        let output_for_worker = output.clone();
-        let worker = thread::spawn(move || {
-            worker_barrier.wait();
-            fs::rename(replacement_for_worker, output_for_worker)
-                .expect("replace output concurrently");
+        let mut outcome = None;
+        let result = capability.write_impl(b"new report", || {
+            outcome = Some(attempt_regular_file_swap(&output, &moved, &replacement));
         });
+        let swapped = restore_regular_file_swap(outcome.expect("replacement was attempted"));
 
-        let error = capability
-            .write_impl(b"new report", || {
-                barrier.wait();
-                worker.join().expect("join file-swap worker");
-            })
-            .expect_err("regular-file swap must fail");
-        assert!(matches!(error, SecureFsError::Changed { .. }));
-        assert_eq!(
-            fs::read_to_string(output).expect("read concurrent output"),
-            "concurrent replacement"
-        );
+        if swapped {
+            assert!(matches!(result, Err(SecureFsError::Changed { .. })));
+            assert_eq!(
+                fs::read_to_string(output).expect("read restored output"),
+                "original"
+            );
+        } else {
+            result.expect("denied replacement permits validated publication");
+            assert_eq!(
+                fs::read_to_string(output).expect("read published output"),
+                "new report"
+            );
+        }
     }
 
     #[test]

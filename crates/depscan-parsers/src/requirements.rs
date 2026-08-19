@@ -4,7 +4,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, File, OpenOptions},
 };
-use depscan_core::{Ecosystem, Package, ParseError, normalize_name};
+use depscan_core::{Ecosystem, FileIdentity, Package, ParseError, normalize_name};
 use pep440_rs::{Version as Pep440Version, VersionSpecifiers};
 use std::{
     collections::BTreeMap,
@@ -104,73 +104,6 @@ struct ActiveFile {
     identity: FileIdentity,
 }
 
-#[derive(Debug)]
-struct FileIdentity {
-    key: IdentityKey,
-    _handle: std::fs::File,
-}
-
-impl PartialEq for FileIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for FileIdentity {}
-
-#[derive(Debug, PartialEq, Eq)]
-enum IdentityKey {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume_serial_number: u64,
-        file_id: [u8; 16],
-    },
-}
-
-#[cfg(unix)]
-fn platform_file_identity(file: &std::fs::File) -> std::io::Result<IdentityKey> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata()?;
-    Ok(IdentityKey::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn platform_file_identity(file: &std::fs::File) -> std::io::Result<IdentityKey> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx},
-    };
-
-    let mut information = FILE_ID_INFO::default();
-    // SAFETY: `file` owns a valid handle for this call, `information` provides a correctly sized
-    // initialized writable FILE_ID_INFO buffer, and the return value is checked before its fields
-    // are trusted.
-    let succeeded = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileIdInfo,
-            (&raw mut information).cast(),
-            u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
-                .expect("FILE_ID_INFO size fits a Windows DWORD"),
-        )
-    };
-    if succeeded == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(IdentityKey::Windows {
-        volume_serial_number: information.VolumeSerialNumber,
-        file_id: information.FileId.Identifier,
-    })
-}
-
 fn directory_identity(directory: &Dir, path: &Path) -> Result<FileIdentity, ParseError> {
     let file = directory
         .try_clone()
@@ -181,13 +114,12 @@ fn directory_identity(directory: &Dir, path: &Path) -> Result<FileIdentity, Pars
             )
         })?
         .into_std_file();
-    let key = platform_file_identity(&file).map_err(|error| {
+    FileIdentity::from_owned_file(file).map_err(|error| {
         invalid(
             path,
             format!("cannot identify requirements directory: {error}"),
         )
-    })?;
-    Ok(FileIdentity { key, _handle: file })
+    })
 }
 
 fn file_identity(file: &File, path: &Path) -> Result<FileIdentity, ParseError> {
@@ -195,9 +127,8 @@ fn file_identity(file: &File, path: &Path) -> Result<FileIdentity, ParseError> {
         .try_clone()
         .map_err(|error| invalid(path, format!("cannot clone requirements file: {error}")))?
         .into_std();
-    let key = platform_file_identity(&file)
-        .map_err(|error| invalid(path, format!("cannot identify requirements file: {error}")))?;
-    Ok(FileIdentity { key, _handle: file })
+    FileIdentity::from_owned_file(file)
+        .map_err(|error| invalid(path, format!("cannot identify requirements file: {error}")))
 }
 
 fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
