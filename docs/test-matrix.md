@@ -166,6 +166,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-051 | consumed-field document validator, query-hit match/evaluability tests, hydration cache bypass/non-publication, offline shape parity, and CLI hard/soft malformed-record tests |
 | DS-052 | strict root/workspace manifest fallback fixtures plus unauthorized, missing-executable, provenance, and post-start hard-failure process tests |
 | DS-053 | ledger numbering/index/traceability and issue-tagged commit-history completion audit |
+| DS-054 | bounded inline/linked NuGet registration metadata, canonical-ID/mismatch and URL-confinement provider tests; online/offline query-plan identity controls; lowercase exact/range canonical-only OSV process regression |
 | DS-055 | online/offline total manifest-resolution failure, partial-resolution, and report-only process controls |
 | DS-057 | strict npm v2/v3 entry table; link/alias/group-precedence/concrete-hoist/workspace-pattern/source/v1 controls; npm 11 fixtures; mixed-record exit `10`; source-redaction process test |
 | DS-063 | pending suffix-aware positive/negative-extglob differential corpus and real npm workspace fixture |

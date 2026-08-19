@@ -5,9 +5,9 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::{generate, shells};
 use depscan_core::{
-    Ecosystem, EnrichError, LatestVersions, Package, ScanDocument, ScanResult, Severity, Staleness,
-    SuppressedFinding, SuppressionMatch, SuppressionSource, SuppressionState, VersionProvider,
-    VulnProvider, Vulnerability,
+    Ecosystem, EnrichError, LatestVersions, Package, RegistryEnrichment, ScanDocument, ScanResult,
+    Severity, Staleness, SuppressedFinding, SuppressionMatch, SuppressionSource, SuppressionState,
+    VersionProvider, VulnProvider, Vulnerability,
 };
 use depscan_parsers::{ParserSet, parse_bun_manifest_fallback};
 use depscan_providers::{
@@ -30,7 +30,7 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
-use vulnerability_resolution::VulnerabilityQueryPlan;
+use vulnerability_resolution::{OsvIdentityPolicy, VulnerabilityQueryPlan};
 
 mod external_tools;
 
@@ -613,7 +613,7 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
     let (vulnerability_outcome, freshness) = if args.offline {
         let registry = RegistryOffline::new(cache.clone());
         let freshness = fetch_latest(&registry, &packages, true).await;
-        let plan = VulnerabilityQueryPlan::new(&packages, &freshness);
+        let plan = VulnerabilityQueryPlan::new(&packages, &freshness, OsvIdentityPolicy::Offline);
         reject_totally_unresolved_plan(&plan)?;
         let vulnerabilities = OsvOffline::new(cache)
             .query(plan.packages())
@@ -624,7 +624,7 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         let http = HttpClient::new().map_err(CliError::provider)?;
         let registry = RegistryClient::new(http.clone(), cache.clone());
         let freshness = fetch_latest(&registry, &packages, false).await;
-        let plan = VulnerabilityQueryPlan::new(&packages, &freshness);
+        let plan = VulnerabilityQueryPlan::new(&packages, &freshness, OsvIdentityPolicy::Online);
         reject_totally_unresolved_plan(&plan)?;
         let vulnerabilities = OsvClient::new(http, cache)
             .query(plan.packages())
@@ -660,10 +660,11 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
             });
             !active
         });
-        let (latest, mut errors) = freshness
+        let (enrichment, mut errors) = freshness
             .get(&package_key)
             .cloned()
             .unwrap_or((None, Vec::new()));
+        let latest = enrichment.map(|enrichment| enrichment.latest);
         errors.extend(
             vulnerability_errors
                 .remove(&package_key)
@@ -766,7 +767,7 @@ async fn fetch_latest<P>(
     registry: &P,
     packages: &[Package],
     unknown_on_error: bool,
-) -> std::collections::HashMap<String, (Option<LatestVersions>, Vec<EnrichError>)>
+) -> std::collections::HashMap<String, (Option<RegistryEnrichment>, Vec<EnrichError>)>
 where
     P: VersionProvider + Clone,
 {
@@ -787,7 +788,9 @@ where
                         Err(error) => (
                             key,
                             (
-                                unknown_on_error.then(LatestVersions::unknown),
+                                unknown_on_error.then(|| {
+                                    RegistryEnrichment::versions_only(LatestVersions::unknown())
+                                }),
                                 vec![EnrichError {
                                     provider: "registry".to_owned(),
                                     message: error.to_string(),

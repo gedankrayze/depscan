@@ -9,13 +9,23 @@ this erratum defines the repository's implemented contract.
 The normalization summary in sections 3.3 and 3.5 must not be read as a rule
 to lowercase NuGet names for every external API.
 
-- Internal NuGet identity, deduplication, and cache lookup are
-  case-insensitive and use a lowercase key.
-- The spelling read from the project is retained for display and for OSV
-  queries. OSV matching is case-sensitive for some NuGet advisory records.
-- NuGet flat-container registry paths use the lowercase package ID, consistent
-  with the registry's case-insensitive identity rules.
+- Internal NuGet identity, deduplication, and registry cache lookup are
+  case-insensitive and use a lowercase key. Online OSV request-cache keys use
+  the validated canonical ID because they are request-specific.
+- The spelling read from the project is retained unchanged for reports. It is
+  not trusted as the canonical package ID because NuGet references are
+  case-insensitive.
+- Online OSV queries use the canonical `catalogEntry.id` from the NuGet
+  registration leaf for the concrete queried version. If that identity cannot
+  be validated, the coordinate remains visibly unresolved and no
+  source-spelling fallback is sent.
+- NuGet flat-container and registration lookup paths use the lowercase package
+  ID, consistent with the registry's case-insensitive identity rules.
+- Offline dump matching uses ecosystem-normalized identity and does not require
+  registration metadata.
 
-This separation is implemented and tested under [DS-003](issues/DS-003.md).
+The original internal/display/provider separation was implemented under
+[DS-003](issues/DS-003.md); [DS-054](issues/DS-054.md) corrects its assumption
+that source-preserved casing is necessarily canonical.
 The provider mapping is summarized in the repository
 [README](../README.md#package-identity-and-provider-names).

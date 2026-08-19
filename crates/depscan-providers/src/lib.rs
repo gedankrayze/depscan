@@ -11,10 +11,10 @@ use cap_std::{
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use cvss::Cvss;
 use depscan_core::{
-    Ecosystem, EnrichError, LatestVersions, NuGetVersion, Package, ProviderError, Severity,
-    VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome, Vulnerability, classify_staleness,
-    compare_versions, evaluate_osv_affected, latest_matching_version, normalize_name,
-    pypi_version_is_prerelease, pypi_version_is_stable,
+    Ecosystem, EnrichError, LatestVersions, NuGetVersion, Package, ProviderError,
+    RegistryEnrichment, Severity, VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome,
+    Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
+    latest_matching_version, normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
 };
 use directories::{BaseDirs, ProjectDirs};
 use fs2::FileExt;
@@ -24,7 +24,7 @@ use osv_document::{
 };
 use rand::RngExt;
 use reqwest::{
-    Client, StatusCode,
+    Client, StatusCode, Url,
     header::{ACCEPT, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, RETRY_AFTER},
 };
 use same_file::Handle;
@@ -58,6 +58,8 @@ const CACHE_COMMIT_ATTEMPTS: usize = 3;
 const NPM_REGISTRY_BASE_URL: &str = "https://registry.npmjs.org";
 const PYPI_REGISTRY_BASE_URL: &str = "https://pypi.org/pypi";
 const NUGET_REGISTRY_BASE_URL: &str = "https://api.nuget.org/v3-flatcontainer";
+const NUGET_REGISTRATION_BASE_URL: &str = "https://api.nuget.org/v3/registration5-gz-semver2";
+const NUGET_REGISTRATION_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const CRATES_IO_INDEX_BASE_URL: &str = "https://index.crates.io";
 const CRATES_IO_MAX_NAME_LEN: usize = 64;
 const CRATES_IO_MAX_INDEX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -311,6 +313,223 @@ fn nuget_registry_url(package: &Package) -> String {
 
 fn nuget_registry_url_with_base(base_url: &str, package: &Package) -> String {
     format!("{}/{}/index.json", base_url, encode(&package.name))
+}
+
+fn nuget_registration_cache_key(package: &Package) -> String {
+    format!("nuget-registration:{}", package.name)
+}
+
+fn nuget_registration_url_with_base(base_url: &str, package: &Package) -> String {
+    format!("{}/{}/index.json", base_url, encode(&package.name))
+}
+
+fn nuget_registration_page_cache_key(package: &Package, lower: &str, upper: &str) -> String {
+    format!("nuget-registration-page:{}:{lower}:{upper}", package.name)
+}
+
+#[derive(Debug)]
+enum NugetRegistrationPageSource {
+    Inline(Value),
+    Linked {
+        lower: String,
+        upper: String,
+        url: String,
+    },
+}
+
+fn invalid_nuget_registration(reason: impl std::fmt::Display) -> ProviderError {
+    ProviderError::InvalidResponse(format!("NuGet registration metadata is invalid: {reason}"))
+}
+
+fn nuget_registration_page_for_version(
+    document: &Value,
+    target_raw: &str,
+) -> Result<NugetRegistrationPageSource, ProviderError> {
+    let target = NuGetVersion::parse(target_raw).map_err(invalid_nuget_registration)?;
+    let root = document
+        .as_object()
+        .ok_or_else(|| invalid_nuget_registration("index root must be an object"))?;
+    let pages = root
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_nuget_registration("index must contain a pages array"))?;
+    let count = root
+        .get("count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_nuget_registration("index must contain an integer page count"))?;
+    if usize::try_from(count).ok() != Some(pages.len()) {
+        return Err(invalid_nuget_registration(format_args!(
+            "index page count {count} does not match its {} pages",
+            pages.len()
+        )));
+    }
+
+    let mut selected = None;
+    for (index, page) in pages.iter().enumerate() {
+        let page = page.as_object().ok_or_else(|| {
+            invalid_nuget_registration(format_args!("index page {index} must be an object"))
+        })?;
+        let lower_raw = page.get("lower").and_then(Value::as_str).ok_or_else(|| {
+            invalid_nuget_registration(format_args!("index page {index} has no lower bound"))
+        })?;
+        let upper_raw = page.get("upper").and_then(Value::as_str).ok_or_else(|| {
+            invalid_nuget_registration(format_args!("index page {index} has no upper bound"))
+        })?;
+        let lower = NuGetVersion::parse(lower_raw).map_err(invalid_nuget_registration)?;
+        let upper = NuGetVersion::parse(upper_raw).map_err(invalid_nuget_registration)?;
+        if lower > upper {
+            return Err(invalid_nuget_registration(format_args!(
+                "index page {index} lower bound {lower_raw:?} exceeds {upper_raw:?}"
+            )));
+        }
+        if target < lower || target > upper {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(invalid_nuget_registration(format_args!(
+                "more than one index page contains version {target_raw:?}"
+            )));
+        }
+        selected = Some(match page.get("items") {
+            Some(items) => {
+                let items = items.as_array().ok_or_else(|| {
+                    invalid_nuget_registration(format_args!(
+                        "inline index page {index} items must be an array"
+                    ))
+                })?;
+                let count = page.get("count").and_then(Value::as_u64).ok_or_else(|| {
+                    invalid_nuget_registration(format_args!(
+                        "inline index page {index} has no integer leaf count"
+                    ))
+                })?;
+                if usize::try_from(count).ok() != Some(items.len()) {
+                    return Err(invalid_nuget_registration(format_args!(
+                        "inline index page {index} leaf count {count} does not match its {} leaves",
+                        items.len()
+                    )));
+                }
+                NugetRegistrationPageSource::Inline(Value::Object(page.clone()))
+            }
+            None => {
+                let url = page.get("@id").and_then(Value::as_str).ok_or_else(|| {
+                    invalid_nuget_registration(format_args!(
+                        "non-inline index page {index} has no @id"
+                    ))
+                })?;
+                NugetRegistrationPageSource::Linked {
+                    lower: lower_raw.to_owned(),
+                    upper: upper_raw.to_owned(),
+                    url: url.to_owned(),
+                }
+            }
+        });
+    }
+    selected.ok_or_else(|| {
+        invalid_nuget_registration(format_args!(
+            "no index page contains version {target_raw:?}"
+        ))
+    })
+}
+
+fn validated_nuget_registration_page_url(
+    base_url: &str,
+    package: &Package,
+    raw_url: &str,
+) -> Result<String, ProviderError> {
+    let base = Url::parse(base_url).map_err(|error| {
+        invalid_nuget_registration(format_args!("registration base URL is invalid: {error}"))
+    })?;
+    let mut page = Url::parse(raw_url).map_err(|error| {
+        invalid_nuget_registration(format_args!("registration page URL is invalid: {error}"))
+    })?;
+    if page.origin() != base.origin() || !page.username().is_empty() || page.password().is_some() {
+        return Err(invalid_nuget_registration(
+            "registration page URL must use the registration base origin without credentials",
+        ));
+    }
+    let package_prefix = format!(
+        "{}/{}/",
+        base.path().trim_end_matches('/'),
+        encode(&package.name)
+    );
+    if !page.path().starts_with(&package_prefix) {
+        return Err(invalid_nuget_registration(format_args!(
+            "registration page URL path must start with {package_prefix:?}"
+        )));
+    }
+    page.set_fragment(None);
+    Ok(page.into())
+}
+
+fn canonical_nuget_name_from_registration_page(
+    package: &Package,
+    target_raw: &str,
+    page: &Value,
+) -> Result<String, ProviderError> {
+    let target = NuGetVersion::parse(target_raw).map_err(invalid_nuget_registration)?;
+    let page = page
+        .as_object()
+        .ok_or_else(|| invalid_nuget_registration("page root must be an object"))?;
+    let leaves = page
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_nuget_registration("page must contain a leaves array"))?;
+    let count = page
+        .get("count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_nuget_registration("page must contain an integer leaf count"))?;
+    if usize::try_from(count).ok() != Some(leaves.len()) {
+        return Err(invalid_nuget_registration(format_args!(
+            "page leaf count {count} does not match its {} leaves",
+            leaves.len()
+        )));
+    }
+
+    let mut canonical = None;
+    for (index, leaf) in leaves.iter().enumerate() {
+        let catalog = leaf
+            .get("catalogEntry")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                invalid_nuget_registration(format_args!(
+                    "registration leaf {index} has no catalogEntry object"
+                ))
+            })?;
+        let version_raw = catalog
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                invalid_nuget_registration(format_args!(
+                    "registration leaf {index} has no catalogEntry.version"
+                ))
+            })?;
+        let version = NuGetVersion::parse(version_raw).map_err(invalid_nuget_registration)?;
+        if version != target {
+            continue;
+        }
+        if canonical.is_some() {
+            return Err(invalid_nuget_registration(format_args!(
+                "more than one registration leaf matches version {target_raw:?}"
+            )));
+        }
+        let id = catalog.get("id").and_then(Value::as_str).ok_or_else(|| {
+            invalid_nuget_registration(format_args!(
+                "registration leaf {index} has no catalogEntry.id"
+            ))
+        })?;
+        if normalize_name(Ecosystem::NuGet, id) != package.name {
+            return Err(invalid_nuget_registration(format_args!(
+                "catalogEntry.id {id:?} does not match requested package {:?}",
+                package.name
+            )));
+        }
+        canonical = Some(id.to_owned());
+    }
+    canonical.ok_or_else(|| {
+        invalid_nuget_registration(format_args!(
+            "no registration leaf matches version {target_raw:?}"
+        ))
+    })
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1251,6 +1470,26 @@ impl HttpClient {
         Err(ProviderError::Network(format!(
             "{context}: retry policy allowed no attempts"
         )))
+    }
+
+    async fn get_json_limited_revalidated(
+        &self,
+        url: &str,
+        max_bytes: usize,
+        headers: HeaderMap,
+    ) -> Result<Revalidated<Value>, ProviderError> {
+        match self
+            .get_bytes_limited_revalidated(url, max_bytes, headers)
+            .await?
+        {
+            Revalidated::Modified { value, etag } => {
+                let value = serde_json::from_slice(&value).map_err(|_| {
+                    ProviderError::InvalidResponse(format!("GET {url}: invalid JSON response"))
+                })?;
+                Ok(Revalidated::Modified { value, etag })
+            }
+            Revalidated::NotModified { etag } => Ok(Revalidated::NotModified { etag }),
+        }
     }
 }
 
@@ -3698,6 +3937,7 @@ pub struct RegistryClient {
     npm_base_url: String,
     pypi_base_url: String,
     nuget_base_url: String,
+    nuget_registration_base_url: String,
     crates_index_base_url: String,
 }
 impl RegistryClient {
@@ -3708,6 +3948,7 @@ impl RegistryClient {
             NPM_REGISTRY_BASE_URL,
             PYPI_REGISTRY_BASE_URL,
             NUGET_REGISTRY_BASE_URL,
+            NUGET_REGISTRATION_BASE_URL,
             CRATES_IO_INDEX_BASE_URL,
         )
     }
@@ -3724,6 +3965,7 @@ impl RegistryClient {
             NPM_REGISTRY_BASE_URL,
             PYPI_REGISTRY_BASE_URL,
             NUGET_REGISTRY_BASE_URL,
+            NUGET_REGISTRATION_BASE_URL,
             crates_index_base_url,
         )
     }
@@ -3734,6 +3976,7 @@ impl RegistryClient {
         npm_base_url: impl Into<String>,
         pypi_base_url: impl Into<String>,
         nuget_base_url: impl Into<String>,
+        nuget_registration_base_url: impl Into<String>,
         crates_index_base_url: impl Into<String>,
     ) -> Self {
         let limits = HashMap::from([
@@ -3749,6 +3992,10 @@ impl RegistryClient {
             npm_base_url: npm_base_url.into().trim_end_matches('/').to_owned(),
             pypi_base_url: pypi_base_url.into().trim_end_matches('/').to_owned(),
             nuget_base_url: nuget_base_url.into().trim_end_matches('/').to_owned(),
+            nuget_registration_base_url: nuget_registration_base_url
+                .into()
+                .trim_end_matches('/')
+                .to_owned(),
             crates_index_base_url: crates_index_base_url
                 .into()
                 .trim_end_matches('/')
@@ -3760,6 +4007,28 @@ impl RegistryClient {
         namespace: &str,
         url: &str,
         headers: HeaderMap,
+    ) -> Result<Value, ProviderError> {
+        self.metadata_with_limit(namespace, url, headers, None)
+            .await
+    }
+
+    async fn metadata_limited(
+        &self,
+        namespace: &str,
+        url: &str,
+        headers: HeaderMap,
+        max_bytes: usize,
+    ) -> Result<Value, ProviderError> {
+        self.metadata_with_limit(namespace, url, headers, Some(max_bytes))
+            .await
+    }
+
+    async fn metadata_with_limit(
+        &self,
+        namespace: &str,
+        url: &str,
+        headers: HeaderMap,
+        max_bytes: Option<usize>,
     ) -> Result<Value, ProviderError> {
         let ttl = Duration::seconds(REGISTRY_TTL_SECS);
         let mut generation = self.cache.snapshot("registry", namespace, ttl);
@@ -3775,7 +4044,14 @@ impl RegistryClient {
             force_revalidate = false;
             let mut request_headers = headers.clone();
             let conditional = add_if_none_match(&mut request_headers, cached.as_ref());
-            match self.http.get_json_revalidated(url, request_headers).await? {
+            let response = if let Some(max_bytes) = max_bytes {
+                self.http
+                    .get_json_limited_revalidated(url, max_bytes, request_headers)
+                    .await?
+            } else {
+                self.http.get_json_revalidated(url, request_headers).await?
+            };
+            match response {
                 Revalidated::Modified { value, etag } => {
                     match self.cache.put_if_unchanged(
                         "registry",
@@ -3834,7 +4110,43 @@ impl RegistryClient {
             "registry cache entry {namespace:?} changed repeatedly during revalidation"
         )))
     }
-    async fn npm(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+
+    async fn nuget_canonical_name(
+        &self,
+        package: &Package,
+        target_version: &str,
+    ) -> Result<String, ProviderError> {
+        let index_url =
+            nuget_registration_url_with_base(&self.nuget_registration_base_url, package);
+        let index = self
+            .metadata_limited(
+                &nuget_registration_cache_key(package),
+                &index_url,
+                HeaderMap::new(),
+                NUGET_REGISTRATION_MAX_RESPONSE_BYTES,
+            )
+            .await?;
+        let page = match nuget_registration_page_for_version(&index, target_version)? {
+            NugetRegistrationPageSource::Inline(page) => page,
+            NugetRegistrationPageSource::Linked { lower, upper, url } => {
+                let url = validated_nuget_registration_page_url(
+                    &self.nuget_registration_base_url,
+                    package,
+                    &url,
+                )?;
+                self.metadata_limited(
+                    &nuget_registration_page_cache_key(package, &lower, &upper),
+                    &url,
+                    HeaderMap::new(),
+                    NUGET_REGISTRATION_MAX_RESPONSE_BYTES,
+                )
+                .await?
+            }
+        };
+        canonical_nuget_name_from_registration_page(package, target_version, &page)
+    }
+
+    async fn npm(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
         let _permit = self.limits[&Ecosystem::Npm]
             .acquire()
             .await
@@ -3848,9 +4160,9 @@ impl RegistryClient {
         let data = self
             .metadata(&format!("npm:{}", p.name), &url, headers)
             .await?;
-        npm_version_result(p, &data)
+        npm_version_result(p, &data).map(RegistryEnrichment::versions_only)
     }
-    async fn pypi(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+    async fn pypi(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
         let _permit = self.limits[&Ecosystem::PyPI]
             .acquire()
             .await
@@ -3859,9 +4171,9 @@ impl RegistryClient {
         let data = self
             .metadata(&format!("pypi:{}", p.name), &url, HeaderMap::new())
             .await?;
-        pypi_version_result(p, &data)
+        pypi_version_result(p, &data).map(RegistryEnrichment::versions_only)
     }
-    async fn nuget(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+    async fn nuget(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
         let _permit = self.limits[&Ecosystem::NuGet]
             .acquire()
             .await
@@ -3869,9 +4181,18 @@ impl RegistryClient {
         let url = nuget_registry_url_with_base(&self.nuget_base_url, p);
         let cache_key = nuget_registry_cache_key(p);
         let data = self.metadata(&cache_key, &url, HeaderMap::new()).await?;
-        nuget_version_result(p, &data)
+        let latest = nuget_version_result(p, &data)?;
+        let target_version = latest
+            .latest_matching
+            .as_deref()
+            .unwrap_or(p.version.as_str());
+        let canonical_name = self.nuget_canonical_name(p, target_version).await?;
+        Ok(RegistryEnrichment {
+            latest,
+            canonical_name: Some(canonical_name),
+        })
     }
-    async fn crates(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+    async fn crates(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
         let path = crates_io_sparse_path(&p.name)?;
         let _permit = self.limits[&Ecosystem::CratesIo]
             .acquire()
@@ -3882,12 +4203,12 @@ impl RegistryClient {
         let entries = self
             .crates_metadata_for_index(&format!("crates:{}", name), name, &url)
             .await?;
-        crates_version_result(p, &entries)
+        crates_version_result(p, &entries).map(RegistryEnrichment::versions_only)
     }
 }
 #[async_trait]
 impl VersionProvider for RegistryClient {
-    async fn latest(&self, package: &Package) -> Result<LatestVersions, ProviderError> {
+    async fn latest(&self, package: &Package) -> Result<RegistryEnrichment, ProviderError> {
         match package.ecosystem {
             Ecosystem::Npm => self.npm(package).await,
             Ecosystem::PyPI => self.pypi(package).await,
@@ -4394,8 +4715,9 @@ impl RegistryOffline {
 
 #[async_trait]
 impl VersionProvider for RegistryOffline {
-    async fn latest(&self, package: &Package) -> Result<LatestVersions, ProviderError> {
+    async fn latest(&self, package: &Package) -> Result<RegistryEnrichment, ProviderError> {
         self.latest_at(package, self.now)
+            .map(RegistryEnrichment::versions_only)
     }
 }
 
@@ -5573,6 +5895,28 @@ mod tests {
         assert!(runtime.jitter_bounds().is_empty());
         assert!(error.to_string().contains("HTTP 429"));
         assert!(error.to_string().contains("attempt 4/4"));
+    }
+
+    #[tokio::test]
+    async fn bounded_json_rejects_a_body_larger_than_its_decompressed_limit() {
+        let body = serde_json::to_vec(&json!({"padding": "x".repeat(128)})).unwrap();
+        let (base_url, requests, server) =
+            spawn_raw_server(vec![RawResponse::fixed(200, body)]).await;
+        let runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
+        let client = test_http_client(runtime, StdDuration::from_secs(1));
+
+        let error = client
+            .get_json_limited_revalidated(&format!("{base_url}/metadata"), 64, HeaderMap::new())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("response exceeds the 64-byte limit")
+        );
     }
 
     #[tokio::test]
@@ -7088,6 +7432,38 @@ mod tests {
         )
     }
 
+    fn nuget_registration_index(id: &str, versions: &[&str]) -> Value {
+        let lower = versions.first().expect("registration fixture version");
+        let upper = versions.last().expect("registration fixture version");
+        json!({
+            "count": 1,
+            "items": [{
+                "@id": format!("https://example.invalid/{}/index.json#page/{lower}/{upper}", id.to_ascii_lowercase()),
+                "count": versions.len(),
+                "items": versions
+                    .iter()
+                    .map(|version| json!({
+                        "catalogEntry": {"id": id, "version": version}
+                    }))
+                    .collect::<Vec<_>>(),
+                "lower": lower,
+                "upper": upper
+            }]
+        })
+    }
+
+    fn nuget_registry_client(server: &MockServer, cache: Cache) -> RegistryClient {
+        RegistryClient::with_registry_base_urls(
+            HttpClient::new().unwrap(),
+            cache,
+            format!("{}/npm", server.uri()),
+            format!("{}/pypi", server.uri()),
+            format!("{}/nuget", server.uri()),
+            format!("{}/registration", server.uri()),
+            format!("{}/crates", server.uri()),
+        )
+    }
+
     fn npm_package(name: &str) -> Package {
         Package::new(
             Ecosystem::Npm,
@@ -7188,6 +7564,16 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
+            .and(path("/registration/nuget.demo/index.json"))
+            .and(header("user-agent", USER_AGENT_VALUE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(nuget_registration_index("NuGet.Demo", &["1.0.0", "2.0.0"])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/crates/cr/at/crate-demo"))
             .and(header("user-agent", USER_AGENT_VALUE))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
@@ -7212,6 +7598,7 @@ mod tests {
             format!("{}/npm", server.uri()),
             format!("{}/pypi", server.uri()),
             format!("{}/nuget", server.uri()),
+            format!("{}/registration", server.uri()),
             format!("{}/crates", server.uri()),
         );
         let packages = [
@@ -7228,10 +7615,200 @@ mod tests {
 
         for package in packages {
             let latest = client.latest(&package).await.unwrap();
-            assert_eq!(latest.latest_stable, "2.0.0", "{}", package.name);
-            assert_eq!(latest.staleness, depscan_core::Staleness::Major);
+            assert_eq!(latest.latest.latest_stable, "2.0.0", "{}", package.name);
+            assert_eq!(latest.latest.staleness, depscan_core::Staleness::Major);
+            if package.ecosystem == Ecosystem::NuGet {
+                assert_eq!(latest.canonical_name.as_deref(), Some("NuGet.Demo"));
+            }
         }
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn nuget_registration_follows_the_target_page_and_returns_canonical_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nuget/newtonsoft.json/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "versions": ["12.0.1", "13.0.3"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let page_url = format!(
+            "{}/registration/newtonsoft.json/page/12.0.1/13.0.3.json",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/registration/newtonsoft.json/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 1,
+                "items": [{
+                    "@id": page_url,
+                    "count": 2,
+                    "lower": "12.0.1",
+                    "upper": "13.0.3"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/registration/newtonsoft.json/page/12.0.1/13.0.3.json",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 2,
+                "items": [
+                    {"catalogEntry": {"id": "Newtonsoft.Json", "version": "12.0.1"}},
+                    {"catalogEntry": {"id": "Newtonsoft.Json", "version": "13.0.3"}}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let package = nuget_package("newtonsoft.json");
+
+        let enrichment = nuget_registry_client(&server, cache)
+            .latest(&package)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            enrichment.canonical_name.as_deref(),
+            Some("Newtonsoft.Json")
+        );
+        assert_eq!(enrichment.latest.latest_stable, "13.0.3");
+        assert_eq!(package.display_name, "newtonsoft.json");
+        assert_eq!(package.key(), "NuGet:newtonsoft.json:12.0.1");
+        server.verify().await;
+    }
+
+    #[test]
+    fn nuget_registration_rejects_malformed_and_mismatched_catalog_identities() {
+        let package = nuget_package("newtonsoft.json");
+        let mismatched = nuget_registration_index("Other.Package", &["12.0.1"]);
+        let NugetRegistrationPageSource::Inline(page) =
+            nuget_registration_page_for_version(&mismatched, "12.0.1").unwrap()
+        else {
+            panic!("fixture page must be inline");
+        };
+        let mismatch =
+            canonical_nuget_name_from_registration_page(&package, "12.0.1", &page).unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("does not match requested package")
+        );
+
+        let malformed = json!({
+            "count": 1,
+            "items": [{
+                "count": 1,
+                "items": [{"catalogEntry": {"version": "12.0.1"}}],
+                "lower": "12.0.1",
+                "upper": "12.0.1"
+            }]
+        });
+        let NugetRegistrationPageSource::Inline(page) =
+            nuget_registration_page_for_version(&malformed, "12.0.1").unwrap()
+        else {
+            panic!("fixture page must be inline");
+        };
+        let missing =
+            canonical_nuget_name_from_registration_page(&package, "12.0.1", &page).unwrap_err();
+        assert!(missing.to_string().contains("has no catalogEntry.id"));
+    }
+
+    #[tokio::test]
+    async fn nuget_registry_enrichment_fails_when_registration_identity_is_unavailable() {
+        let package = nuget_package("newtonsoft.json");
+        let cases = [
+            (
+                "absent target version",
+                json!({"count": 0, "items": []}),
+                "no index page contains version",
+            ),
+            (
+                "missing catalog ID",
+                json!({
+                    "count": 1,
+                    "items": [{
+                        "count": 1,
+                        "items": [{"catalogEntry": {"version": "12.0.1"}}],
+                        "lower": "12.0.1",
+                        "upper": "12.0.1"
+                    }]
+                }),
+                "has no catalogEntry.id",
+            ),
+            (
+                "mismatched catalog ID",
+                nuget_registration_index("Other.Package", &["12.0.1"]),
+                "does not match requested package",
+            ),
+        ];
+
+        for (case, registration, expected) in cases {
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache = Cache {
+                root: cache_dir.path().to_path_buf(),
+                policy: CachePolicy::default(),
+            };
+            cache
+                .put(
+                    "registry",
+                    &nuget_registry_cache_key(&package),
+                    &json!({"versions": ["12.0.1", "13.0.3"]}),
+                    None,
+                )
+                .unwrap();
+            cache
+                .put(
+                    "registry",
+                    &nuget_registration_cache_key(&package),
+                    &registration,
+                    None,
+                )
+                .unwrap();
+
+            let error = RegistryClient::new(HttpClient::new().unwrap(), cache)
+                .latest(&package)
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{case}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_registration_page_links_are_origin_and_package_prefix_confined() {
+        let package = nuget_package("newtonsoft.json");
+        let base = "https://api.nuget.test/v3/registration";
+        let valid = "https://api.nuget.test/v3/registration/newtonsoft.json/page/1/2.json";
+        assert_eq!(
+            validated_nuget_registration_page_url(base, &package, valid).unwrap(),
+            valid
+        );
+
+        for invalid in [
+            "https://attacker.invalid/v3/registration/newtonsoft.json/page/1/2.json",
+            "https://api.nuget.test/v3/registration/other.package/page/1/2.json",
+            "https://user:secret@api.nuget.test/v3/registration/newtonsoft.json/page/1/2.json",
+        ] {
+            assert!(
+                validated_nuget_registration_page_url(base, &package, invalid).is_err(),
+                "accepted unconfined registration page {invalid:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7271,6 +7848,7 @@ mod tests {
             format!("{}/npm", server.uri()),
             format!("{}/pypi", server.uri()),
             format!("{}/nuget", server.uri()),
+            format!("{}/registration", server.uri()),
             format!("{}/crates", server.uri()),
         );
         let cases = [
@@ -7303,7 +7881,6 @@ mod tests {
             cache
                 .put("registry", &fixture.cache_key, &fixture.registry, None)
                 .unwrap();
-            let client = RegistryClient::new(HttpClient::new().unwrap(), cache);
             let mut package = Package::new(
                 ecosystem,
                 &fixture.package,
@@ -7311,22 +7888,39 @@ mod tests {
                 PathBuf::from("manifest.fixture"),
             );
             package.set_manifest_constraint(&fixture.constraint);
+            if ecosystem == Ecosystem::NuGet {
+                cache
+                    .put(
+                        "registry",
+                        &nuget_registration_cache_key(&package),
+                        &nuget_registration_index(
+                            &fixture.package,
+                            &[
+                                fixture.latest_matching.as_str(),
+                                fixture.latest_stable.as_str(),
+                            ],
+                        ),
+                        None,
+                    )
+                    .unwrap();
+            }
+            let client = RegistryClient::new(HttpClient::new().unwrap(), cache);
 
             let latest = client.latest(&package).await.unwrap();
 
             assert_eq!(
-                latest.latest_stable, fixture.latest_stable,
+                latest.latest.latest_stable, fixture.latest_stable,
                 "wrong stable release for {}",
                 fixture.package
             );
             assert_eq!(
-                latest.latest_matching.as_deref(),
+                latest.latest.latest_matching.as_deref(),
                 Some(fixture.latest_matching.as_str()),
                 "wrong constrained release for {}",
                 fixture.package
             );
-            assert_ne!(latest.latest_stable, fixture.latest_matching);
-            assert_eq!(latest.staleness, depscan_core::Staleness::Unknown);
+            assert_ne!(latest.latest.latest_stable, fixture.latest_matching);
+            assert_eq!(latest.latest.staleness, depscan_core::Staleness::Unknown);
         }
     }
 
@@ -7723,7 +8317,7 @@ mod tests {
 
         for (name, _) in cases {
             let latest = client.latest(&crates_package(name)).await.unwrap();
-            assert_eq!(latest.latest_stable, "1.0.0");
+            assert_eq!(latest.latest.latest_stable, "1.0.0");
         }
         server.verify().await;
     }
@@ -7796,8 +8390,8 @@ mod tests {
 
         for _ in 0..2 {
             let latest = client.latest(&package).await.unwrap();
-            assert_eq!(latest.latest_stable, "2.0.0");
-            assert!(latest.yanked);
+            assert_eq!(latest.latest.latest_stable, "2.0.0");
+            assert!(latest.latest.yanked);
         }
 
         let stored: Value =
@@ -7857,8 +8451,8 @@ mod tests {
 
         let latest = client.latest(&crates_package("fixture")).await.unwrap();
 
-        assert_eq!(latest.latest_stable, "2.0.0");
-        assert!(latest.yanked);
+        assert_eq!(latest.latest.latest_stable, "2.0.0");
+        assert!(latest.latest.yanked);
         let refreshed = read_cache_entry(&cache, "registry", "crates:fixture");
         assert!(refreshed.stored_at > before);
         assert_eq!(refreshed.etag.as_deref(), Some("\"sparse-1\""));
@@ -7942,8 +8536,8 @@ mod tests {
         let fast = fast_client.latest(&package).await.unwrap();
         let slow = slow.await.unwrap().unwrap();
 
-        assert_eq!(fast.latest_stable, "2.0.0");
-        assert_eq!(slow.latest_stable, "2.0.0");
+        assert_eq!(fast.latest.latest_stable, "2.0.0");
+        assert_eq!(slow.latest.latest_stable, "2.0.0");
         let cached = read_cache_entry(&cache, "registry", "crates:fixture");
         assert_eq!(cached.etag.as_deref(), Some("\"sparse-2\""));
         assert_eq!(

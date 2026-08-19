@@ -381,6 +381,26 @@ impl LatestVersions {
     }
 }
 
+/// Registry data used while planning provider work.
+///
+/// `canonical_name` is provider-facing metadata and is deliberately kept separate from
+/// [`LatestVersions`] and [`Package`]. This lets orchestration use a registry-authoritative name
+/// without changing the source spelling retained in reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryEnrichment {
+    pub latest: LatestVersions,
+    pub canonical_name: Option<String>,
+}
+
+impl RegistryEnrichment {
+    pub fn versions_only(latest: LatestVersions) -> Self {
+        Self {
+            latest,
+            canonical_name: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrichError {
     pub provider: String,
@@ -566,7 +586,7 @@ pub trait VulnProvider: Send + Sync {
 }
 #[async_trait]
 pub trait VersionProvider: Send + Sync {
-    async fn latest(&self, package: &Package) -> Result<LatestVersions, ProviderError>;
+    async fn latest(&self, package: &Package) -> Result<RegistryEnrichment, ProviderError>;
 }
 
 pub fn compare_versions(ecosystem: Ecosystem, a: &str, b: &str) -> Ordering {

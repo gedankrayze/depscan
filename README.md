@@ -40,10 +40,10 @@ Package identity and provider request spelling are related but not always identi
 |---|---|---|---|
 | npm | Source spelling | Source spelling | Source spelling |
 | PyPI | PEP 503 normalized | PEP 503 normalized | PEP 503 normalized |
-| NuGet | Lowercase, case-insensitive | Source-preserved casing | Lowercase flat-container ID |
+| NuGet | Lowercase, case-insensitive | Online: registration-derived canonical ID; offline: normalized match | Lowercase flat-container and registration ID |
 | crates.io | Source spelling | Source spelling | Validated crate name |
 
-NuGet's split is intentional: its package identity and flat-container endpoint are case-insensitive, while OSV currently requires the advisory's canonical/source casing for some records. Human output retains the spelling read from the project file.
+NuGet's split is intentional: package references and registry lookup coordinates are case-insensitive, while OSV currently requires the registry's canonical package ID for some advisory records. The spelling read from the project file is retained unchanged in human and machine reports, but it is not assumed to be canonical. Online registry enrichment selects the registration leaf for the exact version being queried (or the range's `latest_matching` release), validates its `catalogEntry.id`, and uses that ID only in the ephemeral OSV request. Missing or malformed canonical metadata leaves the online vulnerability status visibly unresolved rather than sending source spelling as a fallback. Offline dump matching remains ecosystem-normalized and does not require registration metadata.
 
 ## Installation
 
