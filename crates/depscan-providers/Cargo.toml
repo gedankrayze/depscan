@@ -16,6 +16,8 @@ include = ["src/**", "LICENSE"]
 [dependencies]
 depscan-core.workspace = true
 async-trait.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 chrono.workspace = true
 cvss.workspace = true
 directories.workspace = true
@@ -28,6 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
 sha2.workspace = true
+same-file.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 urlencoding.workspace = true

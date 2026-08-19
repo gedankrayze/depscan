@@ -1,6 +1,11 @@
 //! Network providers, disk cache, and OSV offline-dump support.
 
 use async_trait::async_trait;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir as CapDir, OpenOptions as CapOpenOptions},
+};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use cvss::Cvss;
 use depscan_core::{
@@ -17,18 +22,19 @@ use reqwest::{
     Client, StatusCode,
     header::{ACCEPT, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, RETRY_AFTER},
 };
+use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration as StdDuration, SystemTime},
 };
-use tempfile::{Builder as TempFileBuilder, TempPath};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, warn};
@@ -2051,6 +2057,28 @@ enum OsvDumpAge {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsvOfflineReadBoundary {
+    BeforeMarker,
+    BeforeArchive,
+    AfterArchive,
+}
+
+struct OfflineDumpRead {
+    archive: File,
+    marker: File,
+    archive_name: OsString,
+    marker_name: OsString,
+    archive_path: PathBuf,
+    marker_path: PathBuf,
+    archive_identity: Handle,
+    marker_identity: Handle,
+}
+
+fn offline_capability_error(error: ProviderError) -> ProviderError {
+    ProviderError::Offline(error.to_string())
+}
+
 impl OsvOffline {
     pub fn new(cache: Cache) -> Self {
         Self {
@@ -2058,77 +2086,22 @@ impl OsvOffline {
             limits: OsvDumpLimits::production(),
         }
     }
-    fn archive_path(&self, ecosystem: Ecosystem) -> PathBuf {
-        self.cache
-            .root()
-            .join("offline")
-            .join(format!("{}.zip", ecosystem.osv_name().replace('.', "_")))
-    }
-    fn validate_offline_read_directory(&self, archive_path: &Path) -> Result<(), ProviderError> {
-        let directory = archive_path
-            .parent()
-            .expect("offline archive path has a parent");
-        let metadata = fs::symlink_metadata(directory).map_err(|error| {
-            ProviderError::Offline(format!(
-                "cannot inspect offline dump directory {}: {error}",
-                directory.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ProviderError::Offline(format!(
-                "offline dump directory {} is not a real directory",
-                directory.display()
-            )));
-        }
-        let canonical = fs::canonicalize(directory).map_err(|error| {
-            ProviderError::Offline(format!(
-                "cannot resolve offline dump directory {}: {error}",
-                directory.display()
-            ))
-        })?;
-        let cache_root = fs::canonicalize(self.cache.root()).map_err(|error| {
-            ProviderError::Offline(format!(
-                "cannot resolve depscan cache {}: {error}",
-                self.cache.root().display()
-            ))
-        })?;
-        if canonical.parent() != Some(cache_root.as_path()) {
-            return Err(ProviderError::Offline(format!(
-                "offline dump directory {} resolves outside the depscan cache",
-                directory.display()
-            )));
-        }
-        Ok(())
-    }
-    fn validate_dump_age_at(
+    fn validate_dump_age_from_file(
         &self,
         archive_path: &Path,
+        marker_path: &Path,
+        marker: &mut File,
         ecosystem: Ecosystem,
         now: DateTime<Utc>,
     ) -> Result<OsvDumpAge, ProviderError> {
-        let marker_path = archive_path.with_extension("synced-at");
-        let metadata = fs::symlink_metadata(&marker_path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ProviderError::Offline(format!(
-                    "missing OSV dump timestamp {}; run `depscan sync --ecosystem {}`",
-                    marker_path.display(),
-                    ecosystem.display_name()
-                ))
-            } else {
-                ProviderError::Offline(format!(
-                    "cannot inspect OSV dump timestamp {}: {error}",
-                    marker_path.display()
-                ))
-            }
+        marker.rewind().map_err(|error| {
+            ProviderError::Offline(format!(
+                "cannot seek OSV dump timestamp {}: {error}",
+                marker_path.display()
+            ))
         })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(ProviderError::Offline(format!(
-                "OSV dump timestamp {} is not a real regular file; run `depscan sync --ecosystem {}`",
-                marker_path.display(),
-                ecosystem.display_name()
-            )));
-        }
-        let raw = fs::read_to_string(&marker_path).map_err(|error| {
+        let mut raw = String::new();
+        marker.read_to_string(&mut raw).map_err(|error| {
             ProviderError::Offline(format!(
                 "cannot read OSV dump timestamp {}: {error}",
                 marker_path.display()
@@ -2169,15 +2142,49 @@ impl OsvOffline {
             Ok(OsvDumpAge::Current)
         }
     }
+
+    #[cfg(test)]
+    fn validate_dump_age_at(
+        &self,
+        archive_path: &Path,
+        ecosystem: Ecosystem,
+        now: DateTime<Utc>,
+    ) -> Result<OsvDumpAge, ProviderError> {
+        let directory =
+            OfflineDirectory::open(self.cache.root()).map_err(offline_capability_error)?;
+        let mut dump = directory.open_dump(ecosystem)?;
+        debug_assert_eq!(dump.archive_path, archive_path);
+        self.validate_dump_age_from_file(
+            &dump.archive_path,
+            &dump.marker_path,
+            &mut dump.marker,
+            ecosystem,
+            now,
+        )
+    }
+
     fn query_blocking_at(
         &self,
         packages: &[Package],
         now: DateTime<Utc>,
     ) -> Result<VulnMap, ProviderError> {
+        self.query_blocking_at_with_hook(packages, now, |_| {})
+    }
+
+    fn query_blocking_at_with_hook<F>(
+        &self,
+        packages: &[Package],
+        now: DateTime<Utc>,
+        hook: F,
+    ) -> Result<VulnMap, ProviderError>
+    where
+        F: Fn(OsvOfflineReadBoundary),
+    {
         let mut output = VulnMap::new();
         for package in packages {
             output.entry(package.key()).or_default();
         }
+        let mut offline_directory = None;
         for ecosystem in [
             Ecosystem::Npm,
             Ecosystem::PyPI,
@@ -2191,42 +2198,60 @@ impl OsvOffline {
             if scoped.is_empty() {
                 continue;
             }
-            let archive_path = self.archive_path(ecosystem);
-            self.validate_offline_read_directory(&archive_path)?;
-            let file = File::open(&archive_path).map_err(|_| {
-                ProviderError::Offline(format!(
-                    "missing OSV dump {}; run `depscan sync --ecosystem {}`",
-                    archive_path.display(),
-                    ecosystem.display_name()
-                ))
-            })?;
-            if let OsvDumpAge::Warn { synced_at, age } =
-                self.validate_dump_age_at(&archive_path, ecosystem, now)?
-            {
+            if offline_directory.is_none() {
+                offline_directory = Some(
+                    OfflineDirectory::open(self.cache.root()).map_err(offline_capability_error)?,
+                );
+            }
+            let directory = offline_directory
+                .as_ref()
+                .expect("offline directory is opened for a scoped ecosystem");
+            let mut dump = directory.open_dump(ecosystem)?;
+            hook(OsvOfflineReadBoundary::BeforeMarker);
+            if let OsvDumpAge::Warn { synced_at, age } = self.validate_dump_age_from_file(
+                &dump.archive_path,
+                &dump.marker_path,
+                &mut dump.marker,
+                ecosystem,
+                now,
+            )? {
                 warn!(
                     ecosystem = ecosystem.osv_name(),
-                    path = %archive_path.display(),
+                    path = %dump.archive_path.display(),
                     %synced_at,
                     age_seconds = age.num_seconds(),
                     warning_age_seconds = OSV_DUMP_DEFAULT_WARNING_AGE_SECS,
                     "OSV dump is older than the default seven-day warning age; run `depscan sync`"
                 );
             }
-            let context = OsvDumpValidationContext::Offline(&archive_path);
-            visit_osv_dump_file(file, context, self.limits, true, |entry_name, document| {
-                for package in &scoped {
-                    if let Some(vulnerability) = vulnerability_from_osv(document, Some(package))
-                        .map_err(|error| {
-                            context.invalid(format_args!(
-                                "entry {entry_name:?} cannot be evaluated: {error}"
-                            ))
-                        })?
-                    {
-                        output.entry(package.key()).or_default().push(vulnerability);
+            hook(OsvOfflineReadBoundary::BeforeArchive);
+            let archive = dump
+                .archive
+                .try_clone()
+                .map_err(|error| ProviderError::Offline(error.to_string()))?;
+            let context = OsvDumpValidationContext::Offline(&dump.archive_path);
+            visit_osv_dump_file(
+                archive,
+                context,
+                self.limits,
+                true,
+                |entry_name, document| {
+                    for package in &scoped {
+                        if let Some(vulnerability) = vulnerability_from_osv(document, Some(package))
+                            .map_err(|error| {
+                                context.invalid(format_args!(
+                                    "entry {entry_name:?} cannot be evaluated: {error}"
+                                ))
+                            })?
+                        {
+                            output.entry(package.key()).or_default().push(vulnerability);
+                        }
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
+            hook(OsvOfflineReadBoundary::AfterArchive);
+            directory.revalidate_dump(&dump)?;
         }
         Ok(output)
     }
@@ -2264,7 +2289,18 @@ impl Default for OsvSyncOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsvSyncBoundary {
+    AfterTemporaryCreation,
+    BeforeValidation,
+    BeforeRollbackStaging,
+    BeforeArchivePublication,
+    BeforeMarkerPublication,
+    BeforeHandledErrorCleanup,
+}
+
+#[derive(Clone)]
 struct OsvSyncConfig {
     base_url: String,
     transfer_timeout: StdDuration,
@@ -2276,7 +2312,9 @@ struct OsvSyncConfig {
     backoff_base: StdDuration,
     max_retry_delay: StdDuration,
     #[cfg(test)]
-    backup_directory: Option<PathBuf>,
+    boundary_hook: Option<Arc<dyn Fn(OsvSyncBoundary) + Send + Sync>>,
+    #[cfg(test)]
+    force_rollback_staging_error: bool,
     #[cfg(test)]
     observed_max_chunk_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -2299,7 +2337,9 @@ impl OsvSyncConfig {
             backoff_base: OSV_DUMP_BACKOFF_BASE,
             max_retry_delay: OSV_DUMP_MAX_RETRY_DELAY,
             #[cfg(test)]
-            backup_directory: None,
+            boundary_hook: None,
+            #[cfg(test)]
+            force_rollback_staging_error: false,
             #[cfg(test)]
             observed_max_chunk_bytes: None,
         })
@@ -2319,6 +2359,13 @@ impl OsvSyncConfig {
             max_entry_bytes: self.max_entry_bytes,
             max_uncompressed_bytes: self.max_uncompressed_bytes,
             max_entries: self.max_entries,
+        }
+    }
+
+    #[cfg(test)]
+    fn reach_boundary(&self, boundary: OsvSyncBoundary) {
+        if let Some(hook) = &self.boundary_hook {
+            hook(boundary);
         }
     }
 }
@@ -2649,80 +2696,505 @@ fn validate_osv_dump_file(
     )
 }
 
-fn validate_owned_offline_directory(root: &Path) -> Result<PathBuf, ProviderError> {
-    validate_owned_cache_root(root)?;
-    let directory = root.join("offline");
-    match fs::symlink_metadata(&directory) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(cache_path_error(
-                    &directory,
-                    "offline namespace is not a real directory",
-                ));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::create_dir(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(cache_path_error(
-                        &directory,
-                        format_args!("cannot create offline namespace: {error}"),
-                    ));
-                }
-            }
-        }
+fn capability_directory_identity(directory: &CapDir, path: &Path) -> Result<Handle, ProviderError> {
+    let file = directory
+        .try_clone()
+        .map_err(|error| cache_path_error(path, format_args!("cannot clone directory: {error}")))?
+        .into_std_file();
+    Handle::from_file(file)
+        .map_err(|error| cache_path_error(path, format_args!("cannot identify directory: {error}")))
+}
+
+fn std_file_identity(file: &File, path: &Path) -> Result<Handle, ProviderError> {
+    let clone = file
+        .try_clone()
+        .map_err(|error| cache_path_error(path, format_args!("cannot clone file: {error}")))?;
+    Handle::from_file(clone)
+        .map_err(|error| cache_path_error(path, format_args!("cannot identify file: {error}")))
+}
+
+fn open_capability_regular_file(
+    directory: &CapDir,
+    name: &OsStr,
+    display_path: &Path,
+    write: bool,
+) -> Result<Option<File>, ProviderError> {
+    let metadata = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(cache_path_error(
-                &directory,
-                format_args!("cannot inspect offline namespace: {error}"),
+                display_path,
+                format_args!("cannot inspect file: {error}"),
             ));
         }
+    };
+    if metadata.is_symlink() || !metadata.is_file() {
+        return Err(cache_path_error(
+            display_path,
+            "path is not a real regular file",
+        ));
     }
-    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+    let mut options = CapOpenOptions::new();
+    options.read(true).write(write).follow(FollowSymlinks::No);
+    let file = directory.open_with(name, &options).map_err(|error| {
         cache_path_error(
-            &directory,
-            format_args!("cannot inspect offline namespace: {error}"),
+            display_path,
+            format_args!("cannot open regular file without following links: {error}"),
+        )
+    })?;
+    if !file
+        .metadata()
+        .map_err(|error| {
+            cache_path_error(
+                display_path,
+                format_args!("cannot inspect opened file: {error}"),
+            )
+        })?
+        .is_file()
+    {
+        return Err(cache_path_error(
+            display_path,
+            "opened path is not a regular file",
+        ));
+    }
+    Ok(Some(file.into_std()))
+}
+
+fn validate_capability_sentinel(root: &CapDir, root_path: &Path) -> Result<(), ProviderError> {
+    let sentinel_path = root_path.join(CACHE_SENTINEL_FILE);
+    let mut file =
+        open_capability_regular_file(root, OsStr::new(CACHE_SENTINEL_FILE), &sentinel_path, false)?
+            .ok_or_else(|| {
+                cache_path_error(
+                    root_path,
+                    format_args!("missing ownership sentinel {CACHE_SENTINEL_FILE}"),
+                )
+            })?;
+    let metadata = file.metadata().map_err(|error| {
+        cache_path_error(
+            root_path,
+            format_args!("cannot inspect ownership sentinel: {error}"),
+        )
+    })?;
+    if metadata.len() > 1024 {
+        return Err(cache_path_error(
+            root_path,
+            format_args!("ownership sentinel {CACHE_SENTINEL_FILE} is oversized"),
+        ));
+    }
+    let identity = std_file_identity(&file, &sentinel_path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).map_err(|error| {
+        cache_path_error(
+            root_path,
+            format_args!("cannot read ownership sentinel: {error}"),
+        )
+    })?;
+    let sentinel: CacheSentinel = serde_json::from_slice(&bytes).map_err(|error| {
+        cache_path_error(
+            root_path,
+            format_args!("invalid ownership sentinel: {error}"),
+        )
+    })?;
+    if sentinel != expected_cache_sentinel() {
+        return Err(cache_path_error(
+            root_path,
+            "ownership sentinel does not identify a supported depscan cache",
+        ));
+    }
+    let current =
+        open_capability_regular_file(root, OsStr::new(CACHE_SENTINEL_FILE), &sentinel_path, false)?
+            .ok_or_else(|| {
+                cache_path_error(root_path, "ownership sentinel changed while validating")
+            })?;
+    if std_file_identity(&current, &sentinel_path)? != identity {
+        return Err(cache_path_error(
+            root_path,
+            "ownership sentinel changed while validating",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_root_capability_attachment(
+    root: &CapDir,
+    root_path: &Path,
+    expected_identity: &Handle,
+) -> Result<(), ProviderError> {
+    let metadata = fs::symlink_metadata(root_path).map_err(|error| {
+        cache_path_error(
+            root_path,
+            format_args!("cannot inspect cache root during revalidation: {error}"),
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(cache_path_error(
-            &directory,
-            "offline namespace is not a real directory",
+            root_path,
+            "cache root changed while synchronizing",
         ));
     }
-    let canonical = fs::canonicalize(&directory).map_err(|error| {
-        cache_path_error(
-            &directory,
-            format_args!("cannot resolve offline namespace: {error}"),
-        )
-    })?;
-    if canonical != directory || canonical.parent() != Some(root) {
+    let current_root =
+        CapDir::open_ambient_dir(root_path, ambient_authority()).map_err(|error| {
+            cache_path_error(
+                root_path,
+                format_args!("cannot reopen cache root during revalidation: {error}"),
+            )
+        })?;
+    if capability_directory_identity(&current_root, root_path)? != *expected_identity {
         return Err(cache_path_error(
-            &directory,
-            format_args!("offline namespace resolves to {}", canonical.display()),
+            root_path,
+            "cache root changed while synchronizing",
         ));
     }
-    validate_owned_cache_root(root)?;
-    Ok(directory)
+    validate_capability_sentinel(root, root_path)
+}
+
+struct OfflineDirectory {
+    root: CapDir,
+    root_path: PathBuf,
+    root_identity: Handle,
+    directory: CapDir,
+    path: PathBuf,
+    identity: Handle,
+}
+
+impl OfflineDirectory {
+    fn open(root_path: &Path) -> Result<Self, ProviderError> {
+        Self::open_with(root_path, || {})
+    }
+
+    fn open_with(root_path: &Path, after_root_open: impl FnOnce()) -> Result<Self, ProviderError> {
+        validate_owned_cache_root(root_path)?;
+        let root = CapDir::open_ambient_dir(root_path, ambient_authority()).map_err(|error| {
+            cache_path_error(
+                root_path,
+                format_args!("cannot open cache capability: {error}"),
+            )
+        })?;
+        let root_identity = capability_directory_identity(&root, root_path)?;
+        after_root_open();
+        validate_root_capability_attachment(&root, root_path, &root_identity)?;
+        let path = root_path.join("offline");
+        let directory = match root.open_dir_nofollow("offline") {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match root.create_dir("offline") {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(cache_path_error(
+                            &path,
+                            format_args!("cannot create offline namespace: {error}"),
+                        ));
+                    }
+                }
+                root.open_dir_nofollow("offline").map_err(|error| {
+                    cache_path_error(
+                        &path,
+                        format_args!(
+                            "cannot open offline namespace without following links: {error}"
+                        ),
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(cache_path_error(
+                    &path,
+                    format_args!("cannot open offline namespace without following links: {error}"),
+                ));
+            }
+        };
+        let identity = capability_directory_identity(&directory, &path)?;
+        let instance = Self {
+            root,
+            root_path: root_path.to_path_buf(),
+            root_identity,
+            directory,
+            path,
+            identity,
+        };
+        instance.revalidate()?;
+        Ok(instance)
+    }
+
+    fn revalidate(&self) -> Result<(), ProviderError> {
+        validate_root_capability_attachment(&self.root, &self.root_path, &self.root_identity)?;
+        let current = self.root.open_dir_nofollow("offline").map_err(|error| {
+            cache_path_error(
+                &self.path,
+                format_args!("offline namespace changed while synchronizing: {error}"),
+            )
+        })?;
+        if capability_directory_identity(&current, &self.path)? != self.identity {
+            return Err(cache_path_error(
+                &self.path,
+                "offline namespace changed while synchronizing",
+            ));
+        }
+        Ok(())
+    }
+
+    fn display_path(&self, name: &OsStr) -> PathBuf {
+        self.path.join(name)
+    }
+
+    fn open_dump(&self, ecosystem: Ecosystem) -> Result<OfflineDumpRead, ProviderError> {
+        self.revalidate().map_err(offline_capability_error)?;
+        let ecosystem_slug = ecosystem.osv_name().replace('.', "_");
+        let archive_name = OsString::from(format!("{ecosystem_slug}.zip"));
+        let marker_name = OsString::from(format!("{ecosystem_slug}.synced-at"));
+        let archive_path = self.display_path(&archive_name);
+        let marker_path = self.display_path(&marker_name);
+        let archive =
+            open_capability_regular_file(&self.directory, &archive_name, &archive_path, false)
+                .map_err(offline_capability_error)?
+                .ok_or_else(|| {
+                    ProviderError::Offline(format!(
+                        "missing OSV dump {}; run `depscan sync --ecosystem {}`",
+                        archive_path.display(),
+                        ecosystem.display_name()
+                    ))
+                })?;
+        let marker =
+            open_capability_regular_file(&self.directory, &marker_name, &marker_path, false)
+                .map_err(offline_capability_error)?
+                .ok_or_else(|| {
+                    ProviderError::Offline(format!(
+                        "missing OSV dump timestamp {}; run `depscan sync --ecosystem {}`",
+                        marker_path.display(),
+                        ecosystem.display_name()
+                    ))
+                })?;
+        let archive_identity =
+            std_file_identity(&archive, &archive_path).map_err(offline_capability_error)?;
+        let marker_identity =
+            std_file_identity(&marker, &marker_path).map_err(offline_capability_error)?;
+        let dump = OfflineDumpRead {
+            archive,
+            marker,
+            archive_name,
+            marker_name,
+            archive_path,
+            marker_path,
+            archive_identity,
+            marker_identity,
+        };
+        self.revalidate_dump(&dump)?;
+        Ok(dump)
+    }
+
+    fn revalidate_dump(&self, dump: &OfflineDumpRead) -> Result<(), ProviderError> {
+        self.revalidate().map_err(offline_capability_error)?;
+        self.revalidate_dump_file(
+            &dump.archive_name,
+            &dump.archive_path,
+            &dump.archive_identity,
+        )?;
+        self.revalidate_dump_file(&dump.marker_name, &dump.marker_path, &dump.marker_identity)
+    }
+
+    fn revalidate_dump_file(
+        &self,
+        name: &OsStr,
+        path: &Path,
+        expected_identity: &Handle,
+    ) -> Result<(), ProviderError> {
+        let current = open_capability_regular_file(&self.directory, name, path, false)
+            .map_err(offline_capability_error)?
+            .ok_or_else(|| {
+                ProviderError::Offline(format!(
+                    "OSV dump file {} changed while it was being read; refusing offline scan",
+                    path.display()
+                ))
+            })?;
+        let current_identity =
+            std_file_identity(&current, path).map_err(offline_capability_error)?;
+        if current_identity != *expected_identity {
+            return Err(ProviderError::Offline(format!(
+                "OSV dump file {} changed while it was being read; refusing offline scan",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct CapabilityTempFile {
+    directory: CapDir,
+    directory_path: PathBuf,
+    file: Option<File>,
+    name: Option<OsString>,
+    cleanup: bool,
+}
+
+impl CapabilityTempFile {
+    fn new(
+        directory: &OfflineDirectory,
+        prefix: &str,
+        suffix: &str,
+    ) -> Result<Self, ProviderError> {
+        for _ in 0..128 {
+            let name = OsString::from(format!(
+                "{prefix}{:016x}{suffix}",
+                rand::rng().random::<u64>()
+            ));
+            let mut options = CapOpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            match directory.directory.open_with(&name, &options) {
+                Ok(file) => {
+                    return Ok(Self {
+                        directory: directory.directory.try_clone().map_err(|error| {
+                            cache_path_error(
+                                &directory.path,
+                                format_args!("cannot clone offline capability: {error}"),
+                            )
+                        })?,
+                        directory_path: directory.path.clone(),
+                        file: Some(file.into_std()),
+                        name: Some(name),
+                        cleanup: true,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(cache_path_error(
+                        &directory.path,
+                        format_args!("cannot create temporary file: {error}"),
+                    ));
+                }
+            }
+        }
+        Err(cache_path_error(
+            &directory.path,
+            "cannot allocate a unique temporary file name",
+        ))
+    }
+
+    fn from_link(directory: &OfflineDirectory, name: OsString) -> Result<Self, ProviderError> {
+        let display = directory.display_path(&name);
+        let file = open_capability_regular_file(&directory.directory, &name, &display, false)?
+            .ok_or_else(|| cache_path_error(&display, "staged rollback link disappeared"))?;
+        Ok(Self {
+            directory: directory.directory.try_clone().map_err(|error| {
+                cache_path_error(
+                    &directory.path,
+                    format_args!("cannot clone offline capability: {error}"),
+                )
+            })?,
+            directory_path: directory.path.clone(),
+            file: Some(file),
+            name: Some(name),
+            cleanup: true,
+        })
+    }
+
+    fn as_file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("temporary file handle is present before publication")
+    }
+
+    fn as_file_mut(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("temporary file handle is present before publication")
+    }
+
+    fn logical_path(&self) -> PathBuf {
+        self.directory_path.join(
+            self.name
+                .as_deref()
+                .expect("temporary file name is present before publication"),
+        )
+    }
+
+    fn persist(mut self, target: &OsStr) -> Result<(), CapabilityPersistError> {
+        drop(self.file.take());
+        let name = self
+            .name
+            .take()
+            .expect("temporary file name is present before publication");
+        match self.directory.rename(&name, &self.directory, target) {
+            Ok(()) => {
+                self.cleanup = false;
+                Ok(())
+            }
+            Err(source) => {
+                self.name = Some(name);
+                Err(CapabilityPersistError {
+                    source,
+                    temporary: self,
+                })
+            }
+        }
+    }
+
+    fn retain(mut self) -> PathBuf {
+        self.cleanup = false;
+        self.logical_path()
+    }
+}
+
+impl Write for CapabilityTempFile {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.as_file_mut().write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.as_file_mut().flush()
+    }
+}
+
+impl Drop for CapabilityTempFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if self.cleanup
+            && let Some(name) = self.name.take()
+        {
+            let _ = self.directory.remove_file(name);
+        }
+    }
+}
+
+struct CapabilityPersistError {
+    source: std::io::Error,
+    temporary: CapabilityTempFile,
+}
+
+fn persist_capability_temp(
+    temporary: CapabilityTempFile,
+    target: &OsStr,
+) -> Result<(), ProviderError> {
+    match temporary.persist(target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let source = error.source.to_string();
+            drop(error.temporary);
+            Err(ProviderError::Cache(source))
+        }
+    }
 }
 
 fn cleanup_abandoned_osv_temps(
-    directory: &Path,
+    directory: &OfflineDirectory,
     ecosystem_slug: &str,
 ) -> Result<(), ProviderError> {
     let prefix = format!(".{ecosystem_slug}-");
-    let entries = fs::read_dir(directory).map_err(|error| {
+    let entries = directory.directory.entries().map_err(|error| {
         cache_path_error(
-            directory,
+            &directory.path,
             format_args!("cannot inspect offline namespace: {error}"),
         )
     })?;
     for entry in entries {
         let entry = entry.map_err(|error| {
             cache_path_error(
-                directory,
+                &directory.path,
                 format_args!("cannot inspect offline namespace: {error}"),
             )
         })?;
@@ -2737,21 +3209,24 @@ fn cleanup_abandoned_osv_temps(
         {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
-            cache_path_error(
-                directory,
-                format_args!("cannot inspect abandoned temporary file {name:?}: {error}"),
-            )
-        })?;
-        if metadata.is_dir() || (!metadata.is_file() && !metadata.file_type().is_symlink()) {
+        let metadata = directory
+            .directory
+            .symlink_metadata(name)
+            .map_err(|error| {
+                cache_path_error(
+                    &directory.path,
+                    format_args!("cannot inspect abandoned temporary file {name:?}: {error}"),
+                )
+            })?;
+        if metadata.is_dir() || (!metadata.is_file() && !metadata.is_symlink()) {
             return Err(cache_path_error(
-                directory,
+                &directory.path,
                 format_args!("refusing non-file abandoned temporary path {name:?}"),
             ));
         }
-        fs::remove_file(entry.path()).map_err(|error| {
+        directory.directory.remove_file(name).map_err(|error| {
             cache_path_error(
-                directory,
+                &directory.path,
                 format_args!("cannot remove abandoned temporary file {name:?}: {error}"),
             )
         })?;
@@ -2762,34 +3237,43 @@ fn cleanup_abandoned_osv_temps(
 fn acquire_osv_sync_lock(
     root: &Path,
     ecosystem_slug: &str,
-) -> Result<(PathBuf, File), ProviderError> {
-    let directory = validate_owned_offline_directory(root)?;
-    let lock_path = directory.join(format!(".{ecosystem_slug}.sync.lock"));
-    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
+) -> Result<(OfflineDirectory, File), ProviderError> {
+    acquire_osv_sync_lock_with(root, ecosystem_slug, || {}, || {})
+}
+
+fn acquire_osv_sync_lock_with(
+    root: &Path,
+    ecosystem_slug: &str,
+    before_lock_open: impl FnOnce(),
+    before_cleanup: impl FnOnce(),
+) -> Result<(OfflineDirectory, File), ProviderError> {
+    let directory = OfflineDirectory::open(root)?;
+    let lock_name = OsString::from(format!(".{ecosystem_slug}.sync.lock"));
+    let lock_path = directory.display_path(&lock_name);
+    if let Ok(metadata) = directory.directory.symlink_metadata(&lock_name)
+        && (metadata.is_symlink() || !metadata.is_file())
     {
         return Err(cache_path_error(
             &lock_path,
             "sync lock is not a regular file",
         ));
     }
-    let lock = OpenOptions::new()
+    before_lock_open();
+    let mut options = CapOpenOptions::new();
+    options
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)
+        .follow(FollowSymlinks::No);
+    let lock = directory
+        .directory
+        .open_with(&lock_name, &options)
         .map_err(|error| {
             cache_path_error(&lock_path, format_args!("cannot open sync lock: {error}"))
-        })?;
-    let lock_metadata = fs::symlink_metadata(&lock_path).map_err(|error| {
-        cache_path_error(
-            &lock_path,
-            format_args!("cannot inspect sync lock: {error}"),
-        )
-    })?;
-    if lock_metadata.file_type().is_symlink() || !lock.metadata().is_ok_and(|value| value.is_file())
-    {
+        })?
+        .into_std();
+    if !lock.metadata().is_ok_and(|value| value.is_file()) {
         return Err(cache_path_error(
             &lock_path,
             "sync lock is not a regular file",
@@ -2801,25 +3285,19 @@ fn acquire_osv_sync_lock(
             format_args!("cannot acquire sync lock: {error}"),
         )
     })?;
-    let revalidated = validate_owned_offline_directory(root)?;
-    if revalidated != directory {
-        return Err(cache_path_error(
-            &directory,
-            "offline namespace changed while acquiring the sync lock",
-        ));
-    }
+    directory.revalidate()?;
+    before_cleanup();
     cleanup_abandoned_osv_temps(&directory, ecosystem_slug)?;
+    directory.revalidate()?;
     Ok((directory, lock))
 }
 
-fn validate_marker_target(path: &Path) -> Result<(), ProviderError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(ProviderError::Cache(format!(
-                "cannot replace non-file sync marker {}",
-                path.display()
-            )))
-        }
+fn validate_marker_target(directory: &OfflineDirectory, name: &OsStr) -> Result<(), ProviderError> {
+    let path = directory.display_path(name);
+    match directory.directory.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_symlink() || !metadata.is_file() => Err(ProviderError::Cache(
+            format!("cannot replace non-file sync marker {}", path.display()),
+        )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ProviderError::Cache(error.to_string())),
@@ -2827,86 +3305,104 @@ fn validate_marker_target(path: &Path) -> Result<(), ProviderError> {
 }
 
 fn stage_previous_archive(
-    path: &Path,
-    directory: &Path,
+    directory: &OfflineDirectory,
+    archive_name: &OsStr,
     temp_prefix: &str,
-) -> Result<Option<TempPath>, ProviderError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ProviderError::Cache(error.to_string())),
+) -> Result<Option<CapabilityTempFile>, ProviderError> {
+    let path = directory.display_path(archive_name);
+    let Some(mut source) =
+        open_capability_regular_file(&directory.directory, archive_name, &path, false)?
+    else {
+        return Ok(None);
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let source_identity = std_file_identity(&source, &path)?;
+    let mut link_error = None;
+    for _ in 0..128 {
+        let candidate = OsString::from(format!(
+            "{temp_prefix}{:016x}.zip.rollback.tmp",
+            rand::rng().random::<u64>()
+        ));
+        match directory
+            .directory
+            .hard_link(archive_name, &directory.directory, &candidate)
+        {
+            Ok(()) => {
+                let backup = match CapabilityTempFile::from_link(directory, candidate.clone()) {
+                    Ok(backup) => backup,
+                    Err(error) => {
+                        let _ = directory.directory.remove_file(candidate);
+                        return Err(error);
+                    }
+                };
+                if std_file_identity(backup.as_file(), &backup.logical_path())? == source_identity {
+                    return Ok(Some(backup));
+                }
+                drop(backup);
+                link_error = Some("archive changed while creating the hard link".to_owned());
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                link_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    let link_error =
+        link_error.unwrap_or_else(|| "could not allocate a unique hard-link name".to_owned());
+    let expected_bytes = source
+        .metadata()
+        .map_err(|error| ProviderError::Cache(error.to_string()))?
+        .len();
+    let source_permissions = source
+        .metadata()
+        .map_err(|error| ProviderError::Cache(error.to_string()))?
+        .permissions();
+    let mut backup = CapabilityTempFile::new(directory, temp_prefix, ".zip.rollback.tmp").map_err(
+        |copy_error| {
+            ProviderError::Cache(format!(
+                "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
+                path.display()
+            ))
+        },
+    )?;
+    let copied_bytes = std::io::copy(&mut source, backup.as_file_mut())
+        .and_then(|bytes| {
+            backup.as_file().set_permissions(source_permissions)?;
+            backup.as_file().sync_all().map(|()| bytes)
+        })
+        .map_err(|copy_error| {
+            ProviderError::Cache(format!(
+                "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
+                path.display()
+            ))
+        })?;
+    if copied_bytes != expected_bytes {
         return Err(ProviderError::Cache(format!(
-            "cannot replace non-file OSV archive {}",
+            "cannot stage {} for rollback: copied {copied_bytes} of {expected_bytes} bytes",
             path.display()
         )));
     }
-
-    let mut builder = TempFileBuilder::new();
-    builder.prefix(temp_prefix).suffix(".zip.rollback.tmp");
-    match builder.make_in(directory, |candidate| {
-        fs::hard_link(path, candidate)?;
-        match File::open(candidate) {
-            Ok(file) => Ok(file),
-            Err(error) => {
-                let _ = fs::remove_file(candidate);
-                Err(error)
-            }
-        }
-    }) {
-        Ok(backup) => Ok(Some(backup.into_temp_path())),
-        Err(link_error) => {
-            let mut source = File::open(path).map_err(|copy_error| {
-                ProviderError::Cache(format!(
-                    "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
-                    path.display()
-                ))
-            })?;
-            let expected_bytes = source
-                .metadata()
-                .map_err(|error| ProviderError::Cache(error.to_string()))?
-                .len();
-            let mut backup = builder.tempfile_in(directory).map_err(|copy_error| {
-                ProviderError::Cache(format!(
-                    "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
-                    path.display()
-                ))
-            })?;
-            let copied_bytes = std::io::copy(&mut source, backup.as_file_mut())
-                .and_then(|bytes| backup.as_file().sync_all().map(|()| bytes))
-                .map_err(|copy_error| {
-                    ProviderError::Cache(format!(
-                        "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
-                        path.display()
-                    ))
-                })?;
-            if copied_bytes != expected_bytes {
-                return Err(ProviderError::Cache(format!(
-                    "cannot stage {} for rollback: copied {copied_bytes} of {expected_bytes} bytes",
-                    path.display()
-                )));
-            }
-            Ok(Some(backup.into_temp_path()))
-        }
-    }
+    Ok(Some(backup))
 }
 
-fn restore_previous_archive(previous: Option<TempPath>, path: &Path) -> Result<(), ProviderError> {
+fn restore_previous_archive(
+    directory: &OfflineDirectory,
+    previous: Option<CapabilityTempFile>,
+    archive_name: &OsStr,
+) -> Result<(), ProviderError> {
     let Some(previous) = previous else {
-        return match fs::remove_file(path) {
+        return match directory.directory.remove_file(archive_name) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(ProviderError::Cache(error.to_string())),
         };
     };
-    match previous.persist(path) {
+    match previous.persist(archive_name) {
         Ok(()) => Ok(()),
         Err(error) => {
-            let restore_error = error.error;
-            let mut recovery = error.path;
-            let recovery_path = recovery.to_path_buf();
-            recovery.disable_cleanup(true);
+            let restore_error = error.source;
+            let recovery_path = error.temporary.retain();
             Err(ProviderError::Cache(format!(
                 "{restore_error}; rollback copy retained at {}",
                 recovery_path.display()
@@ -2915,28 +3411,38 @@ fn restore_previous_archive(previous: Option<TempPath>, path: &Path) -> Result<(
     }
 }
 
+#[derive(Clone, Copy)]
+struct OsvPairNames<'a> {
+    archive: &'a OsStr,
+    marker: &'a OsStr,
+}
+
 fn publish_osv_pair_with<F>(
-    archive_temp: TempPath,
-    marker_temp: TempPath,
-    archive_path: &Path,
-    marker_path: &Path,
-    previous_archive: Option<TempPath>,
+    directory: &OfflineDirectory,
+    archive_temp: CapabilityTempFile,
+    marker_temp: CapabilityTempFile,
+    names: OsvPairNames<'_>,
+    previous_archive: Option<CapabilityTempFile>,
+    before_archive: impl FnOnce() -> Result<(), ProviderError>,
     publish_marker: F,
 ) -> Result<(), ProviderError>
 where
-    F: FnOnce(TempPath, &Path) -> Result<(), tempfile::PathPersistError>,
+    F: FnOnce(CapabilityTempFile, &OsStr) -> Result<(), ProviderError>,
 {
-    archive_temp.persist(archive_path).map_err(|error| {
-        ProviderError::Cache(format!(
-            "replacing {}: {}",
-            archive_path.display(),
-            error.error
-        ))
-    })?;
-    if let Err(error) = publish_marker(marker_temp, marker_path) {
-        let publication_error = error.error.to_string();
-        drop(error.path);
-        restore_previous_archive(previous_archive, archive_path).map_err(|rollback_error| {
+    let archive_path = directory.display_path(names.archive);
+    let marker_path = directory.display_path(names.marker);
+    before_archive()?;
+    if let Err(error) = archive_temp.persist(names.archive) {
+        let publication_error = error.source.to_string();
+        drop(error.temporary);
+        return Err(ProviderError::Cache(format!(
+            "replacing {}: {publication_error}",
+            archive_path.display()
+        )));
+    }
+    if let Err(error) = publish_marker(marker_temp, names.marker) {
+        let publication_error = error.to_string();
+        restore_previous_archive(directory, previous_archive, names.archive).map_err(|rollback_error| {
             ProviderError::Cache(format!(
                 "replacing {} failed: {publication_error}; restoring {} also failed: {rollback_error}",
                 marker_path.display(),
@@ -2953,19 +3459,34 @@ where
 }
 
 fn publish_osv_pair(
-    archive_temp: TempPath,
-    marker_temp: TempPath,
-    archive_path: &Path,
-    marker_path: &Path,
-    previous_archive: Option<TempPath>,
+    directory: &OfflineDirectory,
+    archive_temp: CapabilityTempFile,
+    marker_temp: CapabilityTempFile,
+    archive_name: &OsStr,
+    marker_name: &OsStr,
+    previous_archive: Option<CapabilityTempFile>,
+    _config: &OsvSyncConfig,
 ) -> Result<(), ProviderError> {
     publish_osv_pair_with(
+        directory,
         archive_temp,
         marker_temp,
-        archive_path,
-        marker_path,
+        OsvPairNames {
+            archive: archive_name,
+            marker: marker_name,
+        },
         previous_archive,
-        |temporary, target| temporary.persist(target),
+        || {
+            #[cfg(test)]
+            _config.reach_boundary(OsvSyncBoundary::BeforeArchivePublication);
+            directory.revalidate()
+        },
+        |temporary, target| {
+            #[cfg(test)]
+            _config.reach_boundary(OsvSyncBoundary::BeforeMarkerPublication);
+            directory.revalidate()?;
+            persist_capability_temp(temporary, target)
+        },
     )
 }
 
@@ -3017,28 +3538,31 @@ async fn sync_osv_dumps_with_config(
                         eco.osv_name()
                     ))
                 })??;
+        let dir = Arc::new(dir);
         let url = format!("{}/{}/all.zip", config.base_url, eco.osv_name());
         debug!(%url, "downloading OSV dump");
-        let path = dir.join(format!("{ecosystem_slug}.zip"));
-        let marker_path = path.with_extension("synced-at");
-        validate_marker_target(&marker_path)?;
-        let mut archive_temp = TempFileBuilder::new()
-            .prefix(&format!(".{ecosystem_slug}-"))
-            .suffix(".zip.tmp")
-            .tempfile_in(&dir)
-            .map_err(|error| ProviderError::Cache(error.to_string()))?;
+        let archive_name = OsString::from(format!("{ecosystem_slug}.zip"));
+        let marker_name = OsString::from(format!("{ecosystem_slug}.synced-at"));
+        let path = dir.display_path(&archive_name);
+        validate_marker_target(&dir, &marker_name)?;
+        let temp_prefix = format!(".{ecosystem_slug}-");
+        let archive_temp = CapabilityTempFile::new(&dir, &temp_prefix, ".zip.tmp")?;
+        #[cfg(test)]
+        config.reach_boundary(OsvSyncBoundary::AfterTemporaryCreation);
+        dir.revalidate()?;
         if let Err(error) = http
             .download_osv_dump(&url, archive_temp.as_file(), config)
             .await
         {
-            if !validate_owned_offline_directory(cache.root())
-                .is_ok_and(|directory| directory == dir)
-            {
-                archive_temp.disable_cleanup(true);
-            }
+            #[cfg(test)]
+            config.reach_boundary(OsvSyncBoundary::BeforeHandledErrorCleanup);
+            dir.revalidate()?;
             return Err(error);
         }
 
+        #[cfg(test)]
+        config.reach_boundary(OsvSyncBoundary::BeforeValidation);
+        dir.revalidate()?;
         let validation_file = archive_temp
             .as_file()
             .try_clone()
@@ -3055,48 +3579,32 @@ async fn sync_osv_dumps_with_config(
             ))
         })?;
         if let Err(error) = validation {
-            if !validate_owned_offline_directory(cache.root())
-                .is_ok_and(|directory| directory == dir)
-            {
-                archive_temp.disable_cleanup(true);
-            }
+            #[cfg(test)]
+            config.reach_boundary(OsvSyncBoundary::BeforeHandledErrorCleanup);
+            dir.revalidate()?;
             return Err(error);
         }
 
-        let revalidated = match validate_owned_offline_directory(cache.root()) {
-            Ok(directory) => directory,
-            Err(error) => {
-                archive_temp.disable_cleanup(true);
-                return Err(error);
-            }
-        };
-        if revalidated != dir {
-            archive_temp.disable_cleanup(true);
-            return Err(cache_path_error(
-                &dir,
-                "offline namespace changed during dump validation",
-            ));
-        }
-        let mut marker_temp = TempFileBuilder::new()
-            .prefix(&format!(".{ecosystem_slug}-"))
-            .suffix(".synced-at.tmp")
-            .tempfile_in(&dir)
-            .map_err(|error| ProviderError::Cache(error.to_string()))?;
+        dir.revalidate()?;
+        let mut marker_temp = CapabilityTempFile::new(&dir, &temp_prefix, ".synced-at.tmp")?;
         marker_temp
             .write_all(Utc::now().to_rfc3339().as_bytes())
             .and_then(|_| marker_temp.as_file().sync_all())
             .map_err(|error| ProviderError::Cache(error.to_string()))?;
         #[cfg(test)]
-        let backup_directory = config
-            .backup_directory
-            .clone()
-            .unwrap_or_else(|| dir.clone());
-        #[cfg(not(test))]
-        let backup_directory = dir.clone();
-        let stage_path = path.clone();
-        let stage_prefix = format!(".{ecosystem_slug}-");
-        let mut previous_archive = tokio::task::spawn_blocking(move || {
-            stage_previous_archive(&stage_path, &backup_directory, &stage_prefix)
+        config.reach_boundary(OsvSyncBoundary::BeforeRollbackStaging);
+        dir.revalidate()?;
+        #[cfg(test)]
+        if config.force_rollback_staging_error {
+            return Err(ProviderError::Cache(
+                "injected rollback staging failure".to_owned(),
+            ));
+        }
+        let stage_directory = dir.clone();
+        let stage_name = archive_name.clone();
+        let stage_prefix = temp_prefix.clone();
+        let previous_archive = tokio::task::spawn_blocking(move || {
+            stage_previous_archive(&stage_directory, &stage_name, &stage_prefix)
         })
         .await
         .map_err(|error| {
@@ -3106,36 +3614,18 @@ async fn sync_osv_dumps_with_config(
             ))
         })??;
 
-        let revalidated = match validate_owned_offline_directory(cache.root()) {
-            Ok(directory) => directory,
-            Err(error) => {
-                archive_temp.disable_cleanup(true);
-                marker_temp.disable_cleanup(true);
-                if let Some(previous) = previous_archive.as_mut() {
-                    previous.disable_cleanup(true);
-                }
-                return Err(error);
-            }
-        };
-        if revalidated != dir {
-            archive_temp.disable_cleanup(true);
-            marker_temp.disable_cleanup(true);
-            if let Some(previous) = previous_archive.as_mut() {
-                previous.disable_cleanup(true);
-            }
-            return Err(cache_path_error(
-                &dir,
-                "offline namespace changed before dump publication",
-            ));
-        }
-        validate_marker_target(&marker_path)?;
+        dir.revalidate()?;
+        validate_marker_target(&dir, &marker_name)?;
         publish_osv_pair(
-            archive_temp.into_temp_path(),
-            marker_temp.into_temp_path(),
-            &path,
-            &marker_path,
+            &dir,
+            archive_temp,
+            marker_temp,
+            &archive_name,
+            &marker_name,
             previous_archive,
+            config,
         )?;
+        dir.revalidate()?;
         let _ = fs2::FileExt::unlock(&sync_lock);
         written.push(path);
     }
@@ -5160,6 +5650,335 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[derive(Debug)]
+    enum NamespaceSwap {
+        NotAttempted,
+        Denied(std::io::ErrorKind),
+        Swapped { original: PathBuf, moved: PathBuf },
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug)]
+    enum FileNamespaceSwap {
+        Denied(std::io::ErrorKind),
+        Swapped { original: PathBuf, moved: PathBuf },
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug)]
+    enum OfflineReadSwap {
+        Directory(NamespaceSwap),
+        File(FileNamespaceSwap),
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug, Clone, Copy)]
+    enum OfflineReadSwapTarget {
+        Root,
+        OfflineDirectory,
+        Archive,
+        Marker,
+    }
+
+    #[cfg(any(unix, windows))]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn remove_directory_symlink(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            fs::remove_file(path)
+        }
+        #[cfg(windows)]
+        {
+            fs::remove_dir(path)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn attempt_namespace_swap(original: &Path, moved: &Path, external: &Path) -> NamespaceSwap {
+        match fs::rename(original, moved) {
+            Ok(()) => match create_directory_symlink(external, original) {
+                Ok(()) => NamespaceSwap::Swapped {
+                    original: original.to_path_buf(),
+                    moved: moved.to_path_buf(),
+                },
+                Err(error) => {
+                    fs::rename(moved, original).expect("restore namespace after symlink denial");
+                    NamespaceSwap::Denied(error.kind())
+                }
+            },
+            Err(error) => NamespaceSwap::Denied(error.kind()),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn restore_namespace_swap(outcome: NamespaceSwap) -> bool {
+        match outcome {
+            NamespaceSwap::Swapped { original, moved } => {
+                remove_directory_symlink(&original).expect("remove replacement directory link");
+                fs::rename(moved, original).expect("restore original namespace");
+                true
+            }
+            #[cfg(unix)]
+            NamespaceSwap::Denied(kind) => {
+                panic!("directory swap unexpectedly failed on Unix: {kind:?}")
+            }
+            #[cfg(windows)]
+            NamespaceSwap::Denied(kind) => {
+                assert!(
+                    matches!(
+                        kind,
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::Unsupported
+                            | std::io::ErrorKind::Other
+                    ),
+                    "unexpected Windows directory-swap error: {kind:?}"
+                );
+                false
+            }
+            NamespaceSwap::NotAttempted => panic!("the requested sync boundary was not reached"),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn attempt_file_namespace_swap(
+        original: &Path,
+        moved: &Path,
+        external: &Path,
+    ) -> FileNamespaceSwap {
+        match fs::rename(original, moved) {
+            Ok(()) => match create_file_symlink(external, original) {
+                Ok(()) => FileNamespaceSwap::Swapped {
+                    original: original.to_path_buf(),
+                    moved: moved.to_path_buf(),
+                },
+                Err(error) => {
+                    fs::rename(moved, original).expect("restore file after symlink denial");
+                    FileNamespaceSwap::Denied(error.kind())
+                }
+            },
+            Err(error) => FileNamespaceSwap::Denied(error.kind()),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn restore_file_namespace_swap(outcome: FileNamespaceSwap) -> bool {
+        match outcome {
+            FileNamespaceSwap::Swapped { original, moved } => {
+                fs::remove_file(&original).expect("remove replacement file link");
+                fs::rename(moved, original).expect("restore original file");
+                true
+            }
+            #[cfg(unix)]
+            FileNamespaceSwap::Denied(kind) => {
+                panic!("file swap unexpectedly failed on Unix: {kind:?}")
+            }
+            #[cfg(windows)]
+            FileNamespaceSwap::Denied(kind) => {
+                assert!(
+                    matches!(
+                        kind,
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::Unsupported
+                            | std::io::ErrorKind::Other
+                    ),
+                    "unexpected Windows file-swap error: {kind:?}"
+                );
+                false
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn seed_external_offline_read_cache(root: &Path, archive: &[u8], marker: &str) {
+        fs::write(
+            root.join(CACHE_SENTINEL_FILE),
+            serde_json::to_vec(&expected_cache_sentinel()).unwrap(),
+        )
+        .unwrap();
+        let offline = root.join("offline");
+        fs::create_dir(&offline).unwrap();
+        fs::write(offline.join("npm.zip"), archive).unwrap();
+        fs::write(offline.join("npm.synced-at"), marker).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    fn attempt_offline_read_swap(
+        target: OfflineReadSwapTarget,
+        cache: &Cache,
+        external_root: &Path,
+    ) -> OfflineReadSwap {
+        let offline = cache.root().join("offline");
+        let external_offline = external_root.join("offline");
+        match target {
+            OfflineReadSwapTarget::Root => {
+                let original = cache.root();
+                let moved = original.parent().unwrap().join(format!(
+                    "{}.ds047-read-held",
+                    original.file_name().unwrap().to_string_lossy()
+                ));
+                OfflineReadSwap::Directory(attempt_namespace_swap(original, &moved, external_root))
+            }
+            OfflineReadSwapTarget::OfflineDirectory => {
+                let moved = cache.root().join("offline.ds047-read-held");
+                OfflineReadSwap::Directory(attempt_namespace_swap(
+                    &offline,
+                    &moved,
+                    &external_offline,
+                ))
+            }
+            OfflineReadSwapTarget::Archive => {
+                let original = offline.join("npm.zip");
+                let moved = offline.join("npm.zip.ds047-read-held");
+                OfflineReadSwap::File(attempt_file_namespace_swap(
+                    &original,
+                    &moved,
+                    &external_offline.join("npm.zip"),
+                ))
+            }
+            OfflineReadSwapTarget::Marker => {
+                let original = offline.join("npm.synced-at");
+                let moved = offline.join("npm.synced-at.ds047-read-held");
+                OfflineReadSwap::File(attempt_file_namespace_swap(
+                    &original,
+                    &moved,
+                    &external_offline.join("npm.synced-at"),
+                ))
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn restore_offline_read_swap(outcome: OfflineReadSwap) -> bool {
+        match outcome {
+            OfflineReadSwap::Directory(outcome) => restore_namespace_swap(outcome),
+            OfflineReadSwap::File(outcome) => restore_file_namespace_swap(outcome),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn seed_external_sync_namespace(directory: &Path) {
+        fs::create_dir_all(directory).unwrap();
+        for (name, contents) in [
+            ("npm.zip", b"external archive".as_slice()),
+            ("npm.synced-at", b"external marker".as_slice()),
+            (".npm.sync.lock", b"external lock".as_slice()),
+            (".npm-victim.zip.tmp", b"external temp".as_slice()),
+            (
+                ".npm-victim.zip.rollback.tmp",
+                b"external rollback".as_slice(),
+            ),
+        ] {
+            fs::write(directory.join(name), contents).unwrap();
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn assert_external_sync_namespace_unchanged(directory: &Path) {
+        let expected = BTreeMap::from([
+            (
+                ".npm-victim.zip.rollback.tmp",
+                b"external rollback".as_slice(),
+            ),
+            (".npm-victim.zip.tmp", b"external temp".as_slice()),
+            (".npm.sync.lock", b"external lock".as_slice()),
+            ("npm.synced-at", b"external marker".as_slice()),
+            ("npm.zip", b"external archive".as_slice()),
+        ]);
+        let actual = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                let bytes = fs::read(entry.path()).unwrap();
+                (name, bytes)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual.len(), expected.len(), "external namespace changed");
+        for (name, contents) in expected {
+            assert_eq!(
+                actual.get(name).map(Vec::as_slice),
+                Some(contents),
+                "external file {name:?} changed"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    async fn assert_sync_boundary_is_capability_confined(
+        boundary: OsvSyncBoundary,
+        response: Vec<u8>,
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/npm/all.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(response))
+            .mount(&server)
+            .await;
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_root.path());
+        let previous = dump_archive_bytes(32);
+        let previous_marker = "2000-01-01T00:00:00Z";
+        seed_sync_files(&cache, &previous, previous_marker);
+        let external = tempfile::tempdir().unwrap();
+        seed_external_sync_namespace(external.path());
+        let offline = cache.root().join("offline");
+        let moved = cache.root().join("offline.ds047-held");
+        let swap = Arc::new(Mutex::new(NamespaceSwap::NotAttempted));
+        let hook_swap = swap.clone();
+        let external_path = external.path().to_path_buf();
+        let mut config = test_sync_config(server.uri());
+        config.boundary_hook = Some(Arc::new(move |observed| {
+            if observed == boundary {
+                let mut outcome = hook_swap.lock().unwrap();
+                if matches!(*outcome, NamespaceSwap::NotAttempted) {
+                    *outcome = attempt_namespace_swap(&offline, &moved, &external_path);
+                }
+            }
+        }));
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+
+        let result = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config).await;
+        let outcome = std::mem::replace(&mut *swap.lock().unwrap(), NamespaceSwap::NotAttempted);
+        let swapped = restore_namespace_swap(outcome);
+
+        if swapped {
+            assert!(matches!(result, Err(ProviderError::Cache(_))));
+            assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), previous);
+            assert_eq!(
+                fs::read_to_string(sync_paths(&cache).1).unwrap(),
+                previous_marker
+            );
+            assert_no_sync_temps(&cache);
+        }
+        assert_external_sync_namespace_unchanged(external.path());
+    }
+
     fn test_sync_config(base_url: String) -> OsvSyncConfig {
         let mut config = OsvSyncConfig::new(OsvSyncOptions {
             transfer_timeout: StdDuration::from_secs(5),
@@ -5365,6 +6184,281 @@ mod tests {
         assert!(matches!(result, Err(ProviderError::Cache(_))));
         assert_eq!(fs::read(important).unwrap(), b"preserve");
         assert!(!external.path().join("npm.zip").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn capability_relative_sync_confines_every_publication_and_cleanup_boundary() {
+        let valid = dump_archive_bytes(1024);
+        for boundary in [
+            OsvSyncBoundary::AfterTemporaryCreation,
+            OsvSyncBoundary::BeforeValidation,
+            OsvSyncBoundary::BeforeRollbackStaging,
+            OsvSyncBoundary::BeforeArchivePublication,
+            OsvSyncBoundary::BeforeMarkerPublication,
+        ] {
+            assert_sync_boundary_is_capability_confined(boundary, valid.clone()).await;
+        }
+        assert_sync_boundary_is_capability_confined(
+            OsvSyncBoundary::BeforeHandledErrorCleanup,
+            b"not a zip archive".to_vec(),
+        )
+        .await;
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn capability_relative_sync_confines_a_cache_root_swap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/npm/all.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(dump_archive_bytes(1024)))
+            .mount(&server)
+            .await;
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_root.path());
+        let previous = dump_archive_bytes(32);
+        seed_sync_files(&cache, &previous, "2000-01-01T00:00:00Z");
+        let external = tempfile::tempdir().unwrap();
+        seed_external_sync_namespace(external.path());
+        let original = cache.root().to_path_buf();
+        let moved = original.parent().unwrap().join(format!(
+            "{}.ds047-held",
+            original.file_name().unwrap().to_string_lossy()
+        ));
+        let swap = Arc::new(Mutex::new(NamespaceSwap::NotAttempted));
+        let hook_swap = swap.clone();
+        let external_path = external.path().to_path_buf();
+        let mut config = test_sync_config(server.uri());
+        config.boundary_hook = Some(Arc::new(move |boundary| {
+            if boundary == OsvSyncBoundary::AfterTemporaryCreation {
+                let mut outcome = hook_swap.lock().unwrap();
+                if matches!(*outcome, NamespaceSwap::NotAttempted) {
+                    *outcome = attempt_namespace_swap(&original, &moved, &external_path);
+                }
+            }
+        }));
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+
+        let result = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config).await;
+        let outcome = std::mem::replace(&mut *swap.lock().unwrap(), NamespaceSwap::NotAttempted);
+        let swapped = restore_namespace_swap(outcome);
+
+        if swapped {
+            assert!(matches!(result, Err(ProviderError::Cache(_))));
+            assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), previous);
+            assert_no_sync_temps(&cache);
+        }
+        assert_external_sync_namespace_unchanged(external.path());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn capability_relative_lock_and_abandoned_cleanup_ignore_replacement_namespace() {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Boundary {
+            Lock,
+            Cleanup,
+        }
+
+        for boundary in [Boundary::Lock, Boundary::Cleanup] {
+            let cache_root = tempfile::tempdir().unwrap();
+            let cache = cache_for_sync(cache_root.path());
+            let offline = cache.root().join("offline");
+            fs::create_dir(&offline).unwrap();
+            fs::write(offline.join(".npm-victim.zip.tmp"), b"owned stale temp").unwrap();
+            let moved = cache.root().join("offline.ds047-held");
+            let external = tempfile::tempdir().unwrap();
+            seed_external_sync_namespace(external.path());
+            let swap = Arc::new(Mutex::new(NamespaceSwap::NotAttempted));
+            let attempt = {
+                let swap = swap.clone();
+                let offline = offline.clone();
+                let moved = moved.clone();
+                let external = external.path().to_path_buf();
+                Arc::new(move || {
+                    let mut outcome = swap.lock().unwrap();
+                    if matches!(*outcome, NamespaceSwap::NotAttempted) {
+                        *outcome = attempt_namespace_swap(&offline, &moved, &external);
+                    }
+                })
+            };
+            let before_lock = attempt.clone();
+            let before_cleanup = attempt.clone();
+
+            let result = acquire_osv_sync_lock_with(
+                cache.root(),
+                "npm",
+                move || {
+                    if boundary == Boundary::Lock {
+                        before_lock();
+                    }
+                },
+                move || {
+                    if boundary == Boundary::Cleanup {
+                        before_cleanup();
+                    }
+                },
+            );
+            let outcome =
+                std::mem::replace(&mut *swap.lock().unwrap(), NamespaceSwap::NotAttempted);
+            let swapped = restore_namespace_swap(outcome);
+
+            if swapped {
+                assert!(matches!(result, Err(ProviderError::Cache(_))));
+            }
+            if boundary == Boundary::Cleanup {
+                assert!(
+                    !offline.join(".npm-victim.zip.tmp").exists(),
+                    "cleanup did not act through the held directory capability"
+                );
+            }
+            assert_external_sync_namespace_unchanged(external.path());
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn capability_acquisition_revalidates_before_creating_the_offline_child() {
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_root.path());
+        let original = cache.root().to_path_buf();
+        let moved = original.parent().unwrap().join(format!(
+            "{}.ds047-acquire-held",
+            original.file_name().unwrap().to_string_lossy()
+        ));
+        let external = tempfile::tempdir().unwrap();
+        let swap = Arc::new(Mutex::new(NamespaceSwap::NotAttempted));
+        let hook_swap = swap.clone();
+        let hook_original = original.clone();
+        let external_path = external.path().to_path_buf();
+
+        let result = OfflineDirectory::open_with(&original, move || {
+            *hook_swap.lock().unwrap() =
+                attempt_namespace_swap(&hook_original, &moved, &external_path);
+        });
+        let outcome = std::mem::replace(&mut *swap.lock().unwrap(), NamespaceSwap::NotAttempted);
+        let swapped = restore_namespace_swap(outcome);
+
+        if swapped {
+            assert!(matches!(result, Err(ProviderError::Cache(_))));
+        }
+        assert!(
+            fs::read_dir(external.path()).unwrap().next().is_none(),
+            "capability acquisition wrote into the replacement cache root"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn capability_relative_offline_reads_reject_root_child_and_final_name_swaps() {
+        let package = Package::new(
+            Ecosystem::Npm,
+            "read-capability",
+            "1.0.0",
+            PathBuf::from("package-lock.json"),
+        );
+        let document = serde_json::to_vec(&json!({
+            "id": "TEST-READ-CAPABILITY",
+            "modified": TEST_OSV_MODIFIED,
+            "summary": "the original held archive contains this advisory",
+            "affected": [{
+                "package": {
+                    "ecosystem": "npm",
+                    "name": "read-capability"
+                },
+                "versions": ["1.0.0"]
+            }]
+        }))
+        .unwrap();
+        let vulnerable_archive = archive_with_entry("TEST-READ-CAPABILITY.json", &document);
+        let empty_archive = archive_with_entries(&[], zip::CompressionMethod::Stored);
+        let now = test_timestamp("2026-08-19T12:00:00Z");
+
+        for target in [
+            OfflineReadSwapTarget::Root,
+            OfflineReadSwapTarget::OfflineDirectory,
+            OfflineReadSwapTarget::Archive,
+            OfflineReadSwapTarget::Marker,
+        ] {
+            let cache_root = tempfile::tempdir().unwrap();
+            let cache = cache_for_sync(cache_root.path());
+            seed_sync_files(&cache, &vulnerable_archive, TEST_OSV_MODIFIED);
+            let provider = OsvOffline::new(cache.clone());
+            let baseline = provider
+                .query_blocking_at(std::slice::from_ref(&package), now)
+                .unwrap();
+            assert_eq!(
+                baseline[&package.key()].len(),
+                1,
+                "original archive was not a vulnerable baseline for {target:?}"
+            );
+
+            let external = tempfile::tempdir().unwrap();
+            seed_external_offline_read_cache(external.path(), &empty_archive, TEST_OSV_MODIFIED);
+            let boundary = match target {
+                OfflineReadSwapTarget::Archive => OsvOfflineReadBoundary::BeforeArchive,
+                OfflineReadSwapTarget::Root
+                | OfflineReadSwapTarget::OfflineDirectory
+                | OfflineReadSwapTarget::Marker => OsvOfflineReadBoundary::BeforeMarker,
+            };
+            let swap = Arc::new(Mutex::new(None));
+            let hook_swap = swap.clone();
+            let hook_cache = cache.clone();
+            let external_root = external.path().to_path_buf();
+
+            let result = provider.query_blocking_at_with_hook(
+                std::slice::from_ref(&package),
+                now,
+                move |observed| {
+                    if observed == boundary {
+                        let mut outcome = hook_swap.lock().unwrap();
+                        if outcome.is_none() {
+                            *outcome = Some(attempt_offline_read_swap(
+                                target,
+                                &hook_cache,
+                                &external_root,
+                            ));
+                        }
+                    }
+                },
+            );
+            let outcome = swap
+                .lock()
+                .unwrap()
+                .take()
+                .expect("offline read did not reach the requested swap boundary");
+            let swapped = restore_offline_read_swap(outcome);
+
+            if swapped {
+                assert!(
+                    matches!(result, Err(ProviderError::Offline(_))),
+                    "successful {target:?} swap did not fail the offline scan closed: {result:?}"
+                );
+            } else {
+                let output = result.expect("a denied Windows swap must leave the scan usable");
+                assert_eq!(
+                    output[&package.key()].len(),
+                    1,
+                    "denied {target:?} swap produced a false-clean result"
+                );
+            }
+            let (archive_path, marker_path) = sync_paths(&cache);
+            assert_eq!(fs::read(archive_path).unwrap(), vulnerable_archive);
+            assert_eq!(fs::read(marker_path).unwrap(), TEST_OSV_MODIFIED.as_bytes());
+            assert_eq!(
+                fs::read(external.path().join("offline/npm.zip")).unwrap(),
+                empty_archive,
+                "external empty archive changed during {target:?} swap"
+            );
+            assert_eq!(
+                fs::read(external.path().join("offline/npm.synced-at")).unwrap(),
+                TEST_OSV_MODIFIED.as_bytes(),
+                "external marker changed during {target:?} swap"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5606,13 +6700,11 @@ mod tests {
         let cache = cache_for_sync(cache_dir.path());
         let previous_marker = "2000-01-01T00:00:00Z";
         seed_sync_files(&cache, &previous, previous_marker);
-        let backup_blocker = cache.root().join("backup-blocker");
-        fs::write(&backup_blocker, b"not a directory").unwrap();
         let client =
             HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
                 .unwrap();
         let mut config = test_sync_config(base_url);
-        config.backup_directory = Some(backup_blocker);
+        config.force_rollback_staging_error = true;
 
         let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
             .await
@@ -5653,39 +6745,46 @@ mod tests {
 
     #[test]
     fn staged_backup_restores_a_replaced_archive_without_copying_after_failure() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("npm.zip");
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_root.path());
+        let directory = OfflineDirectory::open(cache.root()).unwrap();
+        let archive_name = OsStr::new("npm.zip");
+        let archive = directory.display_path(archive_name);
         let previous = dump_archive_bytes(32);
         fs::write(&archive, &previous).unwrap();
-        let backup = stage_previous_archive(&archive, directory.path(), ".npm-")
+        let backup = stage_previous_archive(&directory, archive_name, ".npm-")
             .unwrap()
             .unwrap();
 
-        let mut replacement = TempFileBuilder::new()
-            .suffix(".zip.tmp")
-            .tempfile_in(directory.path())
-            .unwrap();
+        let mut replacement = CapabilityTempFile::new(&directory, ".npm-", ".zip.tmp").unwrap();
         replacement.write_all(&dump_archive_bytes(1024)).unwrap();
-        replacement.into_temp_path().persist(&archive).unwrap();
-        restore_previous_archive(Some(backup), &archive).unwrap();
+        replacement.as_file().sync_all().unwrap();
+        replacement
+            .persist(archive_name)
+            .map_err(|error| error.source)
+            .unwrap();
+        restore_previous_archive(&directory, Some(backup), archive_name).unwrap();
 
         assert_eq!(fs::read(archive).unwrap(), previous);
     }
 
     #[test]
     fn failed_restore_retains_the_last_recovery_copy() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("npm.zip");
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_root.path());
+        let directory = OfflineDirectory::open(cache.root()).unwrap();
+        let archive_name = OsStr::new("npm.zip");
+        let archive = directory.display_path(archive_name);
         let previous = dump_archive_bytes(32);
         fs::write(&archive, &previous).unwrap();
-        let backup = stage_previous_archive(&archive, directory.path(), ".npm-")
+        let backup = stage_previous_archive(&directory, archive_name, ".npm-")
             .unwrap()
             .unwrap();
         fs::remove_file(&archive).unwrap();
         fs::create_dir(&archive).unwrap();
 
-        let error = restore_previous_archive(Some(backup), &archive).unwrap_err();
-        let recovery_files = fs::read_dir(directory.path())
+        let error = restore_previous_archive(&directory, Some(backup), archive_name).unwrap_err();
+        let recovery_files = fs::read_dir(&directory.path)
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
@@ -5705,44 +6804,47 @@ mod tests {
 
     #[test]
     fn marker_publication_failure_exercises_pair_rollback() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("npm.zip");
-        let marker = directory.path().join("npm.synced-at");
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_root.path());
+        let directory = OfflineDirectory::open(cache.root()).unwrap();
+        let archive_name = OsStr::new("npm.zip");
+        let marker_name = OsStr::new("npm.synced-at");
+        let archive = directory.display_path(archive_name);
+        let marker = directory.display_path(marker_name);
         let previous_archive = dump_archive_bytes(32);
         let previous_marker = b"2000-01-01T00:00:00Z";
         fs::write(&archive, &previous_archive).unwrap();
         fs::write(&marker, previous_marker).unwrap();
-        let backup = stage_previous_archive(&archive, directory.path(), ".npm-").unwrap();
+        let backup = stage_previous_archive(&directory, archive_name, ".npm-").unwrap();
 
-        let mut archive_temp = TempFileBuilder::new()
-            .prefix(".npm-")
-            .suffix(".zip.tmp")
-            .tempfile_in(directory.path())
-            .unwrap();
+        let mut archive_temp = CapabilityTempFile::new(&directory, ".npm-", ".zip.tmp").unwrap();
         archive_temp.write_all(&dump_archive_bytes(1024)).unwrap();
-        let mut marker_temp = TempFileBuilder::new()
-            .prefix(".npm-")
-            .suffix(".synced-at.tmp")
-            .tempfile_in(directory.path())
-            .unwrap();
+        archive_temp.as_file().sync_all().unwrap();
+        let mut marker_temp =
+            CapabilityTempFile::new(&directory, ".npm-", ".synced-at.tmp").unwrap();
         marker_temp.write_all(b"2026-08-19T00:00:00Z").unwrap();
-        let marker_blocker = directory.path().join("marker-blocker");
+        marker_temp.as_file().sync_all().unwrap();
+        let marker_blocker = directory.path.join("marker-blocker");
         fs::create_dir(&marker_blocker).unwrap();
 
         let error = publish_osv_pair_with(
-            archive_temp.into_temp_path(),
-            marker_temp.into_temp_path(),
-            &archive,
-            &marker,
+            &directory,
+            archive_temp,
+            marker_temp,
+            OsvPairNames {
+                archive: archive_name,
+                marker: marker_name,
+            },
             backup,
-            |temporary, _| temporary.persist(&marker_blocker),
+            || Ok(()),
+            |temporary, _| persist_capability_temp(temporary, OsStr::new("marker-blocker")),
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("restored previous archive"));
         assert_eq!(fs::read(&archive).unwrap(), previous_archive);
         assert_eq!(fs::read(&marker).unwrap(), previous_marker);
-        let temporary = fs::read_dir(directory.path())
+        let temporary = fs::read_dir(&directory.path)
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
@@ -8597,7 +9699,8 @@ mod tests {
     #[test]
     fn offline_nuget_matching_is_case_insensitive() {
         let dir = tempfile::tempdir().unwrap();
-        let offline_dir = dir.path().join("offline");
+        let cache = Cache::from_root(dir.path().join("cache"), CachePolicy::default()).unwrap();
+        let offline_dir = cache.root().join("offline");
         fs::create_dir_all(&offline_dir).unwrap();
         let archive_path = offline_dir.join("NuGet.zip");
         let file = File::create(&archive_path).unwrap();
@@ -8636,10 +9739,6 @@ mod tests {
         )
         .unwrap();
 
-        let cache = Cache {
-            root: dir.path().to_path_buf(),
-            policy: CachePolicy::default(),
-        };
         let provider = OsvOffline::new(cache);
         let package = nuget_package("newtonsoft.json");
 
@@ -8714,11 +9813,9 @@ mod tests {
             }
 
             let dir = tempfile::tempdir().unwrap();
-            write_fixture_archives(dir.path(), std::slice::from_ref(fixture));
-            let offline_provider = OsvOffline::new(Cache {
-                root: dir.path().to_path_buf(),
-                policy: CachePolicy::default(),
-            });
+            let cache = Cache::from_root(dir.path().join("cache"), CachePolicy::default()).unwrap();
+            write_fixture_archives(cache.root(), std::slice::from_ref(fixture));
+            let offline_provider = OsvOffline::new(cache);
             let offline_results = offline_provider
                 .query_blocking(std::slice::from_ref(package))
                 .unwrap();
@@ -8772,11 +9869,9 @@ mod tests {
             fixed_in: vec![],
             document,
         };
-        write_fixture_archives(dir.path(), std::slice::from_ref(&fixture));
-        let offline = OsvOffline::new(Cache {
-            root: dir.path().to_path_buf(),
-            policy: CachePolicy::default(),
-        });
+        let cache = Cache::from_root(dir.path().join("cache"), CachePolicy::default()).unwrap();
+        write_fixture_archives(cache.root(), std::slice::from_ref(&fixture));
+        let offline = OsvOffline::new(cache);
         let offline_error = offline
             .query_blocking(std::slice::from_ref(&package))
             .unwrap_err();
