@@ -205,6 +205,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ```
 
+The checked-in [verification matrix](docs/test-matrix.md) maps the development specification and every audit issue to parser fixtures, version tables, provider mocks, process-level E2E tests, platform CI, live probes, or artifact gates. Pull requests dogfood an offline scan of this workspace on Linux, macOS, and Windows; public API checks remain an explicitly enabled scheduled/manual job.
+
 ## Known v0.1 limitations
 
 The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.

@@ -50,6 +50,9 @@ const OSV_QUERY_TTL_SECS: i64 = 60 * 60;
 const OSV_MAX_QUERY_PAGES: usize = 1_000;
 const REGISTRY_TTL_SECS: i64 = 6 * 60 * 60;
 const CACHE_COMMIT_ATTEMPTS: usize = 3;
+const NPM_REGISTRY_BASE_URL: &str = "https://registry.npmjs.org";
+const PYPI_REGISTRY_BASE_URL: &str = "https://pypi.org/pypi";
+const NUGET_REGISTRY_BASE_URL: &str = "https://api.nuget.org/v3-flatcontainer";
 const CRATES_IO_INDEX_BASE_URL: &str = "https://index.crates.io";
 const CRATES_IO_MAX_NAME_LEN: usize = 64;
 const CRATES_IO_MAX_INDEX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -350,11 +353,13 @@ fn nuget_registry_cache_key(package: &Package) -> String {
     format!("nuget:{}", package.name)
 }
 
+#[cfg(test)]
 fn nuget_registry_url(package: &Package) -> String {
-    format!(
-        "https://api.nuget.org/v3-flatcontainer/{}/index.json",
-        encode(&package.name)
-    )
+    nuget_registry_url_with_base(NUGET_REGISTRY_BASE_URL, package)
+}
+
+fn nuget_registry_url_with_base(base_url: &str, package: &Package) -> String {
+    format!("{}/{}/index.json", base_url, encode(&package.name))
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3702,16 +3707,45 @@ pub struct RegistryClient {
     http: HttpClient,
     cache: Cache,
     limits: Arc<HashMap<Ecosystem, Arc<Semaphore>>>,
+    npm_base_url: String,
+    pypi_base_url: String,
+    nuget_base_url: String,
     crates_index_base_url: String,
 }
 impl RegistryClient {
     pub fn new(http: HttpClient, cache: Cache) -> Self {
-        Self::with_crates_index_base_url(http, cache, CRATES_IO_INDEX_BASE_URL)
+        Self::with_registry_base_urls(
+            http,
+            cache,
+            NPM_REGISTRY_BASE_URL,
+            PYPI_REGISTRY_BASE_URL,
+            NUGET_REGISTRY_BASE_URL,
+            CRATES_IO_INDEX_BASE_URL,
+        )
     }
 
+    #[cfg(test)]
     fn with_crates_index_base_url(
         http: HttpClient,
         cache: Cache,
+        crates_index_base_url: impl Into<String>,
+    ) -> Self {
+        Self::with_registry_base_urls(
+            http,
+            cache,
+            NPM_REGISTRY_BASE_URL,
+            PYPI_REGISTRY_BASE_URL,
+            NUGET_REGISTRY_BASE_URL,
+            crates_index_base_url,
+        )
+    }
+
+    fn with_registry_base_urls(
+        http: HttpClient,
+        cache: Cache,
+        npm_base_url: impl Into<String>,
+        pypi_base_url: impl Into<String>,
+        nuget_base_url: impl Into<String>,
         crates_index_base_url: impl Into<String>,
     ) -> Self {
         let limits = HashMap::from([
@@ -3724,6 +3758,9 @@ impl RegistryClient {
             http,
             cache,
             limits: Arc::new(limits),
+            npm_base_url: npm_base_url.into().trim_end_matches('/').to_owned(),
+            pypi_base_url: pypi_base_url.into().trim_end_matches('/').to_owned(),
+            nuget_base_url: nuget_base_url.into().trim_end_matches('/').to_owned(),
             crates_index_base_url: crates_index_base_url
                 .into()
                 .trim_end_matches('/')
@@ -3814,7 +3851,7 @@ impl RegistryClient {
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = format!("https://registry.npmjs.org/{}", encode(&p.name));
+        let url = format!("{}/{}", self.npm_base_url, encode(&p.name));
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
@@ -3830,7 +3867,7 @@ impl RegistryClient {
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = format!("https://pypi.org/pypi/{}/json", encode(&p.name));
+        let url = format!("{}/{}/json", self.pypi_base_url, encode(&p.name));
         let data = self
             .metadata(&format!("pypi:{}", p.name), &url, HeaderMap::new())
             .await?;
@@ -3841,7 +3878,7 @@ impl RegistryClient {
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = nuget_registry_url(p);
+        let url = nuget_registry_url_with_base(&self.nuget_base_url, p);
         let cache_key = nuget_registry_cache_key(p);
         let data = self.metadata(&cache_key, &url, HeaderMap::new()).await?;
         nuget_version_result(p, &data)
@@ -5365,6 +5402,34 @@ mod tests {
                 "unexpected retry classification for HTTP {code}"
             );
         }
+    }
+
+    #[test]
+    fn production_network_budgets_match_the_documented_contract() {
+        let http = HttpClient::new().unwrap();
+        assert_eq!(http.request_timeout, StdDuration::from_secs(10));
+        assert_eq!(http.retry_settings.attempts, 4);
+        assert_eq!(
+            http.retry_settings.backoff_base,
+            StdDuration::from_millis(200)
+        );
+        assert_eq!(http.retry_settings.max_delay, StdDuration::from_secs(30));
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let osv = OsvClient::new(http.clone(), cache.clone());
+        assert_eq!(osv.concurrency.available_permits(), 16);
+        let registries = RegistryClient::new(http, cache);
+        assert_eq!(registries.limits[&Ecosystem::Npm].available_permits(), 16);
+        assert_eq!(registries.limits[&Ecosystem::PyPI].available_permits(), 16);
+        assert_eq!(registries.limits[&Ecosystem::NuGet].available_permits(), 16);
+        assert_eq!(
+            registries.limits[&Ecosystem::CratesIo].available_permits(),
+            8
+        );
     }
 
     #[test]
@@ -6985,6 +7050,10 @@ mod tests {
         )
     }
 
+    fn pypi_package(name: &str) -> Package {
+        Package::new(Ecosystem::PyPI, name, "1.0.0", PathBuf::from("uv.lock"))
+    }
+
     fn cache_osv_document(cache: &Cache, package: &Package, id: &str) {
         let revision = OsvVulnerabilityRevision {
             id: id.to_owned(),
@@ -7035,6 +7104,144 @@ mod tests {
 
     fn registry_range_fixtures() -> Vec<RegistryRangeFixture> {
         serde_json::from_str(include_str!("../tests/fixtures/registry-ranges.json")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_registry_http_mocks_cover_every_endpoint_and_header_contract() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/npm/npm-demo"))
+            .and(header("accept", "application/vnd.npm.install-v1+json"))
+            .and(header("user-agent", USER_AGENT_VALUE))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"dist-tags": {"latest": "2.0.0"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/pypi-demo/json"))
+            .and(header("user-agent", USER_AGENT_VALUE))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "releases": {
+                    "1.0.0": [{"yanked": false}],
+                    "2.0.0": [{"yanked": false}]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nuget/nuget.demo/index.json"))
+            .and(header("user-agent", USER_AGENT_VALUE))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"versions": ["1.0.0", "2.0.0"]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/crates/cr/at/crate-demo"))
+            .and(header("user-agent", USER_AGENT_VALUE))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "{\"name\":\"crate-demo\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+                    "{\"name\":\"crate-demo\",\"vers\":\"2.0.0\",\"yanked\":false}\n"
+                ),
+                "text/plain",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client = RegistryClient::with_registry_base_urls(
+            HttpClient::new().unwrap(),
+            cache,
+            format!("{}/npm", server.uri()),
+            format!("{}/pypi", server.uri()),
+            format!("{}/nuget", server.uri()),
+            format!("{}/crates", server.uri()),
+        );
+        let packages = [
+            npm_package("npm-demo"),
+            pypi_package("pypi-demo"),
+            Package::new(
+                Ecosystem::NuGet,
+                "NuGet.Demo",
+                "1.0.0",
+                PathBuf::from("packages.lock.json"),
+            ),
+            crates_package("crate-demo"),
+        ];
+
+        for package in packages {
+            let latest = client.latest(&package).await.unwrap();
+            assert_eq!(latest.latest_stable, "2.0.0", "{}", package.name);
+            assert_eq!(latest.staleness, depscan_core::Staleness::Major);
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn native_registry_http_mocks_reject_malformed_documents_for_every_ecosystem() {
+        let server = MockServer::start().await;
+        let cases = [
+            ("/npm/npm-bad", json!({"dist-tags": {}})),
+            ("/pypi/pypi-bad/json", json!({"releases": false})),
+            ("/nuget/nuget.bad/index.json", json!({"versions": {}})),
+        ];
+        for (request_path, response) in cases {
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/crates/cr/at/crate-bad"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "{\"name\":\"crate-bad\",\"vers\":false,\"yanked\":false}\n",
+                "text/plain",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client = RegistryClient::with_registry_base_urls(
+            HttpClient::new().unwrap(),
+            cache,
+            format!("{}/npm", server.uri()),
+            format!("{}/pypi", server.uri()),
+            format!("{}/nuget", server.uri()),
+            format!("{}/crates", server.uri()),
+        );
+        let cases = [
+            (npm_package("npm-bad"), "npm response lacked latest"),
+            (pypi_package("pypi-bad"), "PyPI response lacked releases"),
+            (nuget_package("NuGet.Bad"), "NuGet response lacked versions"),
+            (crates_package("crate-bad"), "sparse-index line 1"),
+        ];
+
+        for (package, expected) in cases {
+            let error = client.latest(&package).await.unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{}: expected {expected:?}, got {error}",
+                package.name
+            );
+        }
+        server.verify().await;
     }
 
     #[tokio::test]

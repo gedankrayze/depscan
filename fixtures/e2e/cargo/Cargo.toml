@@ -1,0 +1,13 @@
+[package]
+name = "depscan-e2e-cargo"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+serde = "1.0.228"
+
+[dev-dependencies]
+regex = "1.11.2"
+
+# Keep this standalone E2E project out of the repository workspace.
+[workspace]

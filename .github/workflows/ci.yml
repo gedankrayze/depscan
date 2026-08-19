@@ -29,8 +29,8 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Build CLI
         run: cargo build --release --locked -p depscan-cli
-      - name: Dogfood CLI help
-        run: cargo run --locked -p depscan-cli -- --help
+      - name: Dogfood an offline workspace self-scan
+        run: cargo test --locked -p depscan-cli --test e2e_matrix offline_workspace_self_scan -- --exact --nocapture
 
   msrv:
     name: MSRV

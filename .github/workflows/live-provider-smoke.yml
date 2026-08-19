@@ -1,0 +1,24 @@
+name: Live provider smoke
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-provider-smoke:
+    name: OSV and registry APIs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Run the opt-in live ecosystem matrix
+        env:
+          DEPSCAN_RUN_LIVE: "1"
+        run: >-
+          cargo test --locked -p depscan-cli --test e2e_matrix
+          live_provider_matrix_for_every_ecosystem -- --exact --ignored --nocapture
