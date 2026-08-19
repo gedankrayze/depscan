@@ -1,0 +1,65 @@
+[
+  {
+    "ecosystem": "npm",
+    "package": "fixture-npm",
+    "constraint": "^1.2.0",
+    "cache_key": "npm:fixture-npm",
+    "registry": {
+      "dist-tags": { "latest": "2.0.0" },
+      "versions": {
+        "1.2.0": {},
+        "1.9.4": {},
+        "2.0.0-beta.1": {},
+        "2.0.0": {}
+      }
+    },
+    "latest_stable": "2.0.0",
+    "latest_matching": "1.9.4"
+  },
+  {
+    "ecosystem": "pypi",
+    "package": "fixture-pypi",
+    "constraint": ">=1.0,<2.0,!=1.8",
+    "cache_key": "pypi:fixture-pypi",
+    "registry": {
+      "releases": {
+        "1.7": [{ "yanked": false }],
+        "1.8": [{ "yanked": false }],
+        "1.9rc1": [{ "yanked": false }],
+        "1.9": [{ "yanked": true }],
+        "2.0": [{ "yanked": false }]
+      }
+    },
+    "latest_stable": "2.0",
+    "latest_matching": "1.7"
+  },
+  {
+    "ecosystem": "nuget",
+    "package": "fixture.nuget",
+    "constraint": "1.2.*",
+    "cache_key": "nuget:fixture.nuget",
+    "registry": {
+      "versions": ["1.2.0", "1.2.9", "1.3.0-beta.1", "1.3.0", "2.0.0"]
+    },
+    "latest_stable": "2.0.0",
+    "latest_matching": "1.2.9"
+  },
+  {
+    "ecosystem": "crates.io",
+    "package": "fixture-crate",
+    "constraint": "^1.2",
+    "cache_key": "crates:fixture-crate",
+    "registry": {
+      "schema_version": 1,
+      "entries": [
+        { "name": "fixture-crate", "vers": "1.2.0", "yanked": false },
+        { "name": "fixture-crate", "vers": "1.8.0", "yanked": false },
+        { "name": "fixture-crate", "vers": "1.9.0", "yanked": true },
+        { "name": "fixture-crate", "vers": "2.0.0-beta.1", "yanked": false },
+        { "name": "fixture-crate", "vers": "2.0.0", "yanked": false }
+      ]
+    },
+    "latest_stable": "2.0.0",
+    "latest_matching": "1.8.0"
+  }
+]

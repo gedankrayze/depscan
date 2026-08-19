@@ -132,6 +132,25 @@ pub fn render_table(document: &ScanDocument, color: bool) -> String {
                 }
             }
             if let Some(latest) = &result.latest {
+                if let Some(constraint) = &result.package.manifest_constraint {
+                    let label = paint("RESOLVED", 36, color);
+                    if let Some(matching) = &latest.latest_matching {
+                        text.push_str(&format!(
+                            "  {label:>8}  {} {} → {} (latest stable: {})\n",
+                            result.package.display_name,
+                            constraint.raw(),
+                            matching,
+                            latest.latest_stable
+                        ));
+                    } else {
+                        text.push_str(&format!(
+                            "  {label:>8}  {} {} has no matching published release (latest stable: {})\n",
+                            result.package.display_name,
+                            constraint.raw(),
+                            latest.latest_stable
+                        ));
+                    }
+                }
                 if latest.yanked {
                     let label = paint("YANKED", 31, color);
                     text.push_str(&format!(
@@ -643,8 +662,41 @@ mod tests {
         assert!(
             render(&doc, OutputFormat::Json, false)
                 .unwrap()
-                .contains("\"schema_version\": 3")
+                .contains("\"schema_version\": 4")
         );
+    }
+
+    #[test]
+    fn manifest_resolution_preserves_constraint_and_distinguishes_latest_versions() {
+        let mut package = Package::new(
+            Ecosystem::Npm,
+            "range-example",
+            "^1.2.0",
+            PathBuf::from("package.json"),
+        );
+        package.set_manifest_constraint("^1.2.0");
+        let document = ScanDocument::new(vec![ScanResult {
+            package,
+            vulns: vec![],
+            latest: Some(LatestVersions {
+                latest_stable: "2.0.0".to_owned(),
+                latest_matching: Some("1.9.4".to_owned()),
+                staleness: Staleness::Unknown,
+                yanked: false,
+            }),
+            errors: vec![],
+            suppressed: vec![],
+        }]);
+
+        let table = render(&document, OutputFormat::Table, false).unwrap();
+        let json = render(&document, OutputFormat::Json, false).unwrap();
+
+        assert!(table.contains("RESOLVED  range-example ^1.2.0 → 1.9.4"));
+        assert!(table.contains("latest stable: 2.0.0"));
+        assert!(json.contains("\"raw\": \"^1.2.0\""));
+        assert!(json.contains("\"normalized\": \"^1.2.0\""));
+        assert!(json.contains("\"latest_stable\": \"2.0.0\""));
+        assert!(json.contains("\"latest_matching\": \"1.9.4\""));
     }
 
     #[test]

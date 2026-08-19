@@ -1,8 +1,10 @@
 //! Shared domain model and ecosystem-aware version/range logic for depscan.
 
+mod constraint;
 mod nuget;
 mod osv;
 
+pub use constraint::{VersionConstraintError, latest_matching_version};
 pub use nuget::{NuGetVersion, NuGetVersionError};
 pub use osv::{OsvAffectedEvaluation, OsvEvaluationError, evaluate_osv_affected};
 
@@ -18,7 +20,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 #[serde(rename_all = "lowercase")]
@@ -85,6 +87,39 @@ pub struct DetectedSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestConstraint {
+    /// Exact source spelling, retained for diagnostics and reports.
+    pub raw: String,
+    /// Registry-standard constraint consumed by the ecosystem evaluator.
+    pub normalized: String,
+}
+
+impl ManifestConstraint {
+    pub fn new(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        Self {
+            normalized: raw.clone(),
+            raw,
+        }
+    }
+
+    pub fn with_normalized(raw: impl Into<String>, normalized: impl Into<String>) -> Self {
+        Self {
+            raw: raw.into(),
+            normalized: normalized.into(),
+        }
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn normalized(&self) -> &str {
+        &self.normalized
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
     pub ecosystem: Ecosystem,
     /// Normalized package identity, also suitable for registry lookups.
@@ -104,6 +139,10 @@ pub struct Package {
     pub source_file: PathBuf,
     pub enrichable: bool,
     pub resolved_from_range: bool,
+    /// Manifest-only constraint provenance. `normalized` may differ from `raw` when a manifest
+    /// uses an ecosystem-specific shorthand such as Poetry's caret requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_constraint: Option<ManifestConstraint>,
 }
 
 impl Package {
@@ -127,7 +166,22 @@ impl Package {
             source_file,
             enrichable: true,
             resolved_from_range: false,
+            manifest_constraint: None,
         }
+    }
+
+    pub fn set_manifest_constraint(&mut self, raw: impl Into<String>) {
+        self.manifest_constraint = Some(ManifestConstraint::new(raw));
+        self.resolved_from_range = true;
+    }
+
+    pub fn set_normalized_manifest_constraint(
+        &mut self,
+        raw: impl Into<String>,
+        normalized: impl Into<String>,
+    ) {
+        self.manifest_constraint = Some(ManifestConstraint::with_normalized(raw, normalized));
+        self.resolved_from_range = true;
     }
     pub fn key(&self) -> String {
         format!(
@@ -395,6 +449,19 @@ impl ScanDocument {
                 .then_with(|| left.package.dev.cmp(&right.package.dev))
                 .then_with(|| left.package.dev_known.cmp(&right.package.dev_known))
                 .then_with(|| left.package.enrichable.cmp(&right.package.enrichable))
+                .then_with(|| {
+                    left.package
+                        .manifest_constraint
+                        .as_ref()
+                        .map(|constraint| (&constraint.raw, &constraint.normalized))
+                        .cmp(
+                            &right
+                                .package
+                                .manifest_constraint
+                                .as_ref()
+                                .map(|constraint| (&constraint.raw, &constraint.normalized)),
+                        )
+                })
                 .then_with(|| {
                     left.package
                         .resolved_from_range

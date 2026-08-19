@@ -64,6 +64,13 @@ fn parses_virtual_workspace_members_inheritance_targets_and_sources() {
             .unwrap()
     };
     assert_eq!(package("real-crate").version, "^3");
+    assert_eq!(
+        package("real-crate")
+            .manifest_constraint
+            .as_ref()
+            .map(|constraint| (constraint.raw(), constraint.normalized())),
+        Some(("^3", "^3"))
+    );
     assert!(package("workspace-dev").dev);
     assert!(package("target-dev").dev);
     assert!(!package("cc").dev, "build dependencies are not dev-only");

@@ -16,6 +16,7 @@ include = ["src/**", "LICENSE"]
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+js-semver.workspace = true
 pep440_rs.workspace = true
 semver.workspace = true
 serde.workspace = true

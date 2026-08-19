@@ -214,22 +214,32 @@ impl RequirementsParser {
             if line.starts_with("--hash") || line.starts_with("--") {
                 continue;
             }
-            if let Some((name, version)) = line.split_once("==") {
+            let requirement = line.split(';').next().unwrap_or(line).trim();
+            let operator = requirement.find(['<', '>', '~', '!', '=']);
+            let name_end = operator.unwrap_or(requirement.len());
+            let name_with_extras = requirement[..name_end].trim();
+            let name = name_with_extras
+                .split_once('[')
+                .map_or(name_with_extras, |(name, _)| name)
+                .trim();
+            let constraint = operator.map_or("", |index| requirement[index..].trim());
+            if let Some(version) = constraint.strip_prefix("==")
+                && !version.contains('*')
+                && !name.is_empty()
+            {
                 let mut package = Package::new(
                     Ecosystem::PyPI,
-                    name.trim(),
-                    version.split(';').next().unwrap_or(version).trim(),
+                    name,
+                    version.trim(),
                     canonical.to_path_buf(),
                 );
                 package.direct = true;
                 packages.push(package);
-            } else if let Some(name) = line.split(['<', '>', '~', '!', '=', ';']).next()
-                && !name.trim().is_empty()
-            {
+            } else if !name.is_empty() && !constraint.is_empty() {
                 let mut package =
-                    Package::new(Ecosystem::PyPI, name.trim(), line, canonical.to_path_buf());
+                    Package::new(Ecosystem::PyPI, name, constraint, canonical.to_path_buf());
                 package.direct = true;
-                package.resolved_from_range = true;
+                package.set_manifest_constraint(constraint);
                 packages.push(package);
             }
         }
@@ -334,6 +344,25 @@ mod tests {
                 "shared-package"
             ]
         );
+    }
+
+    #[test]
+    fn preserves_pep440_constraint_without_extras_or_environment_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("requirements.txt");
+        write(
+            &root,
+            "range-package[security]>=1.0,<2.0,!=1.5; python_version >= '3.11'\n",
+        );
+
+        let packages = parse(&root).unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "range-package");
+        assert_eq!(packages[0].version, ">=1.0,<2.0,!=1.5");
+        let constraint = packages[0].manifest_constraint.as_ref().unwrap();
+        assert_eq!(constraint.raw(), ">=1.0,<2.0,!=1.5");
+        assert_eq!(constraint.normalized(), constraint.raw());
     }
 
     #[test]

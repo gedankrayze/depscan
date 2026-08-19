@@ -789,7 +789,7 @@ expires = 2099-01-01
     let report = json_report(&output);
     assert_eq!(
         report.pointer("/schema_version").and_then(|v| v.as_u64()),
-        Some(3)
+        Some(4)
     );
     assert_eq!(
         report
@@ -1463,7 +1463,7 @@ verbose = 0
         report
             .get("schema_version")
             .and_then(serde_json::Value::as_u64),
-        Some(3)
+        Some(4)
     );
 }
 

@@ -92,12 +92,19 @@ fn merges_nearest_central_versions_and_project_overrides() {
         package(csharp, "central.shared", "1.2.3").display_name,
         "Central.Shared"
     );
-    assert!(!package(csharp, "central.shared", "1.2.3").resolved_from_range);
+    assert!(package(csharp, "central.shared", "1.2.3").resolved_from_range);
     assert_eq!(
         package(csharp, "central.nested", "2.3.4").display_name,
         "Central.Nested"
     );
     assert!(package(csharp, "central.range", "[3.0.0,4.0.0)").resolved_from_range);
+    assert_eq!(
+        package(csharp, "central.range", "[3.0.0,4.0.0)")
+            .manifest_constraint
+            .as_ref()
+            .map(|constraint| constraint.raw()),
+        Some("[3.0.0,4.0.0)")
+    );
     assert_eq!(
         package(csharp, "override.me", "4.5.6").display_name,
         "Override.Me"

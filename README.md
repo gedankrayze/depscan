@@ -15,6 +15,8 @@
 
 Resolved lockfile versions are preferred. Manifest-only records are marked as range-derived, because they are not an installed dependency resolution.
 
+For manifest-only records, the registry provider preserves the exact source constraint and evaluates a separate normalized form using the ecosystem's native rules: npm ranges, Cargo version requirements, PEP 440 specifiers, or NuGet intervals and floating versions. `latest_stable` is always the registry's unconstrained stable release; `latest_matching` is the newest non-yanked release accepted by the manifest. Table reports show both when a range is resolved. Invalid or unsupported constraints are per-package registry warnings and never fall back to the unconstrained release.
+
 Python lock provenance is format-aware. `uv.lock` schema version 1 uses project/workspace dependency edges to classify direct, transitive, optional, and development-group reachability. Poetry lock versions 1.0, 1.1, 2.0, and 2.1 use category/group metadata when the lock records it and, when present, the sibling `pyproject.toml` for directness; Poetry 2.0 packages without category/group metadata retain unknown development scope. Only packages resolved from the canonical PyPI index are enriched; Git, URL, path, directory, editable, file, and alternate-registry coordinates remain visible without being sent to PyPI or OSV as registry packages.
 
 `requirements.txt` follows separated `-r` and `--requirement` includes relative to the file containing the directive. The root file and every include must be regular, non-symlink files within the canonical scan root. Expansion is limited to 32 levels, 256 file reads, and 8 MiB of cumulative input.
@@ -80,7 +82,7 @@ SOURCE_DATE_EPOCH=1700000000 depscan scan . --format json --output depscan.json
 
 In that mode, equivalent scan results have canonical package, vulnerability, alias, fix, reference, suppression, and error ordering. An invalid or out-of-range epoch is a configuration error and exits with code `10`.
 
-The current JSON report schema is version `3`. Version `1` represented `results[].suppressed` as advisory-ID strings; version `2` replaced those strings with audit objects containing the complete vulnerability, whether the suppression was active, and every matching rule's ID/alias, CLI/config source, reason, expiry, and active/expired state. Version `3` adds `results[].package.direct_known` and `dev_known` so unknown classifications are no longer serialized as apparent facts. Consumers must branch on `schema_version`. Only matching suppression fields are emitted—other configuration values are never copied into a report.
+The current JSON report schema is version `4`. Version `1` represented `results[].suppressed` as advisory-ID strings; version `2` replaced those strings with audit objects containing the complete vulnerability, whether the suppression was active, and every matching rule's ID/alias, CLI/config source, reason, expiry, and active/expired state. Version `3` adds `results[].package.direct_known` and `dev_known` so unknown classifications are no longer serialized as apparent facts. Version `4` adds `results[].package.manifest_constraint`, retaining both its source spelling (`raw`) and registry-standard evaluator form (`normalized`). Consumers must branch on `schema_version`. Only matching suppression and manifest-constraint fields are emitted—other configuration values are never copied into a report.
 
 | Exit code | Meaning |
 |---:|---|
@@ -169,7 +171,7 @@ cargo test --workspace --all-targets
 
 ## Known v0.1 limitations
 
-The implementation does not execute package-manager binaries automatically. `bun.lockb` is recognized but requires a textual `bun.lock` for parsing at present. The latest-version provider does not yet resolve semver/PEP 440 ranges to a range-constrained latest release; manifest-only results are identified as range-derived. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
+The implementation does not execute package-manager binaries automatically. `bun.lockb` is recognized but requires a textual `bun.lock` for parsing at present. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
 
 ## License
 

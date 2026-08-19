@@ -1363,7 +1363,7 @@ fn parse_package_json_manifest(path: &Path) -> Result<Vec<Package>, ParseError> 
                     let mut p = Package::new(Ecosystem::Npm, name, range, path.to_path_buf());
                     p.direct = true;
                     p.dev = key == "devDependencies";
-                    p.resolved_from_range = true;
+                    p.set_manifest_constraint(range);
                     out.push(p);
                 }
             }
@@ -1529,7 +1529,7 @@ fn parse_pyproject(path: &Path) -> Result<Vec<Package>, ParseError> {
                 path.to_path_buf(),
             );
             p.direct = true;
-            p.resolved_from_range = true;
+            p.set_manifest_constraint(spec[name.len()..].trim());
             out.push(p);
         }
     }
@@ -2184,16 +2184,8 @@ fn package_from_manifest(name: String, version: String, source: &Path, dev: bool
     );
     package.direct = true;
     package.dev = dev;
-    package.resolved_from_range = nuget_version_needs_resolution(&version);
+    package.set_manifest_constraint(version);
     package
-}
-
-fn nuget_version_needs_resolution(version: &str) -> bool {
-    let version = version.trim();
-    version.contains('*')
-        || version.contains("$(")
-        || version.starts_with('[')
-        || version.starts_with('(')
 }
 
 fn parse_nuget_project(path: &Path) -> Result<Vec<Package>, ParseError> {
@@ -2292,12 +2284,15 @@ fn parse_packages_config(path: &Path) -> Result<Vec<Package>, ParseError> {
         .into_iter()
         .filter(|item| item.kind == NugetXmlItemKind::LegacyPackage)
         .map(|item| {
-            package_from_manifest(
+            let mut package = Package::new(
+                Ecosystem::NuGet,
                 item.name.expect("validated package name"),
                 item.version.expect("validated package version"),
-                path,
-                item.development_dependency,
-            )
+                path.to_path_buf(),
+            );
+            package.direct = true;
+            package.dev = item.development_dependency;
+            package
         })
         .collect();
     Ok(dedup(packages))
@@ -2975,7 +2970,8 @@ fn parse_cargo_toml(path: &Path) -> Result<Vec<Package>, ParseError> {
         package.direct = true;
         package.dev = declaration.dev;
         package.enrichable = declaration.dependency.enrichable;
-        package.resolved_from_range = true;
+        let constraint = package.version.clone();
+        package.set_manifest_constraint(constraint);
         let key = (package.key(), package.source_file.clone());
         packages
             .entry(key)
@@ -3252,6 +3248,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result[0].name, "serde");
+    }
+
+    #[test]
+    fn package_json_preserves_the_original_npm_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        fs::write(
+            &manifest,
+            r#"{"dependencies":{"range-package":"^1.2 || 3.x"}}"#,
+        )
+        .unwrap();
+
+        let packages = parse_package_json_manifest(&manifest).unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].version, "^1.2 || 3.x");
+        let constraint = packages[0].manifest_constraint.as_ref().unwrap();
+        assert_eq!(constraint.raw(), "^1.2 || 3.x");
+        assert_eq!(constraint.normalized(), constraint.raw());
     }
 
     #[test]

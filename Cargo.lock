@@ -437,6 +437,7 @@ version = "1.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "js-semver",
  "pep440_rs",
  "semver",
  "serde",
@@ -1126,6 +1127,12 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
+
+[[package]]
+name = "js-semver"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a86e374f16219dbd32d4044d3b27200c2064043e40f0e6d4aa7fa7b047c5958"
 
 [[package]]
 name = "js-sys"

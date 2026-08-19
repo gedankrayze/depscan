@@ -6,7 +6,8 @@ use cvss::Cvss;
 use depscan_core::{
     Ecosystem, LatestVersions, NuGetVersion, Package, ProviderError, Severity, VersionProvider,
     VulnMap, VulnProvider, Vulnerability, classify_staleness, compare_versions,
-    evaluate_osv_affected, normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
+    evaluate_osv_affected, latest_matching_version, normalize_name, pypi_version_is_prerelease,
+    pypi_version_is_stable,
 };
 use directories::{BaseDirs, ProjectDirs};
 use fs2::FileExt;
@@ -3085,15 +3086,37 @@ impl VersionProvider for RegistryClient {
     }
 }
 
-fn version_result(package: &Package, latest: String, yanked: bool) -> LatestVersions {
+fn matching_version<'a>(
+    package: &Package,
+    versions: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<String>, ProviderError> {
+    let Some(constraint) = package.manifest_constraint.as_ref() else {
+        if package.resolved_from_range {
+            return Err(ProviderError::InvalidResponse(format!(
+                "{} is marked range-derived but has no preserved manifest constraint",
+                package.display_name
+            )));
+        }
+        return Ok(None);
+    };
+    latest_matching_version(package.ecosystem, constraint.normalized(), versions)
+        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
+}
+
+fn version_result(
+    package: &Package,
+    latest: String,
+    latest_matching: Option<String>,
+    yanked: bool,
+) -> LatestVersions {
     let staleness = if package.resolved_from_range {
         depscan_core::Staleness::Unknown
     } else {
         classify_staleness(package.ecosystem, &package.version, &latest)
     };
     LatestVersions {
-        latest_stable: latest.clone(),
-        latest_matching: package.resolved_from_range.then_some(latest),
+        latest_stable: latest,
+        latest_matching,
         staleness,
         yanked,
     }
@@ -3111,7 +3134,21 @@ fn npm_version_result(package: &Package, data: &Value) -> Result<LatestVersions,
             ))
         })?
         .to_owned();
-    Ok(version_result(package, latest, false))
+    let matching = if package.manifest_constraint.is_some() {
+        let versions = data
+            .get("versions")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "npm response lacked release versions for manifest-only package {}",
+                    package.name
+                ))
+            })?;
+        matching_version(package, versions.keys().map(String::as_str))?
+    } else {
+        matching_version(package, std::iter::empty())?
+    };
+    Ok(version_result(package, latest, matching, false))
 }
 
 fn pypi_version_result(package: &Package, data: &Value) -> Result<LatestVersions, ProviderError> {
@@ -3127,21 +3164,32 @@ fn pypi_version_result(package: &Package, data: &Value) -> Result<LatestVersions
     let yanked = releases
         .get(&package.version)
         .is_some_and(pypi_release_is_yanked);
-    Ok(version_result(package, latest, yanked))
+    let matching = matching_version(
+        package,
+        releases
+            .iter()
+            .filter(|(_, files)| !pypi_release_is_yanked(files))
+            .map(|(version, _)| version.as_str()),
+    )?;
+    Ok(version_result(package, latest, matching, yanked))
 }
 
 fn nuget_version_result(package: &Package, data: &Value) -> Result<LatestVersions, ProviderError> {
-    let latest = select_nuget_release(
-        data.get("versions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str),
-    )
-    .ok_or_else(|| {
-        ProviderError::InvalidResponse(format!("NuGet has no stable version for {}", package.name))
-    })?;
-    Ok(version_result(package, latest, false))
+    let versions = data
+        .get("versions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse("NuGet response lacked versions".to_owned())
+        })?;
+    let latest =
+        select_nuget_release(versions.iter().filter_map(Value::as_str)).ok_or_else(|| {
+            ProviderError::InvalidResponse(format!(
+                "NuGet has no stable version for {}",
+                package.name
+            ))
+        })?;
+    let matching = matching_version(package, versions.iter().filter_map(Value::as_str))?;
+    Ok(version_result(package, latest, matching, false))
 }
 
 fn crates_version_result(
@@ -3149,13 +3197,17 @@ fn crates_version_result(
     entries: &[CratesIndexEntry],
 ) -> Result<LatestVersions, ProviderError> {
     let mut all: Vec<&str> = Vec::new();
+    let mut matchable: Vec<&str> = Vec::new();
     let mut yanked = false;
     for entry in entries {
         if entry.vers == package.version {
             yanked = entry.yanked;
         }
-        if !entry.yanked && !is_prerelease(Ecosystem::CratesIo, &entry.vers) {
-            all.push(&entry.vers);
+        if !entry.yanked {
+            matchable.push(&entry.vers);
+            if !is_prerelease(Ecosystem::CratesIo, &entry.vers) {
+                all.push(&entry.vers);
+            }
         }
     }
     let latest = maximum_version(Ecosystem::CratesIo, all).ok_or_else(|| {
@@ -3164,7 +3216,8 @@ fn crates_version_result(
             package.name
         ))
     })?;
-    Ok(version_result(package, latest, yanked))
+    let matching = matching_version(package, matchable)?;
+    Ok(version_result(package, latest, matching, yanked))
 }
 fn maximum_version<'a>(
     eco: Ecosystem,
@@ -5404,6 +5457,93 @@ mod tests {
             "1.0.0",
             PathBuf::from("Cargo.lock"),
         )
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RegistryRangeFixture {
+        ecosystem: String,
+        package: String,
+        constraint: String,
+        cache_key: String,
+        registry: Value,
+        latest_stable: String,
+        latest_matching: String,
+    }
+
+    fn registry_range_fixtures() -> Vec<RegistryRangeFixture> {
+        serde_json::from_str(include_str!("../tests/fixtures/registry-ranges.json")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_fixtures_keep_unconstrained_and_matching_latest_distinct() {
+        for fixture in registry_range_fixtures() {
+            let ecosystem = Ecosystem::from_cli(&fixture.ecosystem).unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache = Cache {
+                root: cache_dir.path().to_path_buf(),
+                policy: CachePolicy::default(),
+            };
+            cache
+                .put("registry", &fixture.cache_key, &fixture.registry, None)
+                .unwrap();
+            let client = RegistryClient::new(HttpClient::new().unwrap(), cache);
+            let mut package = Package::new(
+                ecosystem,
+                &fixture.package,
+                &fixture.constraint,
+                PathBuf::from("manifest.fixture"),
+            );
+            package.set_manifest_constraint(&fixture.constraint);
+
+            let latest = client.latest(&package).await.unwrap();
+
+            assert_eq!(
+                latest.latest_stable, fixture.latest_stable,
+                "wrong stable release for {}",
+                fixture.package
+            );
+            assert_eq!(
+                latest.latest_matching.as_deref(),
+                Some(fixture.latest_matching.as_str()),
+                "wrong constrained release for {}",
+                fixture.package
+            );
+            assert_ne!(latest.latest_stable, fixture.latest_matching);
+            assert_eq!(latest.staleness, depscan_core::Staleness::Unknown);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_manifest_constraint_is_a_visible_provider_error() {
+        let fixture = registry_range_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.ecosystem == "npm")
+            .unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put("registry", &fixture.cache_key, &fixture.registry, None)
+            .unwrap();
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache);
+        let mut package = Package::new(
+            Ecosystem::Npm,
+            &fixture.package,
+            "workspace:*",
+            PathBuf::from("package.json"),
+        );
+        package.set_manifest_constraint("workspace:*");
+
+        let error = client.latest(&package).await.unwrap_err();
+
+        assert!(error.to_string().contains("workspace:*"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid npm manifest constraint")
+        );
     }
 
     fn assert_invalid_crates_name(name: &str) {
