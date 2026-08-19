@@ -1,0 +1,18 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="Central.Shared" Version="1.2.3" />
+    <PackageVersion Include="Central.Nested">
+      <Version>2.3.4</Version>
+    </PackageVersion>
+    <PackageVersion Include="Central.Range" Version="[3.0.0,4.0.0)" />
+    <PackageVersion Include="Override.Me" Version="4.0.0" />
+    <PackageVersion Include="Updated.Central" Version="0.1.0" />
+    <PackageVersion Update="Updated.Central">
+      <Version>0.2.0</Version>
+    </PackageVersion>
+    <PackageVersion Include="Unused.Central" Version="99.0.0" />
+  </ItemGroup>
+</Project>

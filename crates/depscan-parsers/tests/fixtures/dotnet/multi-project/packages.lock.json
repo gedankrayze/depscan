@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Root.Locked": {
+        "type": "Direct",
+        "requested": "[16.0.0, )",
+        "resolved": "16.0.1"
+      }
+    }
+  }
+}

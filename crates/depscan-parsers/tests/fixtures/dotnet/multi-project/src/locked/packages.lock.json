@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net8.0": {
+      "Locked.Direct": {
+        "type": "Direct",
+        "requested": "[1.0.0, )",
+        "resolved": "1.0.1"
+      },
+      "Locked.Transitive": {
+        "type": "Transitive",
+        "resolved": "2.0.0"
+      },
+      "Workspace.Project": {
+        "type": "Project",
+        "dependencies": {
+          "Locked.Transitive": "2.0.0"
+        }
+      }
+    },
+    "net9.0": {
+      "Locked.Direct": {
+        "type": "Direct",
+        "requested": "[1.0.0, )",
+        "resolved": "1.0.1"
+      },
+      "Locked.CentralPinned": {
+        "type": "CentralTransitive",
+        "requested": "[3.0.0, )",
+        "resolved": "3.0.0"
+      },
+      "Locked.FourPart": {
+        "type": "Transitive",
+        "resolved": "4.0.0.5"
+      }
+    }
+  }
+}

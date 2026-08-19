@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Central.Shared" />
+    <PackageReference Include="Override.Me" />
+    <PackageReference Update="Override.Me">
+      <VersionOverride>7.8.9</VersionOverride>
+    </PackageReference>
+    <PackageReference Include="Updated.Central" />
+  </ItemGroup>
+</Project>

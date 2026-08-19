@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Central.Shared" />
+    <PackageReference Include="Central.Nested" />
+    <PackageReference Include="Central.Range" />
+    <PackageReference Include="Override.Me" VersionOverride="4.5.6" />
+    <PackageReference Include="Inline.Attribute" Version="5.6.7" />
+    <PackageReference Include="Inline.Nested">
+      <Version>6.7.8</Version>
+    </PackageReference>
+  </ItemGroup>
+</Project>

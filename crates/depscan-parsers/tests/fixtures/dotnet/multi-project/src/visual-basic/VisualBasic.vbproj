@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Central.Shared" />
+    <PackageReference Include="Child.Nested" />
+    <PackageReference Include="Floating.Central" />
+  </ItemGroup>
+</Project>

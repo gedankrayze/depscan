@@ -2,7 +2,9 @@
 
 use depscan_core::{DetectedSource, Ecosystem, EcosystemParser, Package, ParseError, SourceKind};
 use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::XmlVersion;
+use quick_xml::escape::unescape;
+use quick_xml::events::{BytesStart, Event};
 use serde_json::Value as Json;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -1474,98 +1476,765 @@ impl EcosystemParser for NugetParser {
         Ecosystem::NuGet
     }
     fn detect(&self, root: &Path) -> Vec<DetectedSource> {
-        if let Some(s) = source(root, "packages.lock.json", SourceKind::PackagesLock) {
-            return vec![s];
-        }
-        let projects = sorted_project_files(root, &["csproj", "fsproj", "vbproj"]);
-        if let Some(path) = projects.into_iter().next() {
-            return vec![DetectedSource {
+        let files = sorted_dotnet_files(root);
+        let locks: HashSet<_> = files
+            .iter()
+            .filter(|path| is_nuget_lock_file(path))
+            .cloned()
+            .collect();
+        let mut sources: Vec<_> = locks
+            .iter()
+            .cloned()
+            .map(|path| DetectedSource {
                 path,
-                kind: SourceKind::ProjectFile,
-            }];
+                kind: SourceKind::PackagesLock,
+            })
+            .collect();
+
+        for path in files.iter().filter(|path| is_dotnet_project(path)) {
+            if project_lock_file(path).is_none_or(|lock| !locks.contains(&lock)) {
+                sources.push(DetectedSource {
+                    path: path.clone(),
+                    kind: SourceKind::ProjectFile,
+                });
+            }
         }
-        source(root, "packages.config", SourceKind::PackagesConfig)
-            .into_iter()
-            .collect()
+
+        for path in files.iter().filter(|path| is_packages_config(path)) {
+            let covered_by_lock = path
+                .parent()
+                .is_some_and(|directory| directory.join("packages.lock.json").is_file());
+            if !covered_by_lock {
+                sources.push(DetectedSource {
+                    path: path.clone(),
+                    kind: SourceKind::PackagesConfig,
+                });
+            }
+        }
+
+        sources.sort_by(|left, right| left.path.cmp(&right.path));
+        sources
     }
     fn parse(&self, source: &DetectedSource) -> Result<Vec<Package>, ParseError> {
         match source.kind {
             SourceKind::PackagesLock => parse_packages_lock(&source.path),
-            SourceKind::ProjectFile
-            | SourceKind::DirectoryPackagesProps
-            | SourceKind::PackagesConfig => parse_xml_packages(&source.path),
+            SourceKind::ProjectFile => parse_nuget_project(&source.path),
+            SourceKind::DirectoryPackagesProps => parse_directory_packages_props(&source.path),
+            SourceKind::PackagesConfig => parse_packages_config(&source.path),
             _ => Err(invalid(&source.path, "unexpected source kind")),
         }
     }
 }
+
+fn sorted_dotnet_files(root: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | ".vs" | "bin" | "node_modules" | "obj" | "target" | ".venv")
+            )
+        })
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && (is_dotnet_project(entry.path())
+                    || is_nuget_lock_file(entry.path())
+                    || is_packages_config(entry.path()))
+        })
+        .map(|entry| entry.into_path())
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn is_dotnet_project(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["csproj", "fsproj", "vbproj"]
+                .iter()
+                .any(|expected| extension.eq_ignore_ascii_case(expected))
+        })
+}
+
+fn is_nuget_lock_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    file_name == "packages.lock.json"
+        || (file_name.starts_with("packages.") && file_name.ends_with(".lock.json"))
+}
+
+fn is_packages_config(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("packages.config")
+}
+
+fn project_lock_file(project: &Path) -> Option<PathBuf> {
+    let directory = project.parent()?;
+    if let Some(stem) = project.file_stem().and_then(|stem| stem.to_str()) {
+        let project_specific = directory.join(format!("packages.{stem}.lock.json"));
+        if project_specific.is_file() {
+            return Some(project_specific);
+        }
+    }
+    let default = directory.join("packages.lock.json");
+    default.is_file().then_some(default)
+}
+
 fn parse_packages_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
+    let document = value
+        .as_object()
+        .ok_or_else(|| invalid(path, "NuGet lockfile must be a JSON object"))?;
+    let version = document
+        .get("version")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| invalid(path, "NuGet lockfile is missing an integer version"))?;
+    if !(1..=3).contains(&version) {
+        return Err(invalid(
+            path,
+            format!("unsupported NuGet lockfile version {version}"),
+        ));
+    }
+    let frameworks = document
+        .get("dependencies")
+        .and_then(Json::as_object)
+        .ok_or_else(|| invalid(path, "NuGet lockfile dependencies must be an object"))?;
     let mut out = Vec::new();
-    if let Some(frameworks) = value.get("dependencies").and_then(Json::as_object) {
-        for framework in frameworks.values() {
-            if let Some(items) = framework.as_object() {
-                for (name, item) in items {
-                    if let Some(version) = item.get("resolved").and_then(Json::as_str) {
-                        let mut p =
-                            Package::new(Ecosystem::NuGet, name, version, path.to_path_buf());
-                        p.direct = item.get("type").and_then(Json::as_str) == Some("Direct");
-                        out.push(p);
-                    }
-                }
+    for (framework_name, framework) in frameworks {
+        let items = framework.as_object().ok_or_else(|| {
+            invalid(
+                path,
+                format!("NuGet framework {framework_name:?} must be an object"),
+            )
+        })?;
+        for (name, item) in items {
+            let item = item.as_object().ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("NuGet package {name:?} in {framework_name:?} must be an object"),
+                )
+            })?;
+            let dependency_type = item.get("type").and_then(Json::as_str).ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("NuGet package {name:?} in {framework_name:?} is missing type"),
+                )
+            })?;
+            if dependency_type.eq_ignore_ascii_case("Project") {
+                continue;
             }
+            let direct = if dependency_type.eq_ignore_ascii_case("Direct")
+                || dependency_type.eq_ignore_ascii_case("CentralTransitive")
+            {
+                true
+            } else if dependency_type.eq_ignore_ascii_case("Transitive") {
+                false
+            } else {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "NuGet package {name:?} in {framework_name:?} has unsupported type {dependency_type:?}"
+                    ),
+                ));
+            };
+            let resolved = item.get("resolved").and_then(Json::as_str).ok_or_else(|| {
+                invalid(
+                    path,
+                    format!(
+                        "NuGet package {name:?} in {framework_name:?} is missing resolved version"
+                    ),
+                )
+            })?;
+            if resolved.trim().is_empty() {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "NuGet package {name:?} in {framework_name:?} has an empty resolved version"
+                    ),
+                ));
+            }
+            let mut package = Package::new(Ecosystem::NuGet, name, resolved, path.to_path_buf());
+            package.direct = direct;
+            out.push(package);
         }
     }
     Ok(dedup(out))
 }
-fn parse_xml_packages(path: &Path) -> Result<Vec<Package>, ParseError> {
-    let content = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NugetXmlItemKind {
+    PackageReference,
+    PackageVersion,
+    GlobalPackageReference,
+    LegacyPackage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NugetXmlIdentityKind {
+    Include,
+    Update,
+    Id,
+}
+
+#[derive(Debug)]
+struct NugetXmlItem {
+    kind: NugetXmlItemKind,
+    identity_kind: Option<NugetXmlIdentityKind>,
+    name: Option<String>,
+    version: Option<String>,
+    version_override: Option<String>,
+    development_dependency: bool,
+    removed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NugetMetadataKind {
+    Version,
+    VersionOverride,
+    DevelopmentDependency,
+}
+
+#[derive(Debug)]
+struct CapturedMetadata {
+    kind: NugetMetadataKind,
+    depth: usize,
+    value: String,
+}
+
+#[derive(Debug)]
+struct OpenNugetXmlItem {
+    depth: usize,
+    item: NugetXmlItem,
+    captured: Option<CapturedMetadata>,
+}
+
+#[derive(Debug)]
+struct NugetXmlDocument {
+    root: String,
+    items: Vec<NugetXmlItem>,
+}
+
+#[derive(Debug, Clone)]
+struct CentralPackageVersion {
+    display_name: String,
+    version: String,
+}
+
+fn xml_local_name(bytes: &[u8]) -> Result<&str, String> {
+    let name = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    Ok(name.rsplit(':').next().unwrap_or(name))
+}
+
+fn nuget_item_kind(name: &str) -> Option<NugetXmlItemKind> {
+    if name.eq_ignore_ascii_case("PackageReference") {
+        Some(NugetXmlItemKind::PackageReference)
+    } else if name.eq_ignore_ascii_case("PackageVersion") {
+        Some(NugetXmlItemKind::PackageVersion)
+    } else if name.eq_ignore_ascii_case("GlobalPackageReference") {
+        Some(NugetXmlItemKind::GlobalPackageReference)
+    } else if name.eq_ignore_ascii_case("package") {
+        Some(NugetXmlItemKind::LegacyPackage)
+    } else {
+        None
+    }
+}
+
+fn nuget_metadata_kind(name: &str) -> Option<NugetMetadataKind> {
+    if name.eq_ignore_ascii_case("Version") {
+        Some(NugetMetadataKind::Version)
+    } else if name.eq_ignore_ascii_case("VersionOverride") {
+        Some(NugetMetadataKind::VersionOverride)
+    } else if name.eq_ignore_ascii_case("DevelopmentDependency") {
+        Some(NugetMetadataKind::DevelopmentDependency)
+    } else {
+        None
+    }
+}
+
+fn parse_nuget_xml_attributes(
+    path: &Path,
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+) -> Result<HashMap<String, String>, ParseError> {
+    let mut attributes = HashMap::new();
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| invalid(path, error))?;
+        let key = xml_local_name(attribute.key.as_ref()).map_err(|error| invalid(path, error))?;
+        let key = key.to_ascii_lowercase();
+        let value = attribute
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .map_err(|error| invalid(path, error))?
+            .into_owned();
+        if attributes.insert(key.clone(), value).is_some() {
+            return Err(invalid(path, format!("duplicated XML attribute {key:?}")));
+        }
+    }
+    Ok(attributes)
+}
+
+fn new_nuget_xml_item(
+    path: &Path,
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    kind: NugetXmlItemKind,
+) -> Result<NugetXmlItem, ParseError> {
+    let mut attributes = parse_nuget_xml_attributes(path, reader, element)?;
+    let identities: Vec<_> = ["include", "update", "id"]
+        .into_iter()
+        .filter_map(|key| attributes.remove(key).map(|value| (key, value)))
+        .collect();
+    if identities.len() > 1 {
+        return Err(invalid(
+            path,
+            "NuGet package item has more than one of Include, Update, and id",
+        ));
+    }
+    let identity = identities.into_iter().next();
+    let identity_kind = identity.as_ref().map(|(key, _)| match *key {
+        "include" => NugetXmlIdentityKind::Include,
+        "update" => NugetXmlIdentityKind::Update,
+        "id" => NugetXmlIdentityKind::Id,
+        _ => unreachable!("identity keys are statically constrained"),
+    });
+    let name = identity.map(|(_, value)| value);
+    let removed = attributes.contains_key("remove");
+    let development_dependency = attributes
+        .remove("developmentdependency")
+        .map(|value| parse_xml_bool(path, "developmentDependency", &value))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(NugetXmlItem {
+        kind,
+        identity_kind,
+        name,
+        version: attributes.remove("version"),
+        version_override: attributes.remove("versionoverride"),
+        development_dependency,
+        removed,
+    })
+}
+
+fn parse_xml_bool(path: &Path, field: &str, value: &str) -> Result<bool, ParseError> {
+    if value.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(invalid(
+            path,
+            format!("NuGet {field} must be true or false, got {value:?}"),
+        ))
+    }
+}
+
+fn append_xml_text(
+    path: &Path,
+    open: &mut Option<OpenNugetXmlItem>,
+    text: &str,
+) -> Result<(), ParseError> {
+    if let Some(captured) = open.as_mut().and_then(|open| open.captured.as_mut()) {
+        let text = unescape(text).map_err(|error| invalid(path, error))?;
+        captured.value.push_str(&text);
+    }
+    Ok(())
+}
+
+fn set_nuget_metadata(
+    path: &Path,
+    item: &mut NugetXmlItem,
+    kind: NugetMetadataKind,
+    value: String,
+) -> Result<(), ParseError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(invalid(path, "NuGet package metadata cannot be empty"));
+    }
+    match kind {
+        NugetMetadataKind::Version => {
+            if item.version.replace(value).is_some() {
+                return Err(invalid(
+                    path,
+                    "NuGet package item defines Version more than once",
+                ));
+            }
+        }
+        NugetMetadataKind::VersionOverride => {
+            if item.version_override.replace(value).is_some() {
+                return Err(invalid(
+                    path,
+                    "NuGet package item defines VersionOverride more than once",
+                ));
+            }
+        }
+        NugetMetadataKind::DevelopmentDependency => {
+            item.development_dependency = parse_xml_bool(path, "DevelopmentDependency", &value)?;
+        }
+    }
+    Ok(())
+}
+
+fn finish_nuget_xml_item(
+    path: &Path,
+    mut item: NugetXmlItem,
+) -> Result<Option<NugetXmlItem>, ParseError> {
+    if item.removed {
+        if item.name.is_some() {
+            return Err(invalid(
+                path,
+                "NuGet package item cannot combine Remove with Include, Update, or id",
+            ));
+        }
+        return Ok(None);
+    }
+    item.name = item.name.map(|name| name.trim().to_owned());
+    item.version = item.version.map(|version| version.trim().to_owned());
+    item.version_override = item
+        .version_override
+        .map(|version| version.trim().to_owned());
+    if item
+        .name
+        .as_deref()
+        .is_none_or(|name| name.trim().is_empty())
+    {
+        return Err(invalid(
+            path,
+            "NuGet package item is missing its package name",
+        ));
+    }
+    if item.version.as_deref().is_some_and(str::is_empty)
+        || item.version_override.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(invalid(path, "NuGet package version cannot be empty"));
+    }
+    if item.kind != NugetXmlItemKind::PackageReference
+        && item
+            .version_override
+            .as_ref()
+            .or(item.version.as_ref())
+            .is_none_or(|version| version.trim().is_empty())
+    {
+        return Err(invalid(
+            path,
+            "NuGet package item is missing its package version",
+        ));
+    }
+    Ok(Some(item))
+}
+
+fn parse_nuget_xml_document(path: &Path) -> Result<NugetXmlDocument, ParseError> {
+    let content = fs::read_to_string(path).map_err(|error| io_error(path, error))?;
     let mut reader = Reader::from_str(&content);
     reader.config_mut().trim_text(true);
-    let mut out = Vec::new();
+    let mut root = None;
+    let mut items = Vec::new();
+    let mut open: Option<OpenNugetXmlItem> = None;
+    let mut depth = 0_usize;
     let mut buf = Vec::new();
+
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if matches!(
-                    tag.as_str(),
-                    "PackageReference" | "PackageVersion" | "package"
-                ) {
-                    let mut name = None;
-                    let mut version = None;
-                    for attr in e.attributes() {
-                        let attr = attr.map_err(|error| invalid(path, error))?;
-                        let key = String::from_utf8_lossy(attr.key.as_ref());
-                        let val = String::from_utf8_lossy(&attr.value).to_string();
-                        match key.as_ref() {
-                            "Include" | "Update" | "id" => name = Some(val),
-                            "Version" | "version" => version = Some(val),
-                            _ => {}
-                        }
+            Ok(Event::Start(element)) => {
+                let qualified_name = element.name();
+                let name = xml_local_name(qualified_name.as_ref())
+                    .map_err(|error| invalid(path, error))?;
+                if depth == 0 {
+                    root = Some(name.to_owned());
+                }
+                if open
+                    .as_ref()
+                    .is_some_and(|open_item| open_item.captured.is_some())
+                {
+                    return Err(invalid(
+                        path,
+                        "NuGet package metadata cannot contain nested XML elements",
+                    ));
+                }
+                if let Some(kind) = nuget_item_kind(name) {
+                    if open.is_some() {
+                        return Err(invalid(path, "NuGet package items cannot be nested"));
                     }
-                    if let (Some(name), Some(version)) = (name, version) {
-                        let mut p = Package::new(
-                            Ecosystem::NuGet,
-                            name,
-                            version.clone(),
-                            path.to_path_buf(),
-                        );
-                        p.direct = true;
-                        p.resolved_from_range = version.contains('*')
-                            || version.starts_with('[')
-                            || version.starts_with('(');
-                        out.push(p);
+                    open = Some(OpenNugetXmlItem {
+                        depth,
+                        item: new_nuget_xml_item(path, &reader, &element, kind)?,
+                        captured: None,
+                    });
+                } else if let Some(kind) = nuget_metadata_kind(name)
+                    && let Some(open_item) = open.as_mut()
+                    && depth == open_item.depth + 1
+                {
+                    if open_item.captured.is_some() {
+                        return Err(invalid(path, "NuGet package metadata cannot be nested"));
+                    }
+                    open_item.captured = Some(CapturedMetadata {
+                        kind,
+                        depth,
+                        value: String::new(),
+                    });
+                    parse_nuget_xml_attributes(path, &reader, &element)?;
+                } else {
+                    parse_nuget_xml_attributes(path, &reader, &element)?;
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(element)) => {
+                let qualified_name = element.name();
+                let name = xml_local_name(qualified_name.as_ref())
+                    .map_err(|error| invalid(path, error))?;
+                if depth == 0 {
+                    root = Some(name.to_owned());
+                }
+                if open
+                    .as_ref()
+                    .is_some_and(|open_item| open_item.captured.is_some())
+                {
+                    return Err(invalid(
+                        path,
+                        "NuGet package metadata cannot contain nested XML elements",
+                    ));
+                }
+                if let Some(kind) = nuget_item_kind(name) {
+                    if open.is_some() {
+                        return Err(invalid(path, "NuGet package items cannot be nested"));
+                    }
+                    let item = new_nuget_xml_item(path, &reader, &element, kind)?;
+                    if let Some(item) = finish_nuget_xml_item(path, item)? {
+                        items.push(item);
+                    }
+                } else if nuget_metadata_kind(name).is_some()
+                    && open
+                        .as_ref()
+                        .is_some_and(|open_item| depth == open_item.depth + 1)
+                {
+                    return Err(invalid(path, "NuGet package metadata cannot be empty"));
+                } else {
+                    parse_nuget_xml_attributes(path, &reader, &element)?;
+                }
+            }
+            Ok(Event::Text(text)) => {
+                let text = text.xml10_content().map_err(|error| invalid(path, error))?;
+                append_xml_text(path, &mut open, &text)?;
+            }
+            Ok(Event::CData(text)) => {
+                let text = text.xml10_content().map_err(|error| invalid(path, error))?;
+                if let Some(captured) = open.as_mut().and_then(|open| open.captured.as_mut()) {
+                    captured.value.push_str(&text);
+                }
+            }
+            Ok(Event::End(element)) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid(path, "unexpected closing XML element"))?;
+                let qualified_name = element.name();
+                let name = xml_local_name(qualified_name.as_ref())
+                    .map_err(|error| invalid(path, error))?;
+                if let Some(open_item) = open.as_mut()
+                    && let Some(captured) = open_item.captured.as_ref()
+                    && depth == captured.depth
+                {
+                    if nuget_metadata_kind(name) != Some(captured.kind) {
+                        return Err(invalid(path, "mismatched NuGet package metadata"));
+                    }
+                    let captured = open_item.captured.take().expect("capture checked above");
+                    set_nuget_metadata(path, &mut open_item.item, captured.kind, captured.value)?;
+                }
+                if open
+                    .as_ref()
+                    .is_some_and(|open_item| depth == open_item.depth)
+                {
+                    let open_item = open.take().expect("open item checked above");
+                    if nuget_item_kind(name) != Some(open_item.item.kind) {
+                        return Err(invalid(path, "mismatched NuGet package item"));
+                    }
+                    if let Some(item) = finish_nuget_xml_item(path, open_item.item)? {
+                        items.push(item);
                     }
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => return Err(invalid(path, e)),
+            Err(error) => return Err(invalid(path, error)),
             _ => {}
         }
         buf.clear();
     }
-    Ok(dedup(out))
+
+    let root = root.ok_or_else(|| invalid(path, "NuGet XML document has no root element"))?;
+    Ok(NugetXmlDocument { root, items })
+}
+
+fn require_xml_root(path: &Path, actual: &str, expected: &str) -> Result<(), ParseError> {
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(invalid(
+            path,
+            format!("expected NuGet XML root {expected:?}, found {actual:?}"),
+        ))
+    }
+}
+
+fn nearest_directory_packages_props(project: &Path) -> Option<PathBuf> {
+    project.parent()?.ancestors().find_map(|directory| {
+        let candidate = directory.join("Directory.Packages.props");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn central_package_versions(
+    path: &Path,
+) -> Result<BTreeMap<String, CentralPackageVersion>, ParseError> {
+    let document = parse_nuget_xml_document(path)?;
+    require_xml_root(path, &document.root, "Project")?;
+    let mut versions = BTreeMap::new();
+    for item in document
+        .items
+        .into_iter()
+        .filter(|item| item.kind == NugetXmlItemKind::PackageVersion)
+    {
+        let display_name = item.name.expect("validated package name");
+        let version = item
+            .version_override
+            .or(item.version)
+            .expect("validated package version");
+        versions.insert(
+            display_name.to_ascii_lowercase(),
+            CentralPackageVersion {
+                display_name,
+                version,
+            },
+        );
+    }
+    Ok(versions)
+}
+
+fn package_from_manifest(name: String, version: String, source: &Path, dev: bool) -> Package {
+    let mut package = Package::new(
+        Ecosystem::NuGet,
+        name,
+        version.clone(),
+        source.to_path_buf(),
+    );
+    package.direct = true;
+    package.dev = dev;
+    package.resolved_from_range = nuget_version_needs_resolution(&version);
+    package
+}
+
+fn nuget_version_needs_resolution(version: &str) -> bool {
+    let version = version.trim();
+    version.contains('*')
+        || version.contains("$(")
+        || version.starts_with('[')
+        || version.starts_with('(')
+}
+
+fn parse_nuget_project(path: &Path) -> Result<Vec<Package>, ParseError> {
+    if let Some(lock) = project_lock_file(path) {
+        return parse_packages_lock(&lock);
+    }
+    let document = parse_nuget_xml_document(path)?;
+    require_xml_root(path, &document.root, "Project")?;
+    let central_path = nearest_directory_packages_props(path);
+    let central = central_path
+        .as_deref()
+        .map(central_package_versions)
+        .transpose()?
+        .unwrap_or_default();
+    let mut references: Vec<NugetXmlItem> = Vec::new();
+    for reference in document
+        .items
+        .into_iter()
+        .filter(|item| item.kind == NugetXmlItemKind::PackageReference)
+    {
+        if reference.identity_kind == Some(NugetXmlIdentityKind::Update) {
+            let normalized_name = reference
+                .name
+                .as_deref()
+                .expect("validated package name")
+                .to_ascii_lowercase();
+            let mut updated = false;
+            for existing in references.iter_mut().filter(|existing| {
+                existing
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_name))
+            }) {
+                if reference.version.is_some() {
+                    existing.version.clone_from(&reference.version);
+                }
+                if reference.version_override.is_some() {
+                    existing
+                        .version_override
+                        .clone_from(&reference.version_override);
+                }
+                existing.development_dependency |= reference.development_dependency;
+                updated = true;
+            }
+            if updated {
+                continue;
+            }
+        }
+        references.push(reference);
+    }
+
+    let mut packages = Vec::new();
+    for reference in references {
+        let display_name = reference.name.expect("validated package name");
+        let central_version = central.get(&display_name.to_ascii_lowercase());
+        let version = reference
+            .version_override
+            .or(reference.version)
+            .or_else(|| central_version.map(|central| central.version.clone()))
+            .ok_or_else(|| {
+                let props = central_path
+                    .as_ref()
+                    .map_or_else(|| "no Directory.Packages.props was found".to_owned(), |path| {
+                        format!("{} has no matching PackageVersion", path.display())
+                    });
+                invalid(
+                    path,
+                    format!(
+                        "PackageReference {display_name:?} has no inline, override, or central version ({props})"
+                    ),
+                )
+            })?;
+        let name = central_version.map_or(display_name, |central| central.display_name.clone());
+        packages.push(package_from_manifest(
+            name,
+            version,
+            path,
+            reference.development_dependency,
+        ));
+    }
+    Ok(dedup(packages))
+}
+
+fn parse_directory_packages_props(path: &Path) -> Result<Vec<Package>, ParseError> {
+    Ok(central_package_versions(path)?
+        .into_values()
+        .map(|central| package_from_manifest(central.display_name, central.version, path, false))
+        .collect())
+}
+
+fn parse_packages_config(path: &Path) -> Result<Vec<Package>, ParseError> {
+    let document = parse_nuget_xml_document(path)?;
+    require_xml_root(path, &document.root, "packages")?;
+    let packages = document
+        .items
+        .into_iter()
+        .filter(|item| item.kind == NugetXmlItemKind::LegacyPackage)
+        .map(|item| {
+            package_from_manifest(
+                item.name.expect("validated package name"),
+                item.version.expect("validated package version"),
+                path,
+                item.development_dependency,
+            )
+        })
+        .collect();
+    Ok(dedup(packages))
 }
 
 pub struct CargoParser;
@@ -2562,7 +3231,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = parse_xml_packages(&project).unwrap();
+        let result = parse_nuget_project(&project).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "newtonsoft.json");
@@ -2587,7 +3256,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = parse_xml_packages(&project).unwrap_err();
+        let error = parse_nuget_project(&project).unwrap_err();
 
         assert!(error.to_string().contains("duplicated attribute"));
     }
@@ -2611,7 +3280,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = parse_xml_packages(&project).unwrap();
+        let result = parse_nuget_project(&project).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].display_name, "Safe.Package");
