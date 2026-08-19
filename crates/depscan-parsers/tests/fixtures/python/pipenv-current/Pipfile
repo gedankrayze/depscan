@@ -1,0 +1,14 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+requests = { version = "*", extras = ["socks", "security"] }
+"Zope.Interface" = "==6.0"
+
+[dev-packages]
+Py_Test = { version = "*", extras = ["testing"] }
+
+[requires]
+python_version = "3.12"

@@ -1,6 +1,8 @@
 //! Offline, filesystem-only dependency parsers.
 
-use depscan_core::{DetectedSource, Ecosystem, EcosystemParser, Package, ParseError, SourceKind};
+use depscan_core::{
+    DetectedSource, Ecosystem, EcosystemParser, Package, ParseError, SourceKind, normalize_name,
+};
 use noyalib::policy::MaxScalarLength;
 use noyalib::{DuplicateKeyPolicy, MergeKeyPolicy, ParserConfig, Value as Yaml};
 use quick_xml::Reader;
@@ -1403,6 +1405,7 @@ impl EcosystemParser for PythonParser {
 fn parse_pipfile_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
+    let directness = pipfile_direct_dependencies(path);
     let mut out = Vec::new();
     for section in ["default", "develop"] {
         if let Some(map) = value.get(section).and_then(Json::as_object) {
@@ -1414,7 +1417,16 @@ fn parse_pipfile_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                         version.trim_start_matches("=="),
                         path.to_path_buf(),
                     );
-                    p.direct = true;
+                    match directness.for_lock_section(section) {
+                        Some(direct) => {
+                            p.direct = direct.contains(&p.name);
+                            p.direct_known = true;
+                        }
+                        None => {
+                            p.direct = false;
+                            p.direct_known = false;
+                        }
+                    }
                     p.dev = section == "develop";
                     out.push(p);
                 }
@@ -1422,6 +1434,60 @@ fn parse_pipfile_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
         }
     }
     Ok(dedup(out))
+}
+
+#[derive(Debug, Default)]
+struct PipfileDirectDependencies {
+    default: Option<HashSet<String>>,
+    develop: Option<HashSet<String>>,
+}
+
+impl PipfileDirectDependencies {
+    fn for_lock_section(&self, section: &str) -> Option<&HashSet<String>> {
+        match section {
+            "default" => self.default.as_ref(),
+            "develop" => self.develop.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+fn pipfile_direct_dependencies(lock_path: &Path) -> PipfileDirectDependencies {
+    let Some(path) = lock_path.parent().map(|parent| parent.join("Pipfile")) else {
+        return PipfileDirectDependencies::default();
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return PipfileDirectDependencies::default();
+    };
+    let Ok(value) = toml::from_str::<Toml>(&text) else {
+        return PipfileDirectDependencies::default();
+    };
+
+    let default = pipfile_section_names(&value, "packages");
+    let develop = pipfile_section_names(&value, "dev-packages");
+    if default.is_none() || develop.is_none() {
+        return PipfileDirectDependencies::default();
+    }
+    PipfileDirectDependencies { default, develop }
+}
+
+fn pipfile_section_names(value: &Toml, section: &str) -> Option<HashSet<String>> {
+    let root = value.as_table()?;
+    let Some(section_value) = root.get(section) else {
+        return Some(HashSet::new());
+    };
+    let dependencies = section_value.as_table()?;
+    dependencies
+        .iter()
+        .map(|(name, declaration)| {
+            if !matches!(declaration, Toml::String(_) | Toml::Table(_)) {
+                return None;
+            }
+            let base_name = name.split_once('[').map_or(name.as_str(), |(base, _)| base);
+            let normalized = normalize_name(Ecosystem::PyPI, base_name.trim());
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect()
 }
 fn parse_pyproject(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;

@@ -1,0 +1,38 @@
+{
+    "_meta": {
+        "hash": { "sha256": "fixture" },
+        "pipfile-spec": 6,
+        "requires": { "python_version": "3.12" },
+        "sources": [
+            {
+                "name": "pypi",
+                "url": "https://pypi.org/simple",
+                "verify_ssl": true
+            }
+        ]
+    },
+    "default": {
+        "requests": {
+            "hashes": ["sha256:fixture"],
+            "version": "==2.32.5"
+        },
+        "urllib3": {
+            "hashes": ["sha256:fixture"],
+            "version": "==2.5.0"
+        },
+        "zope-interface": {
+            "hashes": ["sha256:fixture"],
+            "version": "==6.0"
+        }
+    },
+    "develop": {
+        "iniconfig": {
+            "hashes": ["sha256:fixture"],
+            "version": "==2.1.0"
+        },
+        "py-test": {
+            "hashes": ["sha256:fixture"],
+            "version": "==8.4.1"
+        }
+    }
+}

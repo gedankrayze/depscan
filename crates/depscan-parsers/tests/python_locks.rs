@@ -62,6 +62,60 @@ fn parses_current_poetry_sources_manifest_directness_and_groups() {
 }
 
 #[test]
+fn pipfile_lock_joins_manifest_directness_by_normalized_name() {
+    let packages = parse("pipenv-current", "Pipfile.lock", SourceKind::PipfileLock);
+
+    assert_eq!(packages.len(), 5);
+    for (name, direct, dev) in [
+        ("requests", true, false),
+        ("urllib3", false, false),
+        ("zope-interface", true, false),
+        ("iniconfig", false, true),
+        ("py-test", true, true),
+    ] {
+        let package = packages
+            .iter()
+            .find(|package| package.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(package.direct, direct, "directness for {name}");
+        assert!(package.direct_known, "directness is known for {name}");
+        assert_eq!(package.dev, dev, "development scope for {name}");
+        assert!(package.dev_known, "development scope is known for {name}");
+        assert_eq!(
+            package.source_file,
+            fixture("pipenv-current", "Pipfile.lock")
+        );
+    }
+}
+
+#[test]
+fn pipfile_lock_keeps_directness_unknown_without_a_valid_manifest() {
+    for pipfile in [
+        None,
+        Some("[packages\nrequests = \"*\""),
+        Some("[packages]\nrequests = 7"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("Pipfile.lock");
+        fs::copy(fixture("pipenv-current", "Pipfile.lock"), &lock).unwrap();
+        if let Some(pipfile) = pipfile {
+            fs::write(directory.path().join("Pipfile"), pipfile).unwrap();
+        }
+
+        let packages = PythonParser
+            .parse(&DetectedSource {
+                path: lock,
+                kind: SourceKind::PipfileLock,
+            })
+            .unwrap();
+
+        assert!(packages.iter().all(|package| !package.direct));
+        assert!(packages.iter().all(|package| !package.direct_known));
+        assert!(packages.iter().all(|package| package.dev_known));
+    }
+}
+
+#[test]
 fn poetry_without_a_manifest_keeps_directness_unknown() {
     let directory = tempfile::tempdir().unwrap();
     let lock = directory.path().join("poetry.lock");
