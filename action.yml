@@ -1,0 +1,116 @@
+name: depscan dependency scan
+description: Run depscan with a checksum-verified release binary and typed scan options
+author: depscan contributors
+
+inputs:
+  version:
+    description: Exact depscan release tag to download
+    required: false
+    default: v1.1.0
+  binary:
+    description: Optional preinstalled depscan executable path; intended for local action testing
+    required: false
+    default: ""
+  path:
+    description: Project directory to scan
+    required: false
+    default: .
+  ecosystem:
+    description: Ecosystem filter (auto, npm, pypi, nuget, or cargo)
+    required: false
+    default: auto
+  format:
+    description: Report format (table, json, sarif, or summary)
+    required: false
+    default: sarif
+  output:
+    description: Report output path; use an empty value to write to stdout
+    required: false
+    default: depscan.sarif
+  fail-on:
+    description: Vulnerability threshold (critical, high, medium, low, any, or never)
+    required: false
+    default: high
+  fail-on-outdated:
+    description: Staleness threshold (major, minor, patch, or never)
+    required: false
+    default: never
+  offline:
+    description: Use only synced OSV dumps and acceptable cached registry data
+    required: false
+    default: "false"
+  no-cache:
+    description: Bypass reusable JSON cache reads while retaining normal cache writes
+    required: false
+    default: "false"
+  no-dev:
+    description: Exclude dependencies known to be development-only
+    required: false
+    default: "false"
+  direct-only:
+    description: Exclude dependencies known to be transitive
+    required: false
+    default: "false"
+  include-withdrawn:
+    description: Include withdrawn OSV advisories
+    required: false
+    default: "false"
+
+outputs:
+  report:
+    description: The configured report path, or an empty string when stdout is used
+    value: ${{ inputs.output }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install depscan on Unix
+      if: inputs.binary == '' && runner.os != 'Windows'
+      shell: bash
+      env:
+        DEPSCAN_ACTION_VERSION: ${{ inputs.version }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/github-action/install-depscan.sh"
+    - name: Install depscan on Windows
+      if: inputs.binary == '' && runner.os == 'Windows'
+      shell: pwsh
+      env:
+        DEPSCAN_ACTION_VERSION: ${{ inputs.version }}
+      run: '& "$env:GITHUB_ACTION_PATH/scripts/github-action/install-depscan.ps1"'
+    - name: Run depscan on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        DEPSCAN_ACTION_BINARY: ${{ inputs.binary }}
+        DEPSCAN_ACTION_PATH_INPUT: ${{ inputs.path }}
+        DEPSCAN_ACTION_ECOSYSTEM: ${{ inputs.ecosystem }}
+        DEPSCAN_ACTION_FORMAT: ${{ inputs.format }}
+        DEPSCAN_ACTION_OUTPUT: ${{ inputs.output }}
+        DEPSCAN_ACTION_FAIL_ON: ${{ inputs.fail-on }}
+        DEPSCAN_ACTION_FAIL_ON_OUTDATED: ${{ inputs.fail-on-outdated }}
+        DEPSCAN_ACTION_OFFLINE: ${{ inputs.offline }}
+        DEPSCAN_ACTION_NO_CACHE: ${{ inputs.no-cache }}
+        DEPSCAN_ACTION_NO_DEV: ${{ inputs.no-dev }}
+        DEPSCAN_ACTION_DIRECT_ONLY: ${{ inputs.direct-only }}
+        DEPSCAN_ACTION_INCLUDE_WITHDRAWN: ${{ inputs.include-withdrawn }}
+      run: node "$GITHUB_ACTION_PATH/scripts/github-action/run-depscan.mjs"
+    - name: Run depscan on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        DEPSCAN_ACTION_BINARY: ${{ inputs.binary }}
+        DEPSCAN_ACTION_PATH_INPUT: ${{ inputs.path }}
+        DEPSCAN_ACTION_ECOSYSTEM: ${{ inputs.ecosystem }}
+        DEPSCAN_ACTION_FORMAT: ${{ inputs.format }}
+        DEPSCAN_ACTION_OUTPUT: ${{ inputs.output }}
+        DEPSCAN_ACTION_FAIL_ON: ${{ inputs.fail-on }}
+        DEPSCAN_ACTION_FAIL_ON_OUTDATED: ${{ inputs.fail-on-outdated }}
+        DEPSCAN_ACTION_OFFLINE: ${{ inputs.offline }}
+        DEPSCAN_ACTION_NO_CACHE: ${{ inputs.no-cache }}
+        DEPSCAN_ACTION_NO_DEV: ${{ inputs.no-dev }}
+        DEPSCAN_ACTION_DIRECT_ONLY: ${{ inputs.direct-only }}
+        DEPSCAN_ACTION_INCLUDE_WITHDRAWN: ${{ inputs.include-withdrawn }}
+      run: node "$env:GITHUB_ACTION_PATH/scripts/github-action/run-depscan.mjs"
+
+branding:
+  icon: shield
+  color: purple

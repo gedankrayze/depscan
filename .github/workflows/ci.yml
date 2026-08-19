@@ -31,6 +31,63 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Build CLI
         run: cargo build --release --locked -p depscan-cli
+      - name: Verify composite-action metadata and invocation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/verify-github-action.sh
+      - name: Prepare the local composite-action smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          ACTION_CACHE: ${{ runner.temp }}/depscan-action-cache
+        run: |
+          python3 - "$ACTION_CACHE" <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import sys
+          import zipfile
+
+          root = pathlib.Path(sys.argv[1])
+          (root / "offline").mkdir(parents=True)
+          (root / ".depscan-cache.json").write_text(
+              json.dumps({"schema_version": 1, "owner": "depscan"}) + "\n",
+              encoding="utf-8",
+          )
+          with zipfile.ZipFile(
+              root / "offline" / "crates_io.zip",
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+          ):
+              pass
+          stamp = (
+              datetime.datetime.now(datetime.timezone.utc)
+              .replace(microsecond=0)
+              .isoformat()
+              .replace("+00:00", "Z")
+          )
+          (root / "offline" / "crates_io.synced-at").write_text(
+              stamp + "\n",
+              encoding="utf-8",
+          )
+          PY
+          echo "DEPSCAN_CACHE_DIR=$ACTION_CACHE" >> "$GITHUB_ENV"
+      - name: Run the checked-in composite action
+        if: runner.os == 'Linux'
+        uses: ./
+        with:
+          binary: target/release/depscan
+          path: fixtures/e2e/cargo
+          format: summary
+          output: ${{ runner.temp }}/depscan-action-summary.txt
+          fail-on: never
+          fail-on-outdated: never
+          offline: "true"
+      - name: Verify the composite-action report
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          grep -Eq '^depscan: [0-9]+ packages' "${{ runner.temp }}/depscan-action-summary.txt"
       - name: Dogfood an offline workspace self-scan
         run: cargo test --locked -p depscan-cli --test e2e_matrix offline_workspace_self_scan -- --exact --nocapture
 

@@ -100,6 +100,28 @@ A typical CI invocation uses SARIF output and fails only for high-or-higher vuln
 depscan scan . --format sarif --output depscan.sarif --fail-on high
 ```
 
+The repository also includes a thin composite GitHub Action. It downloads the archive for the runner's supported OS/architecture from an exact release tag, validates the paired SHA-256 record before extraction, and passes only typed inputs to the CLI—there is no free-form shell argument input:
+
+```yaml
+permissions:
+  contents: read
+
+steps:
+  - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+    with:
+      persist-credentials: false
+  - id: depscan
+    uses: gedankrayze/depscan@v1.1.0
+    with:
+      version: v1.1.0
+      path: .
+      format: sarif
+      output: depscan.sarif
+      fail-on: high
+```
+
+The `report` action output contains the configured report path. The action supports the five release runners listed above and fails closed on every other OS/architecture. It never enables `--allow-tools`; projects requiring Bun or dotnet execution must invoke the CLI explicitly after making that trust decision. Release-asset downloads are intentionally unauthenticated for the zero-auth public distribution model, so the current private repository must be made public before this path can work; retaining a private repository would require a separately reviewed authenticated GitHub API download path. The first public release still needs an end-to-end action run that downloads the real archive and verifies its checksum; the local CI smoke deliberately supplies the just-built binary so action input and invocation behavior are testable before publication.
+
 `--direct-only` removes packages confirmed to be transitive, and `--no-dev` removes packages confirmed to be development-only. When a lockfile cannot prove one of those classifications—for example, a Poetry lock without its sibling manifest—the package is retained. JSON reports distinguish that conservative result with `direct_known` and `dev_known`; the corresponding `direct` or `dev` value must only be interpreted when its `*_known` field is true.
 
 The supported report formats are `table`, `json`, `sarif`, and `summary`. When no format is specified, terminal output uses a table and redirected output uses a one-line summary. A file extension of `.json`, `.sarif`, `.txt`, or `.log` selects a matching format unless `--format` overrides it.

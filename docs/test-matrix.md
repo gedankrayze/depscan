@@ -50,7 +50,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | §7 cache, ETag, TTL, retries, limits and explicit tools | cache/revalidation/retry suites; capability-safe cache tests; `tool_fallbacks.rs`; implicit authorization denial process test |
 | §8 workspace crate boundaries and packageability | `cargo check/test/clippy --workspace --all-targets`; `cargo package --list`/`cargo package` evidence in DS-024 |
 | §9 required testing layers | parser, version, provider, deterministic E2E, ignored live, three-OS CI, MSRV, and dogfood rows in this document |
-| §10 M1-M5 functional milestones | workspace suite and E2E/provider matrices; M6 artifact publication remains release-gated by DS-045 rather than inferred from unit tests |
+| §10 M1-M6 functional milestones | workspace suite and E2E/provider matrices; `uses: ./` composite-action smoke; artifact publication and real action downloads remain release-gated by DS-045/DS-049 rather than inferred from unit tests |
 | §11 policy decisions | README/help snapshots protect best-effort `--no-dev` and MSRV policy; repository/release ownership remains in DS-001 and DS-045 |
 | Appendix A endpoint/auth/limit reference | native endpoint/header mock; OSV pagination/chunk tests; ignored live matrix |
 
@@ -161,6 +161,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-046 | `verify-static-linux.sh`, native musl artifact matrix, scratch-container offline smoke |
 | DS-047 | capability-relative sync race tests at acquisition, lock, cleanup, staging, archive/marker publication, rollback and error boundaries |
 | DS-048 | `secure_fs.rs` config/root/parent/final swap, symlink, atomic creation/replacement and permission-preservation tests plus CLI process checks |
+| DS-049 | `verify-github-action.sh`, typed argument-vector probes, and the Linux `uses: ./` CI smoke; real per-runner release download remains recorded in the issue |
 
 ## Platform and external evidence boundary
 

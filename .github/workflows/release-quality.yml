@@ -19,6 +19,8 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy --no-self-update
       - name: Verify release workflow pins and permissions
         run: scripts/verify-release-workflow.sh
+      - name: Verify composite-action metadata and invocation
+        run: bash scripts/verify-github-action.sh
       - name: Check formatting
         run: cargo +1.97.1 fmt --all -- --check
       - name: Test every target
