@@ -76,6 +76,101 @@ fn osv_query_body(packages: &[Package]) -> Value {
     })
 }
 
+fn invalid_osv_batch_response(message: impl Into<String>) -> ProviderError {
+    ProviderError::InvalidResponse(format!(
+        "OSV querybatch response is invalid: {}",
+        message.into()
+    ))
+}
+
+fn valid_osv_id(id: &str) -> bool {
+    let Some((database, entry)) = id.split_once('-') else {
+        return false;
+    };
+
+    let valid_component =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_');
+
+    !database.is_empty()
+        && !entry.is_empty()
+        && database.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && entry.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && database.bytes().all(valid_component)
+        && entry.bytes().all(valid_component)
+}
+
+fn parse_osv_query_batch_response(
+    response: &Value,
+    expected_results: usize,
+) -> Result<Vec<Vec<String>>, ProviderError> {
+    let object = response
+        .as_object()
+        .ok_or_else(|| invalid_osv_batch_response("the top-level value is not an object"))?;
+    let results = object
+        .get("results")
+        .ok_or_else(|| invalid_osv_batch_response("the required results field is missing"))?
+        .as_array()
+        .ok_or_else(|| invalid_osv_batch_response("the results field is not an array"))?;
+
+    if results.len() != expected_results {
+        return Err(invalid_osv_batch_response(format!(
+            "returned {} results for {expected_results} queries",
+            results.len()
+        )));
+    }
+
+    results
+        .iter()
+        .enumerate()
+        .map(|(result_index, result)| {
+            let result = result.as_object().ok_or_else(|| {
+                invalid_osv_batch_response(format!("result {result_index} is not an object"))
+            })?;
+            let Some(vulns) = result.get("vulns") else {
+                // OSV's protobuf JSON encoding represents a legitimate empty result as `{}`.
+                return if result.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Err(invalid_osv_batch_response(format!(
+                        "result {result_index} is non-empty but has no vulns field"
+                    )))
+                };
+            };
+            let vulns = vulns.as_array().ok_or_else(|| {
+                invalid_osv_batch_response(format!(
+                    "result {result_index} has a non-array vulns field"
+                ))
+            })?;
+
+            vulns
+                .iter()
+                .enumerate()
+                .map(|(vuln_index, vulnerability)| {
+                    let vulnerability = vulnerability.as_object().ok_or_else(|| {
+                        invalid_osv_batch_response(format!(
+                            "result {result_index} vulnerability {vuln_index} is not an object"
+                        ))
+                    })?;
+                    let id = vulnerability
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            invalid_osv_batch_response(format!(
+                                "result {result_index} vulnerability {vuln_index} has no string id"
+                            ))
+                        })?;
+                    if !valid_osv_id(id) {
+                        return Err(invalid_osv_batch_response(format!(
+                            "result {result_index} vulnerability {vuln_index} has an invalid id"
+                        )));
+                    }
+                    Ok(id.to_owned())
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn nuget_registry_cache_key(package: &Package) -> String {
     format!("nuget:{}", package.name)
 }
@@ -386,27 +481,7 @@ impl OsvClient {
         let body = osv_query_body(batch);
         let url = format!("{}/v1/querybatch", self.base_url);
         let response = self.http.post_json(&url, body).await?;
-        Ok(response
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|results| {
-                results
-                    .iter()
-                    .map(|r| {
-                        r.get("vulns")
-                            .and_then(Value::as_array)
-                            .map(|v| {
-                                v.iter()
-                                    .filter_map(|item| {
-                                        item.get("id").and_then(Value::as_str).map(str::to_owned)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        parse_osv_query_batch_response(&response, batch.len())
     }
     async fn hydrate(&self, id: &str) -> Result<Value, ProviderError> {
         if let Some((value, _)) = self.cache.get("osv/vuln", id, Duration::hours(24 * 3650)) {
@@ -1313,6 +1388,15 @@ mod tests {
         )
     }
 
+    fn npm_package(name: &str) -> Package {
+        Package::new(
+            Ecosystem::Npm,
+            name,
+            "1.0.0",
+            PathBuf::from("package-lock.json"),
+        )
+    }
+
     fn crates_package(name: &str) -> Package {
         Package::new(
             Ecosystem::CratesIo,
@@ -1890,6 +1974,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validates_osv_database_scoped_ids() {
+        for id in [
+            "OSV-2020-111",
+            "GHSA-vp9c-fpxx-744v",
+            "DEBIAN-CVE-2000-0001",
+            "x_CUSTOM-0001",
+        ] {
+            assert!(valid_osv_id(id), "expected {id:?} to be valid");
+        }
+        for id in [
+            "",
+            "unscoped",
+            "-missing-db",
+            "GHSA-",
+            "GHSA---",
+            "GHSA-not valid",
+        ] {
+            assert!(!valid_osv_id(id), "expected {id:?} to be invalid");
+        }
+    }
+
     #[tokio::test]
     async fn online_osv_query_uses_canonical_nuget_case() {
         let server = MockServer::start().await;
@@ -1924,6 +2030,184 @@ mod tests {
         let results = client.query_batch(&[package]).await.unwrap();
 
         assert_eq!(results, vec![vec!["GHSA-5crp-9r3c-p9vr".to_owned()]]);
+    }
+
+    #[tokio::test]
+    async fn malformed_osv_batch_responses_fail_closed_without_query_cache_entries() {
+        let cases = [
+            (
+                "non-object response",
+                json!([]),
+                1,
+                "top-level value is not an object",
+            ),
+            (
+                "missing results",
+                json!({}),
+                1,
+                "required results field is missing",
+            ),
+            (
+                "non-array results",
+                json!({"results": {}}),
+                1,
+                "results field is not an array",
+            ),
+            (
+                "too few results",
+                json!({"results": [{}]}),
+                2,
+                "returned 1 results for 2 queries",
+            ),
+            (
+                "too many results",
+                json!({"results": [{}, {}, {}]}),
+                2,
+                "returned 3 results for 2 queries",
+            ),
+            (
+                "non-object result",
+                json!({"results": [null]}),
+                1,
+                "result 0 is not an object",
+            ),
+            (
+                "non-empty result without vulns",
+                json!({"results": [{"unexpected": true}]}),
+                1,
+                "result 0 is non-empty but has no vulns field",
+            ),
+            (
+                "non-array vulns",
+                json!({"results": [{"vulns": {}}]}),
+                1,
+                "result 0 has a non-array vulns field",
+            ),
+            (
+                "non-object vulnerability",
+                json!({"results": [{"vulns": ["GHSA-5crp-9r3c-p9vr"]}]}),
+                1,
+                "vulnerability 0 is not an object",
+            ),
+            (
+                "missing vulnerability id",
+                json!({"results": [{"vulns": [{"modified": "2026-08-19T00:00:00Z"}]}]}),
+                1,
+                "vulnerability 0 has no string id",
+            ),
+            (
+                "non-string vulnerability id",
+                json!({"results": [{"vulns": [{"id": 42}]}]}),
+                1,
+                "vulnerability 0 has no string id",
+            ),
+            (
+                "malformed later result",
+                json!({"results": [
+                    {"vulns": []},
+                    {"vulns": [{"id": null}]}
+                ]}),
+                2,
+                "result 1 vulnerability 0 has no string id",
+            ),
+            (
+                "empty vulnerability id",
+                json!({"results": [{"vulns": [{"id": ""}]}]}),
+                1,
+                "vulnerability 0 has an invalid id",
+            ),
+            (
+                "unscoped vulnerability id",
+                json!({"results": [{"vulns": [{"id": "invalid"}]}]}),
+                1,
+                "vulnerability 0 has an invalid id",
+            ),
+            (
+                "whitespace vulnerability id",
+                json!({"results": [{"vulns": [{"id": "GHSA-not valid"}]}]}),
+                1,
+                "vulnerability 0 has an invalid id",
+            ),
+        ];
+
+        for (case, response, package_count, expected_message) in cases {
+            let server = MockServer::start().await;
+            let packages = (0..package_count)
+                .map(|index| npm_package(&format!("fixture-{case}-{index}")))
+                .collect::<Vec<_>>();
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_json(osv_query_body(&packages)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache = Cache {
+                root: cache_dir.path().to_path_buf(),
+                policy: CachePolicy::default(),
+            };
+            let client =
+                OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+            let error = client.query(&packages).await.unwrap_err();
+
+            match error {
+                ProviderError::InvalidResponse(message) => assert!(
+                    message.contains(expected_message),
+                    "{case}: expected {expected_message:?}, got {message:?}"
+                ),
+                other => panic!("{case}: expected InvalidResponse, got {other:?}"),
+            }
+            for package in &packages {
+                assert!(
+                    !cache
+                        .filename("osv/query", &osv_query_cache_key(package))
+                        .exists(),
+                    "{case}: malformed response created a query cache entry for {}",
+                    package.display_name
+                );
+            }
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_empty_osv_batch_results_preserve_alignment_and_are_cached() {
+        let server = MockServer::start().await;
+        let packages = vec![npm_package("empty-object"), npm_package("empty-array")];
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(&packages)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{}, {"vulns": []}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let results = client.query(&packages).await.unwrap();
+
+        assert_eq!(results.len(), packages.len());
+        for package in &packages {
+            assert!(results[&package.key()].is_empty());
+            let (cached, _) = cache
+                .get(
+                    "osv/query",
+                    &osv_query_cache_key(package),
+                    Duration::seconds(OSV_QUERY_TTL_SECS),
+                )
+                .unwrap();
+            assert_eq!(cached, json!([]));
+        }
+        server.verify().await;
     }
 
     #[test]
