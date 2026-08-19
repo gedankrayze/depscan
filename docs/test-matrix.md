@@ -41,7 +41,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | §3.3 NuGet locks/projects/central/legacy, identity and ordering | .NET rows below; NuGet version tests; NuGet E2E fixture; authorized tool-fallback tests |
 | §3.4 Cargo lock/manifest/workspace/source semantics | Cargo rows below; Cargo E2E fixture; workspace self-scan |
 | §3.5 ecosystem name/version normalization | core `normalizes_pypi_names`, `nuget_identity_is_case_insensitive_but_display_case_is_preserved`, SemVer/PEP 440/NuGet tables, and E2E normalized package assertions |
-| §4.1 OSV query, hydration, pagination, severity, withdrawn and fixed ranges | OSV provider matrix below; shared `fixtures/osv-range-cases.json`; withdrawal process/report tests |
+| §4.1 OSV query, hydration, pagination, severity, withdrawn and fixed ranges | OSV provider matrix below; shared `fixtures/osv-range-cases.json`; document-shape/cache/offline parity tests; withdrawal process/report tests |
 | §4.2 all native registries and request identity | `native_registry_http_mocks_cover_every_endpoint_and_header_contract`; malformed-document matrix; registry range fixtures; crates sparse-index tests |
 | §4.3 sync/offline dumps and cached freshness | offline dump validation/age/resource tests; sync streaming/rollback/race tests; offline process tests |
 | §5 complete CLI/config/filter/help surface | CLI unit merge tests plus `exit_codes.rs` typed-value, config, help, completion, filtering, and stream-contract process tests |
@@ -87,10 +87,10 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | Native registry success and exact headers/paths | `native_registry_http_mocks_cover_every_endpoint_and_header_contract` |
 | Native registry malformed responses | `native_registry_http_mocks_reject_malformed_documents_for_every_ecosystem`; crates NDJSON malformed/size matrix |
 | Retry budget, 429/5xx/connect/timeout, `Retry-After`, no final sleep | provider retry-status/date/JSON/bytes/transport tests and sync retry tests |
-| OSV batch alignment, 1,000-item chunks, pagination and hydration | `paginates_queries_independently_and_caches_complete_deduplicated_ids`; malformed batch matrix; partial query/hydration tests |
+| OSV batch alignment, 1,000-item chunks, pagination and hydration | `paginates_queries_independently_and_caches_complete_deduplicated_ids`; malformed batch/document matrices; query-hit affected-entry validation; partial query/hydration tests |
 | ETag/304/cache revalidation and racing writers | sparse and generic registry `stale_*`, `late_*`, changed/missing ETag tests; OSV revision/CAS tests |
 | Offline success, missing/stale/corrupt/future cache | `offline_registry_reuses_valid_cached_metadata_for_every_ecosystem`, `offline_registry_reports_cache_age_and_integrity_failures_without_network`, CLI offline tests |
-| Provider soft versus hard failure | report `soft_provider_errors_are_visible_in_every_report_format`; CLI `online_osv_partial_outage_is_visible_without_a_false_clean_cache_entry`, `online_osv_total_outage_exits_thirty` |
+| Provider soft versus hard failure | report `soft_provider_errors_are_visible_in_every_report_format`; CLI partial/total outage tests plus malformed cached OSV hard/soft process cases |
 | Resource bounds | streamed dump peak-memory test; dump entry/aggregate/count limits; sparse response/line limits; requirements depth/read/byte limits; tool timeout/output-limit tests |
 
 ## Process-level output and exit matrix
@@ -163,6 +163,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-048 | `secure_fs.rs` config/root/parent/final swap, symlink, atomic creation/replacement and permission-preservation tests plus CLI process checks |
 | DS-049 | `verify-github-action.sh`, typed argument-vector probes, and the Linux `uses: ./` CI smoke; real per-runner release download remains recorded in the issue |
 | DS-050 | online cached-registry and offline-dump manifest-to-OSV process tests, including exact/ranged constraints, shared-coordinate mapping, vulnerability exit `1`, and unresolved-cache errors |
+| DS-051 | consumed-field document validator, query-hit match/evaluability tests, hydration cache bypass/non-publication, offline shape parity, and CLI hard/soft malformed-record tests |
 | DS-052 | strict root/workspace manifest fallback fixtures plus unauthorized, missing-executable, provenance, and post-start hard-failure process tests |
 
 ## Platform and external evidence boundary

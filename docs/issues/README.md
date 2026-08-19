@@ -69,4 +69,5 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-048](DS-048.md) | P1 | In progress | Make configuration and report file access capability-safe |
 | [DS-049](DS-049.md) | P2 | In progress | Deliver the M6 composite GitHub Action |
 | [DS-050](DS-050.md) | P1 | Closed | Scan registry-resolved manifest dependencies for vulnerabilities |
+| [DS-051](DS-051.md) | P1 | Closed | Reject malformed OSV advisory shapes without false-clean results |
 | [DS-052](DS-052.md) | P1 | Closed | Degrade unavailable Bun binary-lock extraction to manifests |

@@ -1,5 +1,7 @@
 //! Network providers, disk cache, and OSV offline-dump support.
 
+mod osv_document;
+
 use async_trait::async_trait;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
@@ -17,6 +19,9 @@ use depscan_core::{
 use directories::{BaseDirs, ProjectDirs};
 use fs2::FileExt;
 use futures::{StreamExt, stream};
+use osv_document::{
+    ValidatedOsvDocument, affected_entry_is_evaluable, valid_osv_id, validate_osv_document,
+};
 use rand::RngExt;
 use reqwest::{
     Client, StatusCode,
@@ -136,22 +141,6 @@ fn invalid_osv_batch_response(message: impl Into<String>) -> ProviderError {
     ))
 }
 
-fn valid_osv_id(id: &str) -> bool {
-    let Some((database, entry)) = id.split_once('-') else {
-        return false;
-    };
-
-    let valid_component =
-        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_');
-
-    !database.is_empty()
-        && !entry.is_empty()
-        && database.bytes().any(|byte| byte.is_ascii_alphanumeric())
-        && entry.bytes().any(|byte| byte.is_ascii_alphanumeric())
-        && database.bytes().all(valid_component)
-        && entry.bytes().all(valid_component)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OsvVulnerabilityRevision {
@@ -187,44 +176,6 @@ fn canonical_osv_revisions(value: Value) -> Option<Vec<OsvVulnerabilityRevision>
             .map(|(id, modified)| OsvVulnerabilityRevision { id, modified })
             .collect(),
     )
-}
-
-fn osv_document_modified(doc: &Value, expected_id: &str) -> Result<DateTime<Utc>, ProviderError> {
-    let id = doc.get("id").and_then(Value::as_str).ok_or_else(|| {
-        ProviderError::InvalidResponse(format!(
-            "OSV hydration for {expected_id} returned no string id"
-        ))
-    })?;
-    if id != expected_id {
-        return Err(ProviderError::InvalidResponse(format!(
-            "OSV hydration for {expected_id} returned advisory {id}"
-        )));
-    }
-    let raw = doc.get("modified").and_then(Value::as_str).ok_or_else(|| {
-        ProviderError::InvalidResponse(format!(
-            "OSV hydration for {expected_id} returned no string modified timestamp"
-        ))
-    })?;
-    DateTime::parse_from_rfc3339(raw)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|_| {
-            ProviderError::InvalidResponse(format!(
-                "OSV hydration for {expected_id} returned an invalid modified timestamp"
-            ))
-        })
-}
-
-fn osv_affected_entries<'a>(
-    doc: &'a Value,
-    advisory_id: &str,
-) -> Result<&'a [Value], ProviderError> {
-    match doc.get("affected") {
-        None => Ok(&[]),
-        Some(Value::Array(affected)) => Ok(affected),
-        Some(_) => Err(ProviderError::InvalidResponse(format!(
-            "OSV advisory {advisory_id} has a non-array affected field"
-        ))),
-    }
 }
 
 fn parse_osv_modified(
@@ -1440,12 +1391,13 @@ impl OsvClient {
         etag: Option<String>,
         candidate_reusable: bool,
     ) -> Result<PublishedHydration, ProviderError> {
-        let candidate_modified = osv_document_modified(value, id)?;
+        let candidate_modified = validate_osv_document(value, Some(id))?.modified;
         let ttl = Duration::hours(24 * 3650);
         let mut generation = self.cache.snapshot("osv/vuln", cache_key, ttl);
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
             if let Some(current) = &generation
-                && let Ok(current_modified) = osv_document_modified(&current.value, id)
+                && let Ok(current_modified) = validate_osv_document(&current.value, Some(id))
+                    .map(|document| document.modified)
                 && current_modified >= candidate_modified
             {
                 return Ok(PublishedHydration {
@@ -1483,8 +1435,8 @@ impl OsvClient {
             .cache
             .get("osv/vuln", &cache_key, Duration::hours(24 * 3650))
         {
-            match osv_document_modified(&value, &revision.id) {
-                Ok(modified) if modified >= revision.modified => {
+            match validate_osv_document(&value, Some(&revision.id)) {
+                Ok(document) if document.modified >= revision.modified => {
                     return Ok(HydratedDocument {
                         value,
                         cache_warning: None,
@@ -1508,8 +1460,7 @@ impl OsvClient {
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let url = format!("{}/v1/vulns/{}", self.base_url, revision.id);
         let (value, etag) = self.http.get_json(&url, HeaderMap::new()).await?;
-        let actual_modified = osv_document_modified(&value, &revision.id)?;
-        osv_affected_entries(&value, &revision.id)?;
+        let actual_modified = validate_osv_document(&value, Some(&revision.id))?.modified;
         if actual_modified < revision.modified {
             return Err(ProviderError::InvalidResponse(format!(
                 "OSV hydration for {} is older than query revision {}",
@@ -1830,7 +1781,7 @@ impl VulnProvider for OsvClient {
                         error.clone(),
                     );
                 }
-                match vulnerability_from_osv(&document.value, Some(package)) {
+                match vulnerability_from_osv_query_hit(&document.value, package) {
                     Ok(Some(vulnerability)) => {
                         successful_evaluations += 1;
                         evaluated.push(vulnerability);
@@ -1869,19 +1820,65 @@ impl VulnProvider for OsvClient {
     }
 }
 
+#[cfg(test)]
 fn vulnerability_from_osv(
     doc: &Value,
     package: Option<&Package>,
 ) -> Result<Option<Vulnerability>, ProviderError> {
+    vulnerability_from_osv_with_match_policy(doc, package, false)
+}
+
+fn vulnerability_from_osv_query_hit(
+    doc: &Value,
+    package: &Package,
+) -> Result<Option<Vulnerability>, ProviderError> {
+    vulnerability_from_osv_with_match_policy(doc, Some(package), true)
+}
+
+fn vulnerability_from_osv_with_match_policy(
+    doc: &Value,
+    package: Option<&Package>,
+    require_matching_affected: bool,
+) -> Result<Option<Vulnerability>, ProviderError> {
+    let document = validate_osv_document(doc, None)?;
+    vulnerability_from_validated_osv(doc, &document, package, require_matching_affected)
+}
+
+fn vulnerability_from_validated_osv(
+    doc: &Value,
+    document: &ValidatedOsvDocument<'_>,
+    package: Option<&Package>,
+    require_matching_affected: bool,
+) -> Result<Option<Vulnerability>, ProviderError> {
+    if let Some(package) = package {
+        let mut matching = document
+            .affected
+            .iter()
+            .filter(|affected| affected_matches_package(affected, package));
+        let first = matching.next();
+        let evaluable = first
+            .into_iter()
+            .chain(matching)
+            .any(affected_entry_is_evaluable);
+        if !evaluable && (require_matching_affected || first.is_some()) {
+            let source = if require_matching_affected {
+                "OSV query hit"
+            } else {
+                "OSV advisory"
+            };
+            return Err(ProviderError::InvalidResponse(format!(
+                "{source} {} has no matching evaluable affected entry for {} {}",
+                document.id, package.display_name, package.version
+            )));
+        }
+    }
     let score = osv_cvss_score(doc, package);
-    let advisory_id = doc.get("id").and_then(Value::as_str).unwrap_or("UNKNOWN");
-    let affected = osv_affected_entries(doc, advisory_id)?;
     let evaluation = package
         .map(|package| {
-            evaluate_osv_affected(package, affected).map_err(|error| {
+            evaluate_osv_affected(package, document.affected).map_err(|error| {
                 ProviderError::InvalidResponse(format!(
                     "OSV advisory {} cannot be evaluated for {} {}: {error}",
-                    advisory_id, package.display_name, package.version
+                    document.id, package.display_name, package.version
                 ))
             })
         })
@@ -1893,11 +1890,7 @@ fn vulnerability_from_osv(
         .map(|result| result.fixed_versions)
         .unwrap_or_default();
     Ok(Some(Vulnerability {
-        id: doc
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("UNKNOWN")
-            .to_owned(),
+        id: document.id.to_owned(),
         aliases: doc
             .get("aliases")
             .and_then(Value::as_array)
@@ -1926,7 +1919,7 @@ fn vulnerability_from_osv(
                     .collect()
             })
             .unwrap_or_default(),
-        withdrawn: doc.get("withdrawn").is_some(),
+        withdrawn: document.withdrawn,
     }))
 }
 
@@ -2240,15 +2233,19 @@ impl OsvOffline {
                 context,
                 self.limits,
                 true,
-                |entry_name, document| {
+                |entry_name, document, validated| {
                     for package in &scoped {
-                        if let Some(vulnerability) = vulnerability_from_osv(document, Some(package))
-                            .map_err(|error| {
-                                context.invalid(format_args!(
-                                    "entry {entry_name:?} cannot be evaluated: {error}"
-                                ))
-                            })?
-                        {
+                        if let Some(vulnerability) = vulnerability_from_validated_osv(
+                            document,
+                            validated,
+                            Some(package),
+                            false,
+                        )
+                        .map_err(|error| {
+                            context.invalid(format_args!(
+                                "entry {entry_name:?} cannot be evaluated: {error}"
+                            ))
+                        })? {
                             output.entry(package.key()).or_default().push(vulnerability);
                         }
                     }
@@ -2555,27 +2552,18 @@ impl HttpClient {
     }
 }
 
-fn validate_osv_dump_document(entry_name: &str, document: &Value) -> Result<(), String> {
-    let object = document
-        .as_object()
-        .ok_or_else(|| "top-level JSON value is not an object".to_owned())?;
-    let id = object
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "required field `id` is not a string".to_owned())?;
-    if !valid_osv_id(id) {
-        return Err("field `id` is not a valid OSV identifier".to_owned());
+fn validate_osv_dump_document<'a>(
+    entry_name: &str,
+    document: &'a Value,
+) -> Result<ValidatedOsvDocument<'a>, String> {
+    let validated = validate_osv_document(document, None).map_err(|error| error.to_string())?;
+    if entry_name != format!("{}.json", validated.id) {
+        return Err(format!(
+            "filename does not match advisory id {:?}",
+            validated.id
+        ));
     }
-    let modified = object
-        .get("modified")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "required field `modified` is not a string".to_owned())?;
-    DateTime::parse_from_rfc3339(modified)
-        .map_err(|error| format!("field `modified` is not an RFC 3339 timestamp: {error}"))?;
-    if entry_name != format!("{id}.json") {
-        return Err(format!("filename does not match advisory id {id:?}"));
-    }
-    Ok(())
+    Ok(validated)
 }
 
 fn visit_osv_dump_file<F>(
@@ -2586,7 +2574,7 @@ fn visit_osv_dump_file<F>(
     mut visit: F,
 ) -> Result<(), ProviderError>
 where
-    F: FnMut(&str, &Value) -> Result<(), ProviderError>,
+    F: for<'a> FnMut(&str, &'a Value, &ValidatedOsvDocument<'a>) -> Result<(), ProviderError>,
 {
     let compressed_bytes = file
         .metadata()
@@ -2663,12 +2651,12 @@ where
                 "entry {name:?} is not complete valid UTF-8 JSON: {error}"
             ))
         })?;
-        validate_osv_dump_document(&name, &document).map_err(|error| {
+        let validated = validate_osv_dump_document(&name, &document).map_err(|error| {
             context.invalid(format_args!(
                 "entry {name:?} is not an OSV document: {error}"
             ))
         })?;
-        visit(&name, &document)?;
+        visit(&name, &document, &validated)?;
         json_entries += 1;
     }
     if json_entries == 0 && !allow_empty {
@@ -2697,7 +2685,7 @@ fn validate_osv_dump_file(
         OsvDumpValidationContext::Sync(ecosystem),
         config.dump_limits(),
         false,
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     )
 }
 
@@ -4581,6 +4569,40 @@ mod tests {
         .unwrap()
     }
 
+    fn valid_osv_document_value(id: &str, package: &Package) -> Value {
+        json!({
+            "schema_version": "1.7.4",
+            "id": id,
+            "modified": TEST_OSV_MODIFIED,
+            "published": "2026-08-18T00:00:00Z",
+            "aliases": ["CVE-2026-1234"],
+            "related": ["TEST-RELATED-1"],
+            "upstream": ["TEST-UPSTREAM-1"],
+            "summary": "validated advisory",
+            "details": "validation fixture",
+            "severity": [{
+                "type": "CVSS_V3",
+                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                "source": "SELF"
+            }],
+            "affected": [{
+                "package": {
+                    "ecosystem": package.ecosystem.osv_name(),
+                    "name": osv_query_name(package),
+                    "purl": "pkg:generic/fixture@1.0.0"
+                },
+                "versions": [package.version],
+                "ecosystem_specific": {},
+                "database_specific": {}
+            }],
+            "references": [{
+                "type": "ADVISORY",
+                "url": "https://example.invalid/advisory"
+            }],
+            "database_specific": {}
+        })
+    }
+
     fn scan_offline_archive(
         archive_bytes: &[u8],
         limits: OsvDumpLimits,
@@ -4687,6 +4709,30 @@ mod tests {
                 "schema-invalid object",
                 archive_with_entry("TEST-SCHEMA.json", br#"{}"#),
                 "not an OSV document",
+            ),
+            (
+                "missing affected",
+                archive_with_entry(
+                    "TEST-MISSING-AFFECTED.json",
+                    br#"{"id":"TEST-MISSING-AFFECTED","modified":"2026-08-19T00:00:00Z"}"#,
+                ),
+                "affected must be a present array",
+            ),
+            (
+                "malformed package identity",
+                archive_with_entry(
+                    "TEST-MALFORMED-IDENTITY.json",
+                    br#"{"id":"TEST-MALFORMED-IDENTITY","modified":"2026-08-19T00:00:00Z","affected":[{"package":{"ecosystem":"npm"},"versions":["1.0.0"]}]}"#,
+                ),
+                "package.name must be a string",
+            ),
+            (
+                "null withdrawn",
+                archive_with_entry(
+                    "TEST-NULL-WITHDRAWN.json",
+                    br#"{"id":"TEST-NULL-WITHDRAWN","modified":"2026-08-19T00:00:00Z","withdrawn":null,"affected":[]}"#,
+                ),
+                "withdrawn must be an RFC 3339 string",
             ),
             (
                 "trailing data",
@@ -5655,7 +5701,9 @@ mod tests {
             )
             .unwrap();
         archive
-            .write_all(br#"{"id":"TEST-1","modified":"2026-08-19T00:00:00Z","details":""#)
+            .write_all(
+                br#"{"id":"TEST-1","modified":"2026-08-19T00:00:00Z","affected":[],"details":""#,
+            )
             .unwrap();
         archive.write_all(&vec![b'x'; payload_bytes]).unwrap();
         archive.write_all(br#""}"#).unwrap();
@@ -6969,8 +7017,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dump.zip");
         let config = test_sync_config("http://unused.test".to_owned());
-        let valid =
-            br#"{"id":"TEST-1","modified":"2026-08-19T00:00:00Z","details":"forward-compatible"}"#;
+        let valid = br#"{"id":"TEST-1","modified":"2026-08-19T00:00:00Z","details":"forward-compatible","affected":[]}"#;
 
         fs::write(&path, archive_with_entry("TEST-1.json", valid)).unwrap();
         validate_osv_dump(&path, Ecosystem::Npm, &config).unwrap();
@@ -7402,6 +7449,8 @@ mod tests {
         for (severity_type, vector, expected_score, expected_severity) in cases {
             let document = json!({
                 "id": "TEST-1",
+                "modified": TEST_OSV_MODIFIED,
+                "affected": [],
                 "severity": [{"type": severity_type, "score": vector}]
             });
             let vulnerability = vulnerability_from_osv(&document, None).unwrap().unwrap();
@@ -7483,6 +7532,8 @@ mod tests {
             PathBuf::from("Cargo.lock"),
         );
         let document = json!({
+            "id": "TEST-AFFECTED-SEVERITY",
+            "modified": TEST_OSV_MODIFIED,
             "affected": [
                 {
                     "package": {"ecosystem": "npm", "name": "quick-xml"},
@@ -7539,6 +7590,12 @@ mod tests {
         ];
 
         for document in cases {
+            let document = json!({
+                "id": "TEST-MALFORMED-SCORE",
+                "modified": TEST_OSV_MODIFIED,
+                "affected": [],
+                "severity": document["severity"].clone()
+            });
             let vulnerability = vulnerability_from_osv(&document, None).unwrap().unwrap();
             assert_eq!(vulnerability.cvss_score, None);
             assert_eq!(vulnerability.severity, None);
@@ -8616,12 +8673,14 @@ mod tests {
         let newer_document = json!({
             "id": id,
             "modified": "2026-08-20T00:00:00Z",
-            "summary": "newer alias document"
+            "summary": "newer alias document",
+            "affected": []
         });
         let older_document = json!({
             "id": id,
             "modified": "2026-08-19T00:00:00Z",
-            "summary": "late older document"
+            "summary": "late older document",
+            "affected": []
         });
         cache
             .put("osv/vuln", &requested.cache_key(), &newer_document, None)
@@ -8663,12 +8722,14 @@ mod tests {
         let cached_newer = json!({
             "id": id,
             "modified": "2026-08-20T00:00:00Z",
-            "summary": "cached representation"
+            "summary": "cached representation",
+            "affected": []
         });
         let network_candidate = json!({
             "id": id,
             "modified": "2026-08-19T00:00:00Z",
-            "summary": "network representation"
+            "summary": "network representation",
+            "affected": []
         });
         cache
             .put("osv/vuln", &revision.cache_key(), &cached_newer, None)
@@ -8704,7 +8765,8 @@ mod tests {
         let document = json!({
             "id": id,
             "modified": "2026-08-19T00:00:00Z",
-            "summary": "newer than querybatch"
+            "summary": "newer than querybatch",
+            "affected": []
         });
         Mock::given(method("GET"))
             .and(path(format!("/v1/vulns/{id}")))
@@ -8759,12 +8821,14 @@ mod tests {
         let network_document = json!({
             "id": id,
             "modified": "2026-08-19T00:00:00Z",
-            "summary": "fresh network representation"
+            "summary": "fresh network representation",
+            "affected": []
         });
         let cached_newer = json!({
             "id": id,
             "modified": "2026-08-20T00:00:00Z",
-            "summary": "newer cached representation"
+            "summary": "newer cached representation",
+            "affected": []
         });
         Mock::given(method("GET"))
             .and(path(format!("/v1/vulns/{id}")))
@@ -9490,7 +9554,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("non-array affected"));
+        assert!(
+            error
+                .to_string()
+                .contains("affected must be a present array")
+        );
         let revision = OsvVulnerabilityRevision {
             id: advisory.to_owned(),
             modified: test_timestamp(TEST_OSV_MODIFIED),
@@ -9500,12 +9568,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_security_fields_fail_hydration_without_entering_the_cache() {
+        let package = npm_package("malformed-security-fields");
+        let mut cases = Vec::new();
+
+        let mut document = valid_osv_document_value("TEST-MISSING-AFFECTED", &package);
+        document.as_object_mut().unwrap().remove("affected");
+        cases.push((
+            "TEST-MISSING-AFFECTED",
+            document,
+            "affected must be a present array",
+        ));
+
+        let mut document = valid_osv_document_value("TEST-MALFORMED-IDENTITY", &package);
+        document["affected"][0]["package"]["name"] = Value::Null;
+        cases.push((
+            "TEST-MALFORMED-IDENTITY",
+            document,
+            "package.name must be a string",
+        ));
+
+        for (id, value, expected) in [
+            ("TEST-NULL-WITHDRAWN", Value::Null, "RFC 3339 string"),
+            ("TEST-BOOL-WITHDRAWN", json!(false), "RFC 3339 string"),
+            (
+                "TEST-BAD-WITHDRAWN",
+                json!("not-a-timestamp"),
+                "valid RFC 3339 timestamp",
+            ),
+        ] {
+            let mut document = valid_osv_document_value(id, &package);
+            document["withdrawn"] = value;
+            cases.push((id, document, expected));
+        }
+
+        for (advisory, document, expected) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{"vulns": [osv_query_vulnerability(advisory)]}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{advisory}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(document))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache = Cache {
+                root: cache_dir.path().to_path_buf(),
+                policy: CachePolicy::default(),
+            };
+            let client =
+                OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+            let error = client
+                .query(std::slice::from_ref(&package))
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{advisory}: expected {expected:?}, got {error}"
+            );
+            let revision = OsvVulnerabilityRevision {
+                id: advisory.to_owned(),
+                modified: test_timestamp(TEST_OSV_MODIFIED),
+            };
+            assert!(
+                !cache.filename("osv/vuln", &revision.cache_key()).exists(),
+                "{advisory}: malformed hydration entered the cache"
+            );
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_hydration_cache_is_bypassed_and_replaced() {
+        let server = MockServer::start().await;
+        let package = npm_package("malformed-cached-advisory");
+        let advisory = "TEST-MALFORMED-CACHED-ADVISORY";
+        let revision = OsvVulnerabilityRevision {
+            id: advisory.to_owned(),
+            modified: test_timestamp(TEST_OSV_MODIFIED),
+        };
+        let mut malformed = valid_osv_document_value(advisory, &package);
+        malformed["withdrawn"] = Value::Null;
+        let valid = valid_osv_document_value(advisory, &package);
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{advisory}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&valid))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "osv/query",
+                &osv_query_cache_key(&package),
+                &serde_json::to_value(std::slice::from_ref(&revision)).unwrap(),
+                None,
+            )
+            .unwrap();
+        cache
+            .put("osv/vuln", &revision.cache_key(), &malformed, None)
+            .unwrap();
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let outcome = client.query(std::slice::from_ref(&package)).await.unwrap();
+
+        assert_eq!(outcome.vulnerabilities[&package.key()].len(), 1);
+        assert_eq!(outcome.vulnerabilities[&package.key()][0].id, advisory);
+        let cached = read_cache_entry(&cache, "osv/vuln", &revision.cache_key());
+        assert_eq!(cached.value, valid);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn query_hits_require_a_matching_evaluable_affected_entry() {
+        let package = npm_package("query-hit-shape");
+        let cases = [
+            ("TEST-EMPTY-AFFECTED", json!([])),
+            (
+                "TEST-WRONG-AFFECTED-IDENTITY",
+                json!([{
+                    "package": {"ecosystem": "npm", "name": "another-package"},
+                    "versions": ["1.0.0"]
+                }]),
+            ),
+            (
+                "TEST-NON-EVALUABLE-AFFECTED",
+                json!([{
+                    "package": {"ecosystem": "npm", "name": "query-hit-shape"},
+                    "versions": [],
+                    "ranges": []
+                }]),
+            ),
+        ];
+
+        for (advisory, affected) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{"vulns": [osv_query_vulnerability(advisory)]}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{advisory}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": advisory,
+                    "modified": TEST_OSV_MODIFIED,
+                    "affected": affected
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache = Cache {
+                root: cache_dir.path().to_path_buf(),
+                policy: CachePolicy::default(),
+            };
+            let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache, server.uri());
+
+            let error = client
+                .query(std::slice::from_ref(&package))
+                .await
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("no matching evaluable affected entry"),
+                "{advisory}: unexpected error {error}"
+            );
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
     async fn hydration_and_evaluation_failures_preserve_other_advisories() {
         let server = MockServer::start().await;
         let package = npm_package("partial-advisories");
         let hydration_failure = "TEST-HYDRATION-FAILURE";
         let evaluation_failure = "TEST-EVALUATION-FAILURE";
         let malformed_affected = "TEST-MALFORMED-AFFECTED-SOFT";
+        let mismatched_identity = "TEST-MISMATCHED-IDENTITY-SOFT";
+        let invalid_withdrawn = "TEST-INVALID-WITHDRAWN-SOFT";
         let valid = "TEST-VALID-ADVISORY";
         Mock::given(method("POST"))
             .and(path("/v1/querybatch"))
@@ -9515,8 +9784,37 @@ mod tests {
                     osv_query_vulnerability(hydration_failure),
                     osv_query_vulnerability(evaluation_failure),
                     osv_query_vulnerability(malformed_affected),
+                    osv_query_vulnerability(mismatched_identity),
+                    osv_query_vulnerability(invalid_withdrawn),
                     osv_query_vulnerability(valid)
                 ]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{mismatched_identity}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": mismatched_identity,
+                "modified": TEST_OSV_MODIFIED,
+                "affected": [{
+                    "package": {"ecosystem": "npm", "name": "another-package"},
+                    "versions": ["1.0.0"]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{invalid_withdrawn}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": invalid_withdrawn,
+                "modified": TEST_OSV_MODIFIED,
+                "withdrawn": null,
+                "affected": [{
+                    "package": {"ecosystem": "npm", "name": "partial-advisories"},
+                    "versions": ["1.0.0"]
+                }]
             })))
             .expect(1)
             .mount(&server)
@@ -9545,7 +9843,11 @@ mod tests {
                 "summary": "cannot evaluate a commit graph",
                 "affected": [{
                     "package": {"ecosystem": "npm", "name": "partial-advisories"},
-                    "ranges": [{"type": "GIT", "events": [{"introduced": "0"}]}]
+                    "ranges": [{
+                        "type": "GIT",
+                        "repo": "https://example.invalid/partial-advisories.git",
+                        "events": [{"introduced": "0"}]
+                    }]
                 }]
             })))
             .expect(1)
@@ -9590,6 +9892,12 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.contains(malformed_affected) && message.contains("hydration failed")
         }));
+        assert!(messages.iter().any(|message| {
+            message.contains(mismatched_identity) && message.contains("evaluation failed")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains(invalid_withdrawn) && message.contains("hydration failed")
+        }));
         let failed_revision = OsvVulnerabilityRevision {
             id: hydration_failure.to_owned(),
             modified: DateTime::parse_from_rfc3339(TEST_OSV_MODIFIED)
@@ -9608,6 +9916,15 @@ mod tests {
         assert!(
             !cache
                 .filename("osv/vuln", &malformed_revision.cache_key())
+                .exists()
+        );
+        let invalid_withdrawn_revision = OsvVulnerabilityRevision {
+            id: invalid_withdrawn.to_owned(),
+            modified: test_timestamp(TEST_OSV_MODIFIED),
+        };
+        assert!(
+            !cache
+                .filename("osv/vuln", &invalid_withdrawn_revision.cache_key())
                 .exists()
         );
         server.verify().await;
@@ -10000,24 +10317,37 @@ mod tests {
         );
 
         for (fixture, package) in fixtures.iter().zip(&packages) {
-            let hydrated_results = online.query(std::slice::from_ref(package)).await.unwrap();
-            let hydrated = hydrated_results.vulnerabilities[&package.key()]
-                .iter()
-                .map(|vulnerability| (vulnerability.id.clone(), vulnerability.fixed_in.clone()))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                !hydrated.is_empty(),
-                fixture.affected,
-                "fixture {:?} affected mismatch",
-                fixture.name
-            );
-            if let Some((_, fixed_in)) = hydrated.first() {
+            let hydrated_result = online.query(std::slice::from_ref(package)).await;
+            let hydrated = if fixture.name == "wrong package identity" {
+                let error = hydrated_result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("no matching evaluable affected entry"),
+                    "unexpected wrong-identity query error: {error}"
+                );
+                Vec::new()
+            } else {
+                let hydrated_results = hydrated_result.unwrap();
+                let hydrated = hydrated_results.vulnerabilities[&package.key()]
+                    .iter()
+                    .map(|vulnerability| (vulnerability.id.clone(), vulnerability.fixed_in.clone()))
+                    .collect::<Vec<_>>();
                 assert_eq!(
-                    fixed_in, &fixture.fixed_in,
-                    "fixture {:?} fixed versions mismatch",
+                    !hydrated.is_empty(),
+                    fixture.affected,
+                    "fixture {:?} affected mismatch",
                     fixture.name
                 );
-            }
+                if let Some((_, fixed_in)) = hydrated.first() {
+                    assert_eq!(
+                        fixed_in, &fixture.fixed_in,
+                        "fixture {:?} fixed versions mismatch",
+                        fixture.name
+                    );
+                }
+                hydrated
+            };
 
             let dir = tempfile::tempdir().unwrap();
             let cache = Cache::from_root(dir.path().join("cache"), CachePolicy::default()).unwrap();
@@ -10030,6 +10360,10 @@ mod tests {
                 .iter()
                 .map(|vulnerability| (vulnerability.id.clone(), vulnerability.fixed_in.clone()))
                 .collect::<Vec<_>>();
+            if fixture.name == "wrong package identity" {
+                assert!(offline.is_empty());
+                continue;
+            }
             assert_eq!(
                 offline, hydrated,
                 "hydrated/offline mismatch for fixture {:?}",
@@ -10042,6 +10376,7 @@ mod tests {
     fn unsupported_ranges_fail_visibly_online_and_offline() {
         let document = json!({
             "id": "TEST-UNSUPPORTED-GIT",
+            "modified": TEST_OSV_MODIFIED,
             "summary": "A package query cannot evaluate a commit graph",
             "affected": [{
                 "package": {"ecosystem": "npm", "name": "git-only"},
