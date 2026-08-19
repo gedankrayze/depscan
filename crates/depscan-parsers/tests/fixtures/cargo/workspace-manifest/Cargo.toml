@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["crates/excluded-example"]
+resolver = "3"
+
+[workspace.dependencies]
+serde-renamed = { package = "serde", version = "1.0" }
+workspace-dev = "2"
+workspace-build = { package = "cc", version = "1" }
+workspace-path = { package = "local-shared", version = "0.3", path = "shared" }
+workspace-git = { package = "git-real", version = "0.4", git = "https://example.invalid/git-real.git" }
+target-inherited = { package = "target-real", version = "6" }
+unused-template = { package = "unused-real", version = "99" }

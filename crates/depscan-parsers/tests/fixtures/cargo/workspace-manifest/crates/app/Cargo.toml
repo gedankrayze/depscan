@@ -1,0 +1,28 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+workspace = "../.."
+
+[dependencies]
+serde-renamed.workspace = true
+registry-renamed = { package = "real-crate", version = "^3" }
+workspace-path.workspace = true
+workspace-git.workspace = true
+local-only = { package = "local-only", path = "../../vendor/local-only" }
+git-only = { package = "git-only", git = "https://example.invalid/git-only.git" }
+
+[dev-dependencies]
+workspace-dev.workspace = true
+
+[build-dependencies]
+workspace-build.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+target-inherited.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+target-dev = "7"
+
+[target.wasm32-unknown-unknown.build-dependencies]
+target-build = { package = "target-build-real", version = "8" }

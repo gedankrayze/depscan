@@ -5,7 +5,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde_json::Value as Json;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
@@ -1105,36 +1105,618 @@ impl EcosystemParser for CargoParser {
         }
     }
 }
-fn cargo_direct_names(root: &Path) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for path in sorted_project_files(root, &["toml"])
-        .into_iter()
-        .filter(|p| p.file_name().and_then(|x| x.to_str()) == Some("Cargo.toml"))
-    {
-        if let Ok(text) = fs::read_to_string(path)
-            && let Ok(value) = toml::from_str::<Toml>(&text)
-        {
-            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-                if let Some(tbl) = value.get(section).and_then(Toml::as_table) {
-                    names.extend(tbl.keys().cloned());
-                }
+#[derive(Clone, Debug)]
+struct CargoDependencySpec {
+    package_name: String,
+    version: Option<String>,
+    enrichable: bool,
+    local_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct CargoDeclaration {
+    dependency: CargoDependencySpec,
+    declaring_manifest: PathBuf,
+    dev: bool,
+}
+
+#[derive(Debug)]
+struct CargoManifest {
+    path: PathBuf,
+    value: Toml,
+}
+
+fn read_cargo_manifest(path: &Path) -> Result<Toml, ParseError> {
+    let text = fs::read_to_string(path).map_err(|error| io_error(path, error))?;
+    toml::from_str(&text).map_err(|error| invalid(path, error))
+}
+
+fn dependency_field<'a>(
+    manifest: &Path,
+    alias: &str,
+    table: &'a toml::Table,
+    field: &str,
+) -> Result<Option<&'a str>, ParseError> {
+    table
+        .get(field)
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                invalid(
+                    manifest,
+                    format!("Cargo dependency {alias:?} field {field:?} must be a string"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn parse_cargo_dependency(
+    manifest: &Path,
+    alias: &str,
+    entry: &Toml,
+    workspace_dependencies: Option<&BTreeMap<String, CargoDependencySpec>>,
+) -> Result<CargoDependencySpec, ParseError> {
+    if alias.is_empty() {
+        return Err(invalid(manifest, "Cargo dependency name cannot be empty"));
+    }
+    if let Some(version) = entry.as_str() {
+        return Ok(CargoDependencySpec {
+            package_name: alias.to_owned(),
+            version: Some(version.to_owned()),
+            enrichable: true,
+            local_path: None,
+        });
+    }
+
+    let table = entry.as_table().ok_or_else(|| {
+        invalid(
+            manifest,
+            format!("Cargo dependency {alias:?} must be a string or table"),
+        )
+    })?;
+    let package = dependency_field(manifest, alias, table, "package")?;
+    if package.is_some_and(str::is_empty) {
+        return Err(invalid(
+            manifest,
+            format!("Cargo dependency {alias:?} field \"package\" cannot be empty"),
+        ));
+    }
+
+    if let Some(workspace) = table.get("workspace") {
+        if workspace.as_bool() != Some(true) {
+            return Err(invalid(
+                manifest,
+                format!("Cargo dependency {alias:?} field \"workspace\" must be true"),
+            ));
+        }
+        for forbidden in [
+            "version",
+            "path",
+            "git",
+            "branch",
+            "tag",
+            "rev",
+            "registry",
+            "registry-index",
+            "package",
+            "default-features",
+        ] {
+            if table.contains_key(forbidden) {
+                return Err(invalid(
+                    manifest,
+                    format!(
+                        "inherited Cargo dependency {alias:?} cannot override field {forbidden:?}"
+                    ),
+                ));
             }
-            if let Some(tbl) = value
-                .get("workspace")
-                .and_then(Toml::as_table)
-                .and_then(|x| x.get("dependencies"))
-                .and_then(Toml::as_table)
-            {
-                names.extend(tbl.keys().cloned());
+        }
+        return workspace_dependencies
+            .and_then(|dependencies| dependencies.get(alias))
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    manifest,
+                    format!(
+                        "Cargo dependency {alias:?} inherits from a missing [workspace.dependencies] entry"
+                    ),
+                )
+            });
+    }
+
+    let version = dependency_field(manifest, alias, table, "version")?.map(str::to_owned);
+    let path = dependency_field(manifest, alias, table, "path")?;
+    let git = dependency_field(manifest, alias, table, "git")?;
+    let registry = dependency_field(manifest, alias, table, "registry")?;
+    let registry_index = dependency_field(manifest, alias, table, "registry-index")?;
+    for selector in ["branch", "tag", "rev"] {
+        let value = dependency_field(manifest, alias, table, selector)?;
+        if value.is_some() && git.is_none() {
+            return Err(invalid(
+                manifest,
+                format!("Cargo dependency {alias:?} field {selector:?} requires a \"git\" source"),
+            ));
+        }
+    }
+    let source_count = [
+        path.is_some(),
+        git.is_some(),
+        registry.is_some() || registry_index.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if source_count > 1 || (registry.is_some() && registry_index.is_some()) {
+        return Err(invalid(
+            manifest,
+            format!("Cargo dependency {alias:?} declares conflicting sources"),
+        ));
+    }
+    if version.is_none() && path.is_none() && git.is_none() {
+        return Err(invalid(
+            manifest,
+            format!("Cargo dependency {alias:?} has no version, path, or git source"),
+        ));
+    }
+    let local_path = path.map(|dependency_path| {
+        manifest
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(dependency_path)
+    });
+    Ok(CargoDependencySpec {
+        package_name: package.unwrap_or(alias).to_owned(),
+        version,
+        enrichable: path.is_none()
+            && git.is_none()
+            && registry.is_none()
+            && registry_index.is_none(),
+        local_path,
+    })
+}
+
+fn cargo_dependency_tables(value: &Toml) -> Result<Vec<(&toml::Table, bool)>, String> {
+    let mut tables = Vec::new();
+    for (section, dev) in [
+        ("dependencies", false),
+        ("dev-dependencies", true),
+        ("build-dependencies", false),
+    ] {
+        if let Some(entry) = value.get(section) {
+            let table = entry
+                .as_table()
+                .ok_or_else(|| format!("Cargo section [{section}] must be a table"))?;
+            tables.push((table, dev));
+        }
+    }
+    if let Some(targets) = value.get("target") {
+        let targets = targets
+            .as_table()
+            .ok_or_else(|| "Cargo section [target] must be a table".to_owned())?;
+        for (target, target_value) in targets {
+            let target_table = target_value.as_table().ok_or_else(|| {
+                format!("Cargo target section [target.{target:?}] must be a table")
+            })?;
+            for (section, dev) in [
+                ("dependencies", false),
+                ("dev-dependencies", true),
+                ("build-dependencies", false),
+            ] {
+                if let Some(entry) = target_table.get(section) {
+                    let table = entry.as_table().ok_or_else(|| {
+                        format!("Cargo section [target.{target:?}.{section}] must be a table")
+                    })?;
+                    tables.push((table, dev));
+                }
             }
         }
     }
-    names
+    Ok(tables)
 }
+
+fn cargo_manifest_declarations(
+    manifest: &CargoManifest,
+    workspace_dependencies: &BTreeMap<String, CargoDependencySpec>,
+) -> Result<Vec<CargoDeclaration>, ParseError> {
+    let tables = cargo_dependency_tables(&manifest.value)
+        .map_err(|message| invalid(&manifest.path, message))?;
+    let mut declarations = Vec::new();
+    for (table, dev) in tables {
+        for (alias, entry) in table {
+            declarations.push(CargoDeclaration {
+                dependency: parse_cargo_dependency(
+                    &manifest.path,
+                    alias,
+                    entry,
+                    Some(workspace_dependencies),
+                )?,
+                declaring_manifest: manifest.path.clone(),
+                dev,
+            });
+        }
+    }
+    Ok(declarations)
+}
+
+fn workspace_dependency_definitions(
+    workspace_manifest: &Path,
+    value: &Toml,
+) -> Result<BTreeMap<String, CargoDependencySpec>, ParseError> {
+    let Some(dependencies) = value
+        .get("workspace")
+        .and_then(Toml::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let dependencies = dependencies.as_table().ok_or_else(|| {
+        invalid(
+            workspace_manifest,
+            "Cargo section [workspace.dependencies] must be a table",
+        )
+    })?;
+    dependencies
+        .iter()
+        .map(|(alias, entry)| {
+            parse_cargo_dependency(workspace_manifest, alias, entry, None)
+                .map(|dependency| (alias.clone(), dependency))
+        })
+        .collect()
+}
+
+fn workspace_path_list(
+    workspace_manifest: &Path,
+    workspace: &toml::Table,
+    field: &str,
+) -> Result<Vec<String>, ParseError> {
+    let Some(value) = workspace.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        invalid(
+            workspace_manifest,
+            format!("Cargo workspace field {field:?} must be an array"),
+        )
+    })?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    invalid(
+                        workspace_manifest,
+                        format!(
+                            "Cargo workspace field {field:?} entries must be non-empty strings"
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn workspace_member_manifest(path: PathBuf) -> Option<PathBuf> {
+    if path.is_dir() {
+        Some(path.join("Cargo.toml"))
+    } else if path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml") {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn workspace_member_matches(
+    workspace_manifest: &Path,
+    workspace_root: &Path,
+    member: &str,
+) -> Result<Vec<PathBuf>, ParseError> {
+    let joined = workspace_root.join(member);
+    let pattern = joined.to_str().ok_or_else(|| {
+        invalid(
+            workspace_manifest,
+            format!("Cargo workspace member pattern {member:?} is not valid UTF-8"),
+        )
+    })?;
+    let mut matches = Vec::new();
+    for matched in glob::glob(pattern).map_err(|error| {
+        invalid(
+            workspace_manifest,
+            format!("invalid Cargo workspace member pattern {member:?}: {error}"),
+        )
+    })? {
+        let matched = matched.map_err(|error| {
+            invalid(
+                workspace_manifest,
+                format!("reading Cargo workspace member pattern {member:?}: {error}"),
+            )
+        })?;
+        if let Some(manifest) = workspace_member_manifest(matched) {
+            let manifest = fs::canonicalize(&manifest).map_err(|error| {
+                invalid(
+                    workspace_manifest,
+                    format!(
+                        "Cargo workspace member {} has no readable Cargo.toml: {error}",
+                        manifest.display()
+                    ),
+                )
+            })?;
+            matches.push(manifest);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    if matches.is_empty() {
+        return Err(invalid(
+            workspace_manifest,
+            format!("Cargo workspace member pattern {member:?} matched no packages"),
+        ));
+    }
+    Ok(matches)
+}
+
+fn relative_workspace_path(workspace_root: &Path, path: &Path) -> Option<PathBuf> {
+    let canonical_root = fs::canonicalize(workspace_root).ok()?;
+    let canonical_path = fs::canonicalize(path).ok()?;
+    canonical_path
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+fn excluded_workspace_member(
+    workspace_root: &Path,
+    manifest: &Path,
+    excludes: &[glob::Pattern],
+) -> bool {
+    manifest
+        .parent()
+        .and_then(|directory| relative_workspace_path(workspace_root, directory))
+        .is_some_and(|relative| {
+            excludes
+                .iter()
+                .any(|pattern| pattern.matches_path(&relative))
+        })
+}
+
+fn cargo_workspace_manifests(
+    workspace_manifest: &Path,
+    workspace_value: Toml,
+) -> Result<(Vec<CargoManifest>, BTreeMap<String, CargoDependencySpec>), ParseError> {
+    let workspace = workspace_value
+        .get("workspace")
+        .and_then(Toml::as_table)
+        .ok_or_else(|| {
+            invalid(
+                workspace_manifest,
+                "Cargo workspace root is missing a [workspace] table",
+            )
+        })?;
+    let workspace_root = workspace_manifest.parent().unwrap_or(Path::new("."));
+    let member_patterns = workspace_path_list(workspace_manifest, workspace, "members")?;
+    let exclude_patterns = workspace_path_list(workspace_manifest, workspace, "exclude")?
+        .into_iter()
+        .map(|pattern| {
+            glob::Pattern::new(&pattern).map_err(|error| {
+                invalid(
+                    workspace_manifest,
+                    format!("invalid Cargo workspace exclude pattern {pattern:?}: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let workspace_dependencies =
+        workspace_dependency_definitions(workspace_manifest, &workspace_value)?;
+
+    let mut pending = VecDeque::new();
+    let mut queued = BTreeSet::new();
+    if workspace_value.get("package").is_some() {
+        queued.insert(workspace_manifest.to_path_buf());
+        pending.push_back(workspace_manifest.to_path_buf());
+    }
+    for member in member_patterns {
+        for manifest in workspace_member_matches(workspace_manifest, workspace_root, &member)? {
+            if !excluded_workspace_member(workspace_root, &manifest, &exclude_patterns)
+                && queued.insert(manifest.clone())
+            {
+                pending.push_back(manifest);
+            }
+        }
+    }
+    for dependency in workspace_dependencies.values() {
+        if let Some(local_path) = &dependency.local_path
+            && relative_workspace_path(workspace_root, local_path).is_some()
+        {
+            let manifest = local_path.join("Cargo.toml");
+            if !manifest.is_file() {
+                return Err(invalid(
+                    workspace_manifest,
+                    format!(
+                        "Cargo path dependency {} has no Cargo.toml",
+                        local_path.display()
+                    ),
+                ));
+            }
+            let manifest =
+                fs::canonicalize(&manifest).map_err(|error| io_error(&manifest, error))?;
+            if !excluded_workspace_member(workspace_root, &manifest, &exclude_patterns)
+                && queued.insert(manifest.clone())
+            {
+                pending.push_back(manifest);
+            }
+        }
+    }
+
+    let mut manifests = Vec::new();
+    while let Some(path) = pending.pop_front() {
+        let value = if path == workspace_manifest {
+            workspace_value.clone()
+        } else {
+            read_cargo_manifest(&path)?
+        };
+        if value.get("package").and_then(Toml::as_table).is_none() {
+            return Err(invalid(
+                &path,
+                "Cargo workspace member is missing a [package] table",
+            ));
+        }
+        let manifest = CargoManifest {
+            path: path.clone(),
+            value,
+        };
+        let declarations = cargo_manifest_declarations(&manifest, &workspace_dependencies)?;
+        for declaration in &declarations {
+            let Some(local_path) = &declaration.dependency.local_path else {
+                continue;
+            };
+            if relative_workspace_path(workspace_root, local_path).is_none() {
+                continue;
+            }
+            let local_manifest = local_path.join("Cargo.toml");
+            if !local_manifest.is_file() {
+                return Err(invalid(
+                    &declaration.declaring_manifest,
+                    format!(
+                        "Cargo path dependency {} has no Cargo.toml",
+                        local_path.display()
+                    ),
+                ));
+            }
+            let local_manifest = fs::canonicalize(&local_manifest)
+                .map_err(|error| io_error(&local_manifest, error))?;
+            if !excluded_workspace_member(workspace_root, &local_manifest, &exclude_patterns)
+                && queued.insert(local_manifest.clone())
+            {
+                pending.push_back(local_manifest);
+            }
+        }
+        manifests.push(manifest);
+    }
+    manifests.sort_by(|left, right| left.path.cmp(&right.path));
+    if manifests.is_empty() {
+        return Err(invalid(
+            workspace_manifest,
+            "Cargo workspace contains no package members",
+        ));
+    }
+    Ok((manifests, workspace_dependencies))
+}
+
+fn cargo_project_manifests(
+    source_manifest: &Path,
+) -> Result<(Vec<CargoManifest>, BTreeMap<String, CargoDependencySpec>), ParseError> {
+    let source_value = read_cargo_manifest(source_manifest)?;
+    if source_value.get("workspace").is_some() {
+        return cargo_workspace_manifests(source_manifest, source_value);
+    }
+    let explicit_workspace = source_value
+        .get("package")
+        .and_then(Toml::as_table)
+        .and_then(|package| package.get("workspace"));
+    if let Some(explicit_workspace) = explicit_workspace {
+        let explicit_workspace = explicit_workspace.as_str().ok_or_else(|| {
+            invalid(
+                source_manifest,
+                "Cargo package field \"workspace\" must be a path string",
+            )
+        })?;
+        let workspace_manifest = source_manifest
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(explicit_workspace)
+            .join("Cargo.toml");
+        let workspace_manifest = fs::canonicalize(&workspace_manifest)
+            .map_err(|error| io_error(&workspace_manifest, error))?;
+        let workspace_value = read_cargo_manifest(&workspace_manifest)?;
+        let (manifests, workspace_dependencies) =
+            cargo_workspace_manifests(&workspace_manifest, workspace_value)?;
+        let canonical_source =
+            fs::canonicalize(source_manifest).map_err(|error| io_error(source_manifest, error))?;
+        if !manifests.iter().any(|manifest| {
+            fs::canonicalize(&manifest.path).ok().as_ref() == Some(&canonical_source)
+        }) {
+            return Err(invalid(
+                source_manifest,
+                "Cargo package points to a workspace that does not include it",
+            ));
+        }
+        return Ok((manifests, workspace_dependencies));
+    }
+    let canonical_source =
+        fs::canonicalize(source_manifest).map_err(|error| io_error(source_manifest, error))?;
+    let mut ancestor = source_manifest.parent().and_then(Path::parent);
+    while let Some(directory) = ancestor {
+        let candidate = directory.join("Cargo.toml");
+        if candidate.is_file() {
+            let value = read_cargo_manifest(&candidate)?;
+            if value.get("workspace").is_some() {
+                let candidate =
+                    fs::canonicalize(&candidate).map_err(|error| io_error(&candidate, error))?;
+                let (manifests, workspace_dependencies) =
+                    cargo_workspace_manifests(&candidate, value)?;
+                if manifests.iter().any(|manifest| {
+                    fs::canonicalize(&manifest.path).ok().as_ref() == Some(&canonical_source)
+                }) {
+                    return Ok((manifests, workspace_dependencies));
+                }
+                return Err(invalid(
+                    source_manifest,
+                    format!(
+                        "Cargo package is under workspace {} but is not included as a member",
+                        candidate.display()
+                    ),
+                ));
+            }
+        }
+        ancestor = directory.parent();
+    }
+    if source_value
+        .get("package")
+        .and_then(Toml::as_table)
+        .is_none()
+    {
+        return Err(invalid(
+            source_manifest,
+            "Cargo manifest is missing a [package] or [workspace] table",
+        ));
+    }
+    Ok((
+        vec![CargoManifest {
+            path: source_manifest.to_path_buf(),
+            value: source_value,
+        }],
+        BTreeMap::new(),
+    ))
+}
+
+fn cargo_project_declarations(path: &Path) -> Result<Vec<CargoDeclaration>, ParseError> {
+    let (manifests, workspace_dependencies) = cargo_project_manifests(path)?;
+    manifests
+        .iter()
+        .map(|manifest| cargo_manifest_declarations(manifest, &workspace_dependencies))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|declarations| declarations.into_iter().flatten().collect())
+}
+
+fn cargo_direct_dependencies(root: &Path) -> Result<BTreeMap<String, bool>, ParseError> {
+    let manifest = root.join("Cargo.toml");
+    if !manifest.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let mut direct = BTreeMap::new();
+    for declaration in cargo_project_declarations(&manifest)? {
+        direct
+            .entry(declaration.dependency.package_name)
+            .and_modify(|dev_only| *dev_only &= declaration.dev)
+            .or_insert(declaration.dev);
+    }
+    Ok(direct)
+}
+
 fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
-    let direct = cargo_direct_names(path.parent().unwrap_or(Path::new(".")));
+    let direct = cargo_direct_dependencies(path.parent().unwrap_or(Path::new(".")))?;
     let mut out = Vec::new();
     for item in value
         .get("package")
@@ -1147,7 +1729,10 @@ fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
             item.get("version").and_then(Toml::as_str),
         ) {
             let mut p = Package::new(Ecosystem::CratesIo, name, version, path.to_path_buf());
-            p.direct = direct.contains(name);
+            if let Some(dev) = direct.get(name) {
+                p.direct = true;
+                p.dev = *dev;
+            }
             if !item.get("source").and_then(Toml::as_str).is_some_and(|s| {
                 s.starts_with("registry+https://github.com/rust-lang/crates.io-index")
             }) {
@@ -1159,31 +1744,31 @@ fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     Ok(dedup(out))
 }
 fn parse_cargo_toml(path: &Path) -> Result<Vec<Package>, ParseError> {
-    let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
-    let mut out = Vec::new();
-    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(table) = value.get(section).and_then(Toml::as_table) {
-            for (name, entry) in table {
-                let version = entry.as_str().map(str::to_owned).or_else(|| {
-                    entry
-                        .as_table()
-                        .and_then(|t| t.get("version"))
-                        .and_then(Toml::as_str)
-                        .map(str::to_owned)
-                });
-                if let Some(version) = version {
-                    let mut p =
-                        Package::new(Ecosystem::CratesIo, name, version, path.to_path_buf());
-                    p.direct = true;
-                    p.dev = section == "dev-dependencies";
-                    p.resolved_from_range = true;
-                    out.push(p);
-                }
-            }
-        }
+    let mut packages = BTreeMap::new();
+    for declaration in cargo_project_declarations(path)? {
+        let Some(version) = declaration.dependency.version else {
+            continue;
+        };
+        let mut package = Package::new(
+            Ecosystem::CratesIo,
+            declaration.dependency.package_name,
+            version,
+            declaration.declaring_manifest,
+        );
+        package.direct = true;
+        package.dev = declaration.dev;
+        package.enrichable = declaration.dependency.enrichable;
+        package.resolved_from_range = true;
+        let key = (package.key(), package.source_file.clone());
+        packages
+            .entry(key)
+            .and_modify(|existing: &mut Package| {
+                existing.dev &= package.dev;
+                existing.enrichable &= package.enrichable;
+            })
+            .or_insert(package);
     }
-    Ok(dedup(out))
+    Ok(packages.into_values().collect())
 }
 
 fn dedup(packages: Vec<Package>) -> Vec<Package> {

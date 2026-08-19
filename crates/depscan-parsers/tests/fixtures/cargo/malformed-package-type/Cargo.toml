@@ -1,0 +1,9 @@
+[package]
+name = "malformed-package-type"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+renamed = { package = false, version = "1" }

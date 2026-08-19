@@ -1,0 +1,166 @@
+---
+source: crates/depscan-parsers/tests/cargo_manifest.rs
+expression: "normalized(&packages, &root)"
+---
+[
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "auto-child",
+    "enrichable": true,
+    "name": "auto-child",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "12.0.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "cc",
+    "enrichable": true,
+    "name": "cc",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "1.2.0"
+  },
+  {
+    "dev": false,
+    "direct": false,
+    "display_name": "excluded-direct",
+    "enrichable": true,
+    "name": "excluded-direct",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "10.0.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "git-only",
+    "enrichable": false,
+    "name": "git-only",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "0.5.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "git-real",
+    "enrichable": false,
+    "name": "git-real",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "0.4.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "local-only",
+    "enrichable": false,
+    "name": "local-only",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "0.1.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "local-shared",
+    "enrichable": false,
+    "name": "local-shared",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "0.3.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "other-direct",
+    "enrichable": true,
+    "name": "other-direct",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "9.0.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "real-crate",
+    "enrichable": true,
+    "name": "real-crate",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "3.2.1"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "serde",
+    "enrichable": true,
+    "name": "serde",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "1.0.228"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "shared-child",
+    "enrichable": true,
+    "name": "shared-child",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "11.0.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "target-build-real",
+    "enrichable": true,
+    "name": "target-build-real",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "8.0.0"
+  },
+  {
+    "dev": true,
+    "direct": true,
+    "display_name": "target-dev",
+    "enrichable": true,
+    "name": "target-dev",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "7.0.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "target-real",
+    "enrichable": true,
+    "name": "target-real",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "6.0.0"
+  },
+  {
+    "dev": false,
+    "direct": false,
+    "display_name": "unused-real",
+    "enrichable": true,
+    "name": "unused-real",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "99.0.0"
+  },
+  {
+    "dev": true,
+    "direct": true,
+    "display_name": "workspace-dev",
+    "enrichable": true,
+    "name": "workspace-dev",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "2.1.0"
+  }
+]

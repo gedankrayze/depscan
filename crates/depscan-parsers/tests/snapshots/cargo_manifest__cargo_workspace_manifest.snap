@@ -1,0 +1,136 @@
+---
+source: crates/depscan-parsers/tests/cargo_manifest.rs
+expression: "normalized(&packages, &root)"
+---
+[
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "auto-child",
+    "enrichable": true,
+    "name": "auto-child",
+    "resolved_from_range": true,
+    "source": "vendor/local-only/Cargo.toml",
+    "version": "12"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "cc",
+    "enrichable": true,
+    "name": "cc",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "1"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "git-real",
+    "enrichable": false,
+    "name": "git-real",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "0.4"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "local-shared",
+    "enrichable": false,
+    "name": "local-shared",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "0.3"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "other-direct",
+    "enrichable": true,
+    "name": "other-direct",
+    "resolved_from_range": true,
+    "source": "crates/other/Cargo.toml",
+    "version": "9"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "real-crate",
+    "enrichable": true,
+    "name": "real-crate",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "^3"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "serde",
+    "enrichable": true,
+    "name": "serde",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "1.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "serde",
+    "enrichable": true,
+    "name": "serde",
+    "resolved_from_range": true,
+    "source": "crates/other/Cargo.toml",
+    "version": "1.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "shared-child",
+    "enrichable": true,
+    "name": "shared-child",
+    "resolved_from_range": true,
+    "source": "shared/Cargo.toml",
+    "version": "11"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "target-build-real",
+    "enrichable": true,
+    "name": "target-build-real",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "8"
+  },
+  {
+    "dev": true,
+    "direct": true,
+    "display_name": "target-dev",
+    "enrichable": true,
+    "name": "target-dev",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "7"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "target-real",
+    "enrichable": true,
+    "name": "target-real",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "6"
+  },
+  {
+    "dev": true,
+    "direct": true,
+    "display_name": "workspace-dev",
+    "enrichable": true,
+    "name": "workspace-dev",
+    "resolved_from_range": true,
+    "source": "crates/app/Cargo.toml",
+    "version": "2"
+  }
+]

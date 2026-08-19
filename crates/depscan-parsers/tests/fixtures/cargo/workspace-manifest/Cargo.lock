@@ -1,0 +1,79 @@
+version = 4
+
+[[package]]
+name = "auto-child"
+version = "12.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "cc"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "excluded-direct"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "git-only"
+version = "0.5.0"
+source = "git+https://example.invalid/git-only.git#0000000000000000000000000000000000000000"
+
+[[package]]
+name = "git-real"
+version = "0.4.0"
+source = "git+https://example.invalid/git-real.git#0000000000000000000000000000000000000000"
+
+[[package]]
+name = "local-only"
+version = "0.1.0"
+
+[[package]]
+name = "local-shared"
+version = "0.3.0"
+
+[[package]]
+name = "other-direct"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "real-crate"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "shared-child"
+version = "11.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "target-build-real"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "target-dev"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "target-real"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "unused-real"
+version = "99.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "workspace-dev"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"

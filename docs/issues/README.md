@@ -29,7 +29,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-008](DS-008.md) | P1 | Closed | Retain nested npm v2/v3 packages |
 | [DS-009](DS-009.md) | P1 | Open | Support Yarn Berry lockfiles |
 | [DS-010](DS-010.md) | P1 | Open | Scan all .NET projects and central package versions |
-| [DS-011](DS-011.md) | P1 | Open | Make Cargo manifest parsing workspace- and rename-aware |
+| [DS-011](DS-011.md) | P1 | Closed | Make Cargo manifest parsing workspace- and rename-aware |
 | [DS-012](DS-012.md) | P1 | Open | Preserve uv/Poetry source, directness, and group provenance |
 | [DS-013](DS-013.md) | P1 | Closed | Fail closed on malformed OSV batch responses |
 | [DS-014](DS-014.md) | P1 | Closed | Follow OSV per-query pagination |
