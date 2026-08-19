@@ -170,6 +170,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-055 | online/offline total manifest-resolution failure, partial-resolution, and report-only process controls |
 | DS-056 | controlled common-cache time boundaries; future OSV query/hydration, generic registry, sparse-index, cache-bypass, and process hard/soft regressions |
 | DS-057 | strict npm v2/v3 entry table; link/alias/group-precedence/concrete-hoist/workspace-pattern/source/v1 controls; npm 11 fixtures; mixed-record exit `10`; source-redaction process test |
+| DS-058 | pending lock-derived Node directness fixtures plus conservative unknown and process `--direct-only` coverage |
 | DS-061 | installer environment-handoff guards, installed/override argument-vector probes, PATH decoy rejection, and a native Windows workspace-executable decoy regression |
 | DS-063 | pending suffix-aware positive/negative-extglob differential corpus and real npm workspace fixture |
 
