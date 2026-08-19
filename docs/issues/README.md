@@ -36,7 +36,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-015](DS-015.md) | P1 | Open | Revalidate OSV and registry caches |
 | [DS-016](DS-016.md) | P1 | Open | Make offline dump sync streaming and resilient |
 | [DS-017](DS-017.md) | P1 | Open | Contain recursive requirements includes to the scan root |
-| [DS-018](DS-018.md) | P1 | Open | Prevent sparse-index path panics on invalid crate names |
+| [DS-018](DS-018.md) | P1 | Closed | Prevent sparse-index path panics on invalid crate names |
 | [DS-019](DS-019.md) | P1 | Open | Implement the specified exit-code taxonomy |
 | [DS-020](DS-020.md) | P1 | Open | Render included withdrawn advisories consistently |
 | [DS-021](DS-021.md) | P1 | Open | Preserve auditable suppression details |
