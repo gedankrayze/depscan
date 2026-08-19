@@ -8,7 +8,8 @@ use depscan_core::{
 };
 use depscan_parsers::ParserSet;
 use depscan_providers::{
-    Cache, CachePolicy, HttpClient, OsvClient, OsvOffline, RegistryClient, sync_osv_dumps,
+    Cache, CachePolicy, HttpClient, OsvClient, OsvOffline, OsvSyncOptions, RegistryClient,
+    sync_osv_dumps_with_options,
 };
 use depscan_report::{OutputFormat, render};
 use futures::{StreamExt, stream};
@@ -19,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
+    time::Duration as StdDuration,
 };
 use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
@@ -280,6 +282,14 @@ struct SyncArgs {
         action = clap::ArgAction::Append
     )]
     ecosystems: Vec<EcosystemArg>,
+    /// Bound each dump transfer attempt while retaining the 10-second connect/read-idle deadline.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "15m",
+        value_parser = parse_sync_timeout
+    )]
+    transfer_timeout: StdDuration,
     /// Bypass reusable JSON cache reads; selected OSV dumps are always downloaded and written.
     #[arg(long)]
     no_cache: bool,
@@ -737,6 +747,16 @@ where
         ))
     })
 }
+
+fn parse_sync_timeout(value: &str) -> Result<StdDuration, String> {
+    let CacheAge(timeout) = value.parse()?;
+    if timeout == Duration::zero() {
+        return Err("sync transfer timeout must be greater than zero".to_owned());
+    }
+    timeout
+        .to_std()
+        .map_err(|_| format!("sync transfer timeout {value:?} is outside the supported range"))
+}
 fn determine_format(args: &ScanArgs) -> Result<OutputFormat, String> {
     if let Some(format) = args.format {
         return Ok(format.into());
@@ -819,9 +839,16 @@ async fn sync(args: SyncArgs) -> Result<AppExit, CliError> {
     })
     .map_err(CliError::provider)?;
     let http = HttpClient::new().map_err(CliError::provider)?;
-    let paths = sync_osv_dumps(&http, &cache, &ecosystems.into_iter().collect::<Vec<_>>())
-        .await
-        .map_err(CliError::provider)?;
+    let paths = sync_osv_dumps_with_options(
+        &http,
+        &cache,
+        &ecosystems.into_iter().collect::<Vec<_>>(),
+        OsvSyncOptions {
+            transfer_timeout: args.transfer_timeout,
+        },
+    )
+    .await
+    .map_err(CliError::provider)?;
     for path in paths {
         println!("synced {}", path.display());
     }

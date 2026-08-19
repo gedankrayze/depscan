@@ -22,11 +22,13 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration as StdDuration,
 };
+use tempfile::{Builder as TempFileBuilder, TempPath};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::debug;
 use urlencoding::encode;
@@ -50,6 +52,18 @@ const CACHE_SENTINEL_FILE: &str = ".depscan-cache.json";
 const CACHE_SENTINEL_SCHEMA_VERSION: u32 = 1;
 const CACHE_SENTINEL_OWNER: &str = "depscan";
 const CACHE_CONTENT_DIRECTORIES: [&str; 3] = ["offline", "osv", "registry"];
+const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
+const OSV_DUMP_TRANSFER_TIMEOUT: StdDuration = StdDuration::from_secs(15 * 60);
+const OSV_DUMP_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const OSV_DUMP_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+const OSV_DUMP_MAX_UNCOMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const OSV_DUMP_MAX_ENTRIES: usize = 2_000_000;
+const OSV_DUMP_ATTEMPTS: usize = 3;
+const OSV_DUMP_BACKOFF_BASE: StdDuration = StdDuration::from_millis(200);
+const OSV_DUMP_MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
+const OSV_DUMP_PROGRESS_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+const OSV_DUMP_TEMP_SUFFIXES: [&str; 3] = [".zip.tmp", ".synced-at.tmp", ".zip.rollback.tmp"];
 
 fn osv_query_name(package: &Package) -> &str {
     match package.ecosystem {
@@ -842,18 +856,29 @@ struct PublishedHydration {
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Client,
+    request_timeout: StdDuration,
 }
 impl HttpClient {
     pub fn new() -> Result<Self, ProviderError> {
+        Self::with_timeouts(HTTP_REQUEST_TIMEOUT, HTTP_REQUEST_TIMEOUT)
+    }
+
+    fn with_timeouts(
+        request_timeout: StdDuration,
+        network_idle_timeout: StdDuration,
+    ) -> Result<Self, ProviderError> {
         let client = Client::builder()
             .user_agent(USER_AGENT_VALUE)
-            .timeout(StdDuration::from_secs(10))
-            .connect_timeout(StdDuration::from_secs(10))
+            .connect_timeout(network_idle_timeout)
+            .read_timeout(network_idle_timeout)
             .gzip(true)
             .http2_adaptive_window(true)
             .build()
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        Ok(Self { inner: client })
+        Ok(Self {
+            inner: client,
+            request_timeout,
+        })
     }
     async fn request_json(
         &self,
@@ -867,7 +892,8 @@ impl HttpClient {
             let mut request = self
                 .inner
                 .request(method.clone(), url)
-                .headers(headers.clone());
+                .headers(headers.clone())
+                .timeout(self.request_timeout);
             if let Some(body) = &body {
                 request = request.json(body);
             }
@@ -952,22 +978,6 @@ impl HttpClient {
             ))),
         }
     }
-    pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
-        let response = self
-            .inner
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
-        response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))
-    }
-
     async fn get_bytes_limited_revalidated(
         &self,
         url: &str,
@@ -978,6 +988,7 @@ impl HttpClient {
             .inner
             .get(url)
             .headers(headers)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
@@ -1595,10 +1606,714 @@ impl VulnProvider for OsvOffline {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OsvSyncOptions {
+    /// Maximum wall-clock time for one dump transfer attempt.
+    ///
+    /// The HTTP client's ten-second connect/read-idle deadline still applies. A transfer may run
+    /// longer than ten seconds while bytes continue to arrive, up to this overall deadline.
+    pub transfer_timeout: StdDuration,
+}
+
+impl Default for OsvSyncOptions {
+    fn default() -> Self {
+        Self {
+            transfer_timeout: OSV_DUMP_TRANSFER_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OsvSyncConfig {
+    base_url: String,
+    transfer_timeout: StdDuration,
+    max_download_bytes: u64,
+    max_entry_bytes: u64,
+    max_uncompressed_bytes: u64,
+    max_entries: usize,
+    attempts: usize,
+    backoff_base: StdDuration,
+    max_retry_delay: StdDuration,
+    #[cfg(test)]
+    backup_directory: Option<PathBuf>,
+    #[cfg(test)]
+    observed_max_chunk_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl OsvSyncConfig {
+    fn new(options: OsvSyncOptions) -> Result<Self, ProviderError> {
+        if options.transfer_timeout.is_zero() {
+            return Err(ProviderError::InvalidResponse(
+                "OSV dump transfer timeout must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            base_url: OSV_DUMP_BASE_URL.to_owned(),
+            transfer_timeout: options.transfer_timeout,
+            max_download_bytes: OSV_DUMP_MAX_DOWNLOAD_BYTES,
+            max_entry_bytes: OSV_DUMP_MAX_ENTRY_BYTES,
+            max_uncompressed_bytes: OSV_DUMP_MAX_UNCOMPRESSED_BYTES,
+            max_entries: OSV_DUMP_MAX_ENTRIES,
+            attempts: OSV_DUMP_ATTEMPTS,
+            backoff_base: OSV_DUMP_BACKOFF_BASE,
+            max_retry_delay: OSV_DUMP_MAX_RETRY_DELAY,
+            #[cfg(test)]
+            backup_directory: None,
+            #[cfg(test)]
+            observed_max_chunk_bytes: None,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum OsvDownloadFailure {
+    Retryable {
+        message: String,
+        retry_after: Option<StdDuration>,
+    },
+    Fatal(ProviderError),
+}
+
+fn retry_after_delay(headers: &HeaderMap, cap: StdDuration) -> Option<StdDuration> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(StdDuration::from_secs)
+        .map(|delay| std::cmp::min(delay, cap))
+}
+
+fn osv_dump_backoff(config: &OsvSyncConfig, retry_index: usize) -> StdDuration {
+    let multiplier = 1u32
+        .checked_shl(retry_index.min(31) as u32)
+        .unwrap_or(u32::MAX);
+    let base = std::cmp::min(
+        config.backoff_base.saturating_mul(multiplier),
+        config.max_retry_delay,
+    );
+    let jitter_bound = u64::try_from(base.as_millis() / 4).unwrap_or(u64::MAX);
+    let jitter = rand::rng().random_range(0..=jitter_bound);
+    std::cmp::min(
+        base.saturating_add(StdDuration::from_millis(jitter)),
+        config.max_retry_delay,
+    )
+}
+
+async fn stream_osv_dump_body<S, C, E, W>(
+    mut chunks: S,
+    destination: &mut W,
+    url: &str,
+    config: &OsvSyncConfig,
+) -> Result<u64, OsvDownloadFailure>
+where
+    S: futures::Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+    E: std::fmt::Display,
+    W: AsyncWrite + Unpin,
+{
+    let mut downloaded = 0u64;
+    let mut next_progress = OSV_DUMP_PROGRESS_INTERVAL_BYTES;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| OsvDownloadFailure::Retryable {
+            message: format!("{url}: interrupted OSV dump transfer: {error}"),
+            retry_after: None,
+        })?;
+        let bytes = chunk.as_ref();
+        #[cfg(test)]
+        if let Some(observed) = &config.observed_max_chunk_bytes {
+            observed.fetch_max(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        downloaded = downloaded.checked_add(bytes.len() as u64).ok_or_else(|| {
+            OsvDownloadFailure::Fatal(ProviderError::InvalidResponse(format!(
+                "{url}: OSV dump size overflowed"
+            )))
+        })?;
+        if downloaded > config.max_download_bytes {
+            return Err(OsvDownloadFailure::Fatal(ProviderError::InvalidResponse(
+                format!(
+                    "{url}: OSV dump exceeds the {}-byte compressed-size limit",
+                    config.max_download_bytes
+                ),
+            )));
+        }
+        destination
+            .write_all(bytes)
+            .await
+            .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
+        if downloaded >= next_progress {
+            debug!(%url, downloaded, "streaming OSV dump");
+            next_progress = downloaded.saturating_add(OSV_DUMP_PROGRESS_INTERVAL_BYTES);
+        }
+    }
+    destination
+        .flush()
+        .await
+        .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
+    Ok(downloaded)
+}
+
+impl HttpClient {
+    async fn download_osv_dump_attempt(
+        &self,
+        url: &str,
+        destination: &File,
+        config: &OsvSyncConfig,
+    ) -> Result<u64, OsvDownloadFailure> {
+        let response = self
+            .inner
+            .get(url)
+            .timeout(config.transfer_timeout)
+            .send()
+            .await
+            .map_err(|error| OsvDownloadFailure::Retryable {
+                message: format!("{url}: {error}"),
+                retry_after: None,
+            })?;
+        let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            return Err(OsvDownloadFailure::Retryable {
+                message: format!("{url}: HTTP {status}"),
+                retry_after: retry_after_delay(response.headers(), config.max_retry_delay),
+            });
+        }
+        if !status.is_success() {
+            return Err(OsvDownloadFailure::Fatal(ProviderError::Network(format!(
+                "{url}: HTTP {status}"
+            ))));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > config.max_download_bytes)
+        {
+            return Err(OsvDownloadFailure::Fatal(ProviderError::InvalidResponse(
+                format!(
+                    "{url}: OSV dump exceeds the {}-byte compressed-size limit",
+                    config.max_download_bytes
+                ),
+            )));
+        }
+
+        let mut destination = destination
+            .try_clone()
+            .and_then(|mut file| {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                Ok(file)
+            })
+            .map(tokio::fs::File::from_std)
+            .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
+        let downloaded =
+            stream_osv_dump_body(response.bytes_stream(), &mut destination, url, config).await?;
+        destination
+            .sync_all()
+            .await
+            .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
+        debug!(%url, downloaded, "OSV dump transfer complete");
+        Ok(downloaded)
+    }
+
+    async fn download_osv_dump(
+        &self,
+        url: &str,
+        destination: &File,
+        config: &OsvSyncConfig,
+    ) -> Result<u64, ProviderError> {
+        let mut last_error = None;
+        for attempt in 0..config.attempts {
+            match self
+                .download_osv_dump_attempt(url, destination, config)
+                .await
+            {
+                Ok(downloaded) => return Ok(downloaded),
+                Err(OsvDownloadFailure::Fatal(error)) => return Err(error),
+                Err(OsvDownloadFailure::Retryable {
+                    message,
+                    retry_after,
+                }) => {
+                    last_error = Some(message);
+                    if attempt + 1 < config.attempts {
+                        let delay =
+                            retry_after.unwrap_or_else(|| osv_dump_backoff(config, attempt));
+                        sleep(delay).await;
+                    }
+                }
+            }
+        }
+        Err(ProviderError::Network(last_error.unwrap_or_else(|| {
+            format!("{url}: OSV dump transfer had no attempts")
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct OsvDumpDocumentShape {
+    id: String,
+    #[serde(rename = "modified")]
+    _modified: DateTime<Utc>,
+}
+
+#[cfg(test)]
+fn validate_osv_dump(
+    path: &Path,
+    ecosystem: Ecosystem,
+    config: &OsvSyncConfig,
+) -> Result<(), ProviderError> {
+    let file = File::open(path).map_err(|error| ProviderError::Cache(error.to_string()))?;
+    validate_osv_dump_file(file, ecosystem, config)
+}
+
+fn validate_osv_dump_file(
+    file: File,
+    ecosystem: Ecosystem,
+    config: &OsvSyncConfig,
+) -> Result<(), ProviderError> {
+    let invalid = |reason: String| {
+        ProviderError::InvalidResponse(format!(
+            "OSV dump for {} is invalid: {reason}",
+            ecosystem.osv_name()
+        ))
+    };
+    let compressed_bytes = file
+        .metadata()
+        .map_err(|error| ProviderError::Cache(error.to_string()))?
+        .len();
+    if compressed_bytes > config.max_download_bytes {
+        return Err(invalid(format!(
+            "compressed size exceeds {} bytes",
+            config.max_download_bytes
+        )));
+    }
+    let mut archive = ZipArchive::new(file).map_err(|error| invalid(error.to_string()))?;
+    if archive.len() > config.max_entries {
+        return Err(invalid(format!(
+            "entry count exceeds {}",
+            config.max_entries
+        )));
+    }
+
+    let mut json_entries = 0usize;
+    let mut declared_uncompressed_bytes = 0u64;
+    let mut actual_uncompressed_bytes = 0u64;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| invalid(error.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        if !entry.name().ends_with(".json") {
+            return Err(invalid(format!(
+                "unexpected non-JSON entry {:?}",
+                entry.name()
+            )));
+        }
+        if entry.size() > config.max_entry_bytes {
+            return Err(invalid(format!(
+                "entry {:?} exceeds {} uncompressed bytes",
+                entry.name(),
+                config.max_entry_bytes
+            )));
+        }
+        declared_uncompressed_bytes = declared_uncompressed_bytes
+            .checked_add(entry.size())
+            .ok_or_else(|| invalid("uncompressed size overflowed".to_owned()))?;
+        if declared_uncompressed_bytes > config.max_uncompressed_bytes {
+            return Err(invalid(format!(
+                "declared uncompressed size exceeds {} bytes",
+                config.max_uncompressed_bytes
+            )));
+        }
+
+        let name = entry.name().to_owned();
+        let entry_read_limit = config.max_entry_bytes.saturating_add(1);
+        let mut limited = (&mut entry).take(entry_read_limit);
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
+        let parsed = OsvDumpDocumentShape::deserialize(&mut deserializer).and_then(|document| {
+            deserializer.end()?;
+            Ok(document)
+        });
+        drop(deserializer);
+        let actual_entry_bytes = entry_read_limit.saturating_sub(limited.limit());
+        if actual_entry_bytes > config.max_entry_bytes {
+            return Err(invalid(format!(
+                "entry {name:?} exceeds {} actual uncompressed bytes",
+                config.max_entry_bytes
+            )));
+        }
+        actual_uncompressed_bytes = actual_uncompressed_bytes
+            .checked_add(actual_entry_bytes)
+            .ok_or_else(|| invalid("actual uncompressed size overflowed".to_owned()))?;
+        if actual_uncompressed_bytes > config.max_uncompressed_bytes {
+            return Err(invalid(format!(
+                "actual uncompressed size exceeds {} bytes",
+                config.max_uncompressed_bytes
+            )));
+        }
+        let document = parsed.map_err(|error| {
+            invalid(format!(
+                "entry {name:?} is not a complete OSV document: {error}"
+            ))
+        })?;
+        if !valid_osv_id(&document.id) {
+            return Err(invalid(format!("entry {name:?} has an invalid OSV id")));
+        }
+        if name != format!("{}.json", document.id) {
+            return Err(invalid(format!(
+                "entry {name:?} does not match OSV id {:?}",
+                document.id
+            )));
+        }
+        json_entries += 1;
+    }
+    if json_entries == 0 {
+        return Err(invalid("archive contains no JSON entries".to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_owned_offline_directory(root: &Path) -> Result<PathBuf, ProviderError> {
+    validate_owned_cache_root(root)?;
+    let directory = root.join("offline");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(cache_path_error(
+                    &directory,
+                    "offline namespace is not a real directory",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(cache_path_error(
+                        &directory,
+                        format_args!("cannot create offline namespace: {error}"),
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(cache_path_error(
+                &directory,
+                format_args!("cannot inspect offline namespace: {error}"),
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+        cache_path_error(
+            &directory,
+            format_args!("cannot inspect offline namespace: {error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(cache_path_error(
+            &directory,
+            "offline namespace is not a real directory",
+        ));
+    }
+    let canonical = fs::canonicalize(&directory).map_err(|error| {
+        cache_path_error(
+            &directory,
+            format_args!("cannot resolve offline namespace: {error}"),
+        )
+    })?;
+    if canonical != directory || canonical.parent() != Some(root) {
+        return Err(cache_path_error(
+            &directory,
+            format_args!("offline namespace resolves to {}", canonical.display()),
+        ));
+    }
+    validate_owned_cache_root(root)?;
+    Ok(directory)
+}
+
+fn cleanup_abandoned_osv_temps(
+    directory: &Path,
+    ecosystem_slug: &str,
+) -> Result<(), ProviderError> {
+    let prefix = format!(".{ecosystem_slug}-");
+    let entries = fs::read_dir(directory).map_err(|error| {
+        cache_path_error(
+            directory,
+            format_args!("cannot inspect offline namespace: {error}"),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            cache_path_error(
+                directory,
+                format_args!("cannot inspect offline namespace: {error}"),
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix)
+            || !OSV_DUMP_TEMP_SUFFIXES
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            cache_path_error(
+                directory,
+                format_args!("cannot inspect abandoned temporary file {name:?}: {error}"),
+            )
+        })?;
+        if metadata.is_dir() || (!metadata.is_file() && !metadata.file_type().is_symlink()) {
+            return Err(cache_path_error(
+                directory,
+                format_args!("refusing non-file abandoned temporary path {name:?}"),
+            ));
+        }
+        fs::remove_file(entry.path()).map_err(|error| {
+            cache_path_error(
+                directory,
+                format_args!("cannot remove abandoned temporary file {name:?}: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn acquire_osv_sync_lock(
+    root: &Path,
+    ecosystem_slug: &str,
+) -> Result<(PathBuf, File), ProviderError> {
+    let directory = validate_owned_offline_directory(root)?;
+    let lock_path = directory.join(format!(".{ecosystem_slug}.sync.lock"));
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(cache_path_error(
+            &lock_path,
+            "sync lock is not a regular file",
+        ));
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            cache_path_error(&lock_path, format_args!("cannot open sync lock: {error}"))
+        })?;
+    let lock_metadata = fs::symlink_metadata(&lock_path).map_err(|error| {
+        cache_path_error(
+            &lock_path,
+            format_args!("cannot inspect sync lock: {error}"),
+        )
+    })?;
+    if lock_metadata.file_type().is_symlink() || !lock.metadata().is_ok_and(|value| value.is_file())
+    {
+        return Err(cache_path_error(
+            &lock_path,
+            "sync lock is not a regular file",
+        ));
+    }
+    lock.lock_exclusive().map_err(|error| {
+        cache_path_error(
+            &lock_path,
+            format_args!("cannot acquire sync lock: {error}"),
+        )
+    })?;
+    let revalidated = validate_owned_offline_directory(root)?;
+    if revalidated != directory {
+        return Err(cache_path_error(
+            &directory,
+            "offline namespace changed while acquiring the sync lock",
+        ));
+    }
+    cleanup_abandoned_osv_temps(&directory, ecosystem_slug)?;
+    Ok((directory, lock))
+}
+
+fn validate_marker_target(path: &Path) -> Result<(), ProviderError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(ProviderError::Cache(format!(
+                "cannot replace non-file sync marker {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ProviderError::Cache(error.to_string())),
+    }
+}
+
+fn stage_previous_archive(
+    path: &Path,
+    directory: &Path,
+    temp_prefix: &str,
+) -> Result<Option<TempPath>, ProviderError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ProviderError::Cache(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ProviderError::Cache(format!(
+            "cannot replace non-file OSV archive {}",
+            path.display()
+        )));
+    }
+
+    let mut builder = TempFileBuilder::new();
+    builder.prefix(temp_prefix).suffix(".zip.rollback.tmp");
+    match builder.make_in(directory, |candidate| {
+        fs::hard_link(path, candidate)?;
+        match File::open(candidate) {
+            Ok(file) => Ok(file),
+            Err(error) => {
+                let _ = fs::remove_file(candidate);
+                Err(error)
+            }
+        }
+    }) {
+        Ok(backup) => Ok(Some(backup.into_temp_path())),
+        Err(link_error) => {
+            let mut source = File::open(path).map_err(|copy_error| {
+                ProviderError::Cache(format!(
+                    "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
+                    path.display()
+                ))
+            })?;
+            let expected_bytes = source
+                .metadata()
+                .map_err(|error| ProviderError::Cache(error.to_string()))?
+                .len();
+            let mut backup = builder.tempfile_in(directory).map_err(|copy_error| {
+                ProviderError::Cache(format!(
+                    "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
+                    path.display()
+                ))
+            })?;
+            let copied_bytes = std::io::copy(&mut source, backup.as_file_mut())
+                .and_then(|bytes| backup.as_file().sync_all().map(|()| bytes))
+                .map_err(|copy_error| {
+                    ProviderError::Cache(format!(
+                        "cannot stage {} for rollback (hard link: {link_error}; copy: {copy_error})",
+                        path.display()
+                    ))
+                })?;
+            if copied_bytes != expected_bytes {
+                return Err(ProviderError::Cache(format!(
+                    "cannot stage {} for rollback: copied {copied_bytes} of {expected_bytes} bytes",
+                    path.display()
+                )));
+            }
+            Ok(Some(backup.into_temp_path()))
+        }
+    }
+}
+
+fn restore_previous_archive(previous: Option<TempPath>, path: &Path) -> Result<(), ProviderError> {
+    let Some(previous) = previous else {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ProviderError::Cache(error.to_string())),
+        };
+    };
+    match previous.persist(path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let restore_error = error.error;
+            let mut recovery = error.path;
+            let recovery_path = recovery.to_path_buf();
+            recovery.disable_cleanup(true);
+            Err(ProviderError::Cache(format!(
+                "{restore_error}; rollback copy retained at {}",
+                recovery_path.display()
+            )))
+        }
+    }
+}
+
+fn publish_osv_pair_with<F>(
+    archive_temp: TempPath,
+    marker_temp: TempPath,
+    archive_path: &Path,
+    marker_path: &Path,
+    previous_archive: Option<TempPath>,
+    publish_marker: F,
+) -> Result<(), ProviderError>
+where
+    F: FnOnce(TempPath, &Path) -> Result<(), tempfile::PathPersistError>,
+{
+    archive_temp.persist(archive_path).map_err(|error| {
+        ProviderError::Cache(format!(
+            "replacing {}: {}",
+            archive_path.display(),
+            error.error
+        ))
+    })?;
+    if let Err(error) = publish_marker(marker_temp, marker_path) {
+        let publication_error = error.error.to_string();
+        drop(error.path);
+        restore_previous_archive(previous_archive, archive_path).map_err(|rollback_error| {
+            ProviderError::Cache(format!(
+                "replacing {} failed: {publication_error}; restoring {} also failed: {rollback_error}",
+                marker_path.display(),
+                archive_path.display()
+            ))
+        })?;
+        return Err(ProviderError::Cache(format!(
+            "replacing {} failed: {publication_error}; restored previous archive",
+            marker_path.display()
+        )));
+    }
+    drop(previous_archive);
+    Ok(())
+}
+
+fn publish_osv_pair(
+    archive_temp: TempPath,
+    marker_temp: TempPath,
+    archive_path: &Path,
+    marker_path: &Path,
+    previous_archive: Option<TempPath>,
+) -> Result<(), ProviderError> {
+    publish_osv_pair_with(
+        archive_temp,
+        marker_temp,
+        archive_path,
+        marker_path,
+        previous_archive,
+        |temporary, target| temporary.persist(target),
+    )
+}
+
 pub async fn sync_osv_dumps(
     http: &HttpClient,
     cache: &Cache,
     ecosystems: &[Ecosystem],
+) -> Result<Vec<PathBuf>, ProviderError> {
+    sync_osv_dumps_with_options(http, cache, ecosystems, OsvSyncOptions::default()).await
+}
+
+pub async fn sync_osv_dumps_with_options(
+    http: &HttpClient,
+    cache: &Cache,
+    ecosystems: &[Ecosystem],
+    options: OsvSyncOptions,
+) -> Result<Vec<PathBuf>, ProviderError> {
+    let config = OsvSyncConfig::new(options)?;
+    sync_osv_dumps_with_config(http, cache, ecosystems, &config).await
+}
+
+async fn sync_osv_dumps_with_config(
+    http: &HttpClient,
+    cache: &Cache,
+    ecosystems: &[Ecosystem],
+    config: &OsvSyncConfig,
 ) -> Result<Vec<PathBuf>, ProviderError> {
     let list: Vec<Ecosystem> = if ecosystems.is_empty() {
         vec![
@@ -1610,22 +2325,140 @@ pub async fn sync_osv_dumps(
     } else {
         ecosystems.to_vec()
     };
-    let dir = cache.root().join("offline");
-    fs::create_dir_all(&dir).map_err(|e| ProviderError::Cache(e.to_string()))?;
     let mut written = Vec::new();
     for eco in list {
-        let url = format!(
-            "https://storage.googleapis.com/osv-vulnerabilities/{}/all.zip",
-            eco.osv_name()
-        );
+        let ecosystem_slug = eco.osv_name().replace('.', "_");
+        let cache_root = cache.root().to_path_buf();
+        let lock_slug = ecosystem_slug.clone();
+        let (dir, sync_lock) =
+            tokio::task::spawn_blocking(move || acquire_osv_sync_lock(&cache_root, &lock_slug))
+                .await
+                .map_err(|error| {
+                    ProviderError::Cache(format!(
+                        "OSV sync lock task for {} failed: {error}",
+                        eco.osv_name()
+                    ))
+                })??;
+        let url = format!("{}/{}/all.zip", config.base_url, eco.osv_name());
         debug!(%url, "downloading OSV dump");
-        let bytes = http.get_bytes(&url).await?;
-        let path = dir.join(format!("{}.zip", eco.osv_name().replace('.', "_")));
-        let tmp = path.with_extension("zip.tmp");
-        fs::write(&tmp, bytes).map_err(|e| ProviderError::Cache(e.to_string()))?;
-        fs::rename(tmp, &path).map_err(|e| ProviderError::Cache(e.to_string()))?;
-        fs::write(path.with_extension("synced-at"), Utc::now().to_rfc3339())
-            .map_err(|e| ProviderError::Cache(e.to_string()))?;
+        let path = dir.join(format!("{ecosystem_slug}.zip"));
+        let marker_path = path.with_extension("synced-at");
+        validate_marker_target(&marker_path)?;
+        let mut archive_temp = TempFileBuilder::new()
+            .prefix(&format!(".{ecosystem_slug}-"))
+            .suffix(".zip.tmp")
+            .tempfile_in(&dir)
+            .map_err(|error| ProviderError::Cache(error.to_string()))?;
+        if let Err(error) = http
+            .download_osv_dump(&url, archive_temp.as_file(), config)
+            .await
+        {
+            if !validate_owned_offline_directory(cache.root())
+                .is_ok_and(|directory| directory == dir)
+            {
+                archive_temp.disable_cleanup(true);
+            }
+            return Err(error);
+        }
+
+        let validation_file = archive_temp
+            .as_file()
+            .try_clone()
+            .map_err(|error| ProviderError::Cache(error.to_string()))?;
+        let validation_config = config.clone();
+        let validation = tokio::task::spawn_blocking(move || {
+            validate_osv_dump_file(validation_file, eco, &validation_config)
+        })
+        .await
+        .map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "OSV dump validation task for {} failed: {error}",
+                eco.osv_name()
+            ))
+        })?;
+        if let Err(error) = validation {
+            if !validate_owned_offline_directory(cache.root())
+                .is_ok_and(|directory| directory == dir)
+            {
+                archive_temp.disable_cleanup(true);
+            }
+            return Err(error);
+        }
+
+        let revalidated = match validate_owned_offline_directory(cache.root()) {
+            Ok(directory) => directory,
+            Err(error) => {
+                archive_temp.disable_cleanup(true);
+                return Err(error);
+            }
+        };
+        if revalidated != dir {
+            archive_temp.disable_cleanup(true);
+            return Err(cache_path_error(
+                &dir,
+                "offline namespace changed during dump validation",
+            ));
+        }
+        let mut marker_temp = TempFileBuilder::new()
+            .prefix(&format!(".{ecosystem_slug}-"))
+            .suffix(".synced-at.tmp")
+            .tempfile_in(&dir)
+            .map_err(|error| ProviderError::Cache(error.to_string()))?;
+        marker_temp
+            .write_all(Utc::now().to_rfc3339().as_bytes())
+            .and_then(|_| marker_temp.as_file().sync_all())
+            .map_err(|error| ProviderError::Cache(error.to_string()))?;
+        #[cfg(test)]
+        let backup_directory = config
+            .backup_directory
+            .clone()
+            .unwrap_or_else(|| dir.clone());
+        #[cfg(not(test))]
+        let backup_directory = dir.clone();
+        let stage_path = path.clone();
+        let stage_prefix = format!(".{ecosystem_slug}-");
+        let mut previous_archive = tokio::task::spawn_blocking(move || {
+            stage_previous_archive(&stage_path, &backup_directory, &stage_prefix)
+        })
+        .await
+        .map_err(|error| {
+            ProviderError::Cache(format!(
+                "OSV rollback staging task for {} failed: {error}",
+                eco.osv_name()
+            ))
+        })??;
+
+        let revalidated = match validate_owned_offline_directory(cache.root()) {
+            Ok(directory) => directory,
+            Err(error) => {
+                archive_temp.disable_cleanup(true);
+                marker_temp.disable_cleanup(true);
+                if let Some(previous) = previous_archive.as_mut() {
+                    previous.disable_cleanup(true);
+                }
+                return Err(error);
+            }
+        };
+        if revalidated != dir {
+            archive_temp.disable_cleanup(true);
+            marker_temp.disable_cleanup(true);
+            if let Some(previous) = previous_archive.as_mut() {
+                previous.disable_cleanup(true);
+            }
+            return Err(cache_path_error(
+                &dir,
+                "offline namespace changed before dump publication",
+            ));
+        }
+        validate_marker_target(&marker_path)?;
+        publish_osv_pair(
+            archive_temp.into_temp_path(),
+            marker_temp.into_temp_path(),
+            &path,
+            &marker_path,
+            previous_archive,
+        )?;
+        let _ = fs2::FileExt::unlock(&sync_lock);
         written.push(path);
     }
     Ok(written)
@@ -2242,8 +3075,14 @@ impl RegistryClient {
 mod tests {
     use super::*;
     use std::{
-        io::Write,
+        io::{Cursor, Write},
         sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::Notify,
+        task::JoinHandle,
     };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -2506,6 +3345,922 @@ mod tests {
             }
             archive.finish().unwrap();
         }
+    }
+
+    enum RawResponseBody {
+        Fixed(Vec<u8>),
+        Truncated {
+            body: Vec<u8>,
+            bytes_to_send: usize,
+        },
+        Chunked {
+            body: Vec<u8>,
+            chunk_size: usize,
+            delay: StdDuration,
+            pause_after_chunks: Option<usize>,
+            paused: Option<Arc<Notify>>,
+            resume: Option<Arc<Notify>>,
+        },
+    }
+
+    struct RawResponse {
+        status: u16,
+        retry_after: Option<String>,
+        body: RawResponseBody,
+    }
+
+    impl RawResponse {
+        fn fixed(status: u16, body: Vec<u8>) -> Self {
+            Self {
+                status,
+                retry_after: None,
+                body: RawResponseBody::Fixed(body),
+            }
+        }
+
+        fn truncated(body: Vec<u8>, bytes_to_send: usize) -> Self {
+            Self {
+                status: 200,
+                retry_after: None,
+                body: RawResponseBody::Truncated {
+                    body,
+                    bytes_to_send,
+                },
+            }
+        }
+    }
+
+    async fn read_raw_request(stream: &mut TcpStream) -> std::io::Result<()> {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.len() > 64 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test request headers are too large",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_raw_response(
+        stream: &mut TcpStream,
+        response: RawResponse,
+    ) -> std::io::Result<()> {
+        let reason = match response.status {
+            200 => "OK",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "Test Response",
+        };
+        let retry_after = response
+            .retry_after
+            .map(|value| format!("Retry-After: {value}\r\n"))
+            .unwrap_or_default();
+        match response.body {
+            RawResponseBody::Fixed(body) => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nConnection: close\r\n{}Content-Length: {}\r\n\r\n",
+                    response.status,
+                    reason,
+                    retry_after,
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await?;
+                stream.write_all(&body).await?;
+            }
+            RawResponseBody::Truncated {
+                body,
+                bytes_to_send,
+            } => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nConnection: close\r\n{}Content-Length: {}\r\n\r\n",
+                    response.status,
+                    reason,
+                    retry_after,
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await?;
+                stream
+                    .write_all(&body[..bytes_to_send.min(body.len())])
+                    .await?;
+            }
+            RawResponseBody::Chunked {
+                body,
+                chunk_size,
+                delay,
+                pause_after_chunks,
+                paused,
+                resume,
+            } => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nConnection: close\r\n{}Transfer-Encoding: chunked\r\n\r\n",
+                    response.status, reason, retry_after
+                );
+                stream.write_all(headers.as_bytes()).await?;
+                for (index, chunk) in body.chunks(chunk_size).enumerate() {
+                    stream
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await?;
+                    stream.write_all(chunk).await?;
+                    stream.write_all(b"\r\n").await?;
+                    stream.flush().await?;
+                    if pause_after_chunks == Some(index + 1) {
+                        if let Some(paused) = &paused {
+                            paused.notify_one();
+                        }
+                        if let Some(resume) = &resume {
+                            resume.notified().await;
+                        }
+                    }
+                    sleep(delay).await;
+                }
+                stream.write_all(b"0\r\n\r\n").await?;
+            }
+        }
+        stream.flush().await
+    }
+
+    async fn spawn_raw_server(
+        responses: Vec<RawResponse>,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let handle = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                if read_raw_request(&mut stream).await.is_ok() {
+                    let _ = write_raw_response(&mut stream, response).await;
+                }
+            }
+        });
+        (format!("http://{address}"), requests, handle)
+    }
+
+    fn dump_archive_bytes(payload_bytes: usize) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(cursor);
+        archive
+            .start_file(
+                "TEST-1.json",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"{"id":"TEST-1","modified":"2026-08-19T00:00:00Z","details":""#)
+            .unwrap();
+        archive.write_all(&vec![b'x'; payload_bytes]).unwrap();
+        archive.write_all(br#""}"#).unwrap();
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn archive_with_entry(name: &str, contents: &[u8]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(cursor);
+        archive
+            .start_file(
+                name,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive.write_all(contents).unwrap();
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn cache_for_sync(root: &Path) -> Cache {
+        Cache::from_root(root.to_path_buf(), CachePolicy::default()).unwrap()
+    }
+
+    fn sync_paths(cache: &Cache) -> (PathBuf, PathBuf) {
+        let archive = cache.root().join("offline/npm.zip");
+        let marker = archive.with_extension("synced-at");
+        (archive, marker)
+    }
+
+    fn seed_sync_files(cache: &Cache, archive_bytes: &[u8], marker: &str) {
+        let (archive, synced_at) = sync_paths(cache);
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::write(archive, archive_bytes).unwrap();
+        fs::write(synced_at, marker).unwrap();
+    }
+
+    fn assert_no_sync_temps(cache: &Cache) {
+        let offline = cache.root().join("offline");
+        let temporary = fs::read_dir(offline)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert!(
+            temporary.is_empty(),
+            "temporary files remain: {temporary:?}"
+        );
+    }
+
+    fn test_sync_config(base_url: String) -> OsvSyncConfig {
+        let mut config = OsvSyncConfig::new(OsvSyncOptions {
+            transfer_timeout: StdDuration::from_secs(5),
+        })
+        .unwrap();
+        config.base_url = base_url;
+        config.max_download_bytes = 32 * 1024 * 1024;
+        config.max_entry_bytes = 16 * 1024 * 1024;
+        config.max_uncompressed_bytes = 64 * 1024 * 1024;
+        config.max_entries = 100;
+        config.backoff_base = StdDuration::from_millis(1);
+        config.max_retry_delay = StdDuration::from_millis(5);
+        config
+    }
+
+    struct TrackedChunk {
+        bytes: Vec<u8>,
+        live_bytes: Arc<AtomicUsize>,
+    }
+
+    impl TrackedChunk {
+        fn new(size: usize, live_bytes: Arc<AtomicUsize>, peak_bytes: &AtomicUsize) -> Self {
+            let live = live_bytes.fetch_add(size, Ordering::SeqCst) + size;
+            peak_bytes.fetch_max(live, Ordering::SeqCst);
+            Self {
+                bytes: vec![b'x'; size],
+                live_bytes,
+            }
+        }
+    }
+
+    impl AsRef<[u8]> for TrackedChunk {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for TrackedChunk {
+        fn drop(&mut self) {
+            self.live_bytes
+                .fetch_sub(self.bytes.len(), Ordering::SeqCst);
+        }
+    }
+
+    async fn peak_live_stream_bytes(total_bytes: usize, chunk_bytes: usize) -> usize {
+        assert_eq!(total_bytes % chunk_bytes, 0);
+        let live_bytes = Arc::new(AtomicUsize::new(0));
+        let peak_bytes = Arc::new(AtomicUsize::new(0));
+        let chunks = stream::iter((0..total_bytes / chunk_bytes).map({
+            let live_bytes = live_bytes.clone();
+            let peak_bytes = peak_bytes.clone();
+            move |_| {
+                Ok::<_, std::io::Error>(TrackedChunk::new(
+                    chunk_bytes,
+                    live_bytes.clone(),
+                    &peak_bytes,
+                ))
+            }
+        }));
+        let mut destination = tokio::io::sink();
+        let mut config = test_sync_config("http://unused.test".to_owned());
+        config.max_download_bytes = total_bytes as u64;
+        let downloaded = stream_osv_dump_body(
+            chunks,
+            &mut destination,
+            "http://unused.test/dump.zip",
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(downloaded, total_bytes as u64);
+        assert_eq!(live_bytes.load(Ordering::SeqCst), 0);
+        peak_bytes.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn streamed_dump_memory_is_bounded_by_chunk_size_not_archive_size() {
+        let chunk_bytes = 64 * 1024;
+        let small_peak = peak_live_stream_bytes(4 * 1024 * 1024, chunk_bytes).await;
+        let large_peak = peak_live_stream_bytes(128 * 1024 * 1024, chunk_bytes).await;
+
+        assert_eq!(small_peak, chunk_bytes);
+        assert_eq!(large_peak, chunk_bytes);
+    }
+
+    #[tokio::test]
+    async fn ecosystem_sync_lock_serializes_competing_writers() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let (_, first_lock) = acquire_osv_sync_lock(cache.root(), "npm").unwrap();
+        let started = Arc::new(Notify::new());
+        let waiter_started = started.clone();
+        let root = cache.root().to_path_buf();
+        let mut waiter = tokio::task::spawn_blocking(move || {
+            waiter_started.notify_one();
+            acquire_osv_sync_lock(&root, "npm")
+        });
+
+        started.notified().await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "a competing same-ecosystem sync acquired the lock early"
+        );
+        fs2::FileExt::unlock(&first_lock).unwrap();
+        let (_, second_lock) = waiter.await.unwrap().unwrap();
+        fs2::FileExt::unlock(&second_lock).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_removes_only_owned_abandoned_temporary_files() {
+        let replacement = dump_archive_bytes(1024);
+        let (base_url, requests, server) =
+            spawn_raw_server(vec![RawResponse::fixed(200, replacement)]).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let offline = cache.root().join("offline");
+        fs::create_dir(&offline).unwrap();
+        for name in [
+            ".npm-old.zip.tmp",
+            ".npm-old.synced-at.tmp",
+            ".npm-old.zip.rollback.tmp",
+            ".npm-old.zip.tmp.keep",
+            ".npmx-old.zip.tmp",
+            ".pypi-old.zip.tmp",
+            "unrelated.tmp",
+        ] {
+            fs::write(offline.join(name), b"stale fixture").unwrap();
+        }
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let config = test_sync_config(base_url);
+
+        sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        for name in [
+            ".npm-old.zip.tmp",
+            ".npm-old.synced-at.tmp",
+            ".npm-old.zip.rollback.tmp",
+        ] {
+            assert!(!offline.join(name).exists(), "{name} was not reclaimed");
+        }
+        for name in [
+            ".npm-old.zip.tmp.keep",
+            ".npmx-old.zip.tmp",
+            ".pypi-old.zip.tmp",
+            "unrelated.tmp",
+        ] {
+            assert!(offline.join(name).is_file(), "{name} was removed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_refuses_a_symlinked_offline_namespace_without_external_writes() {
+        use std::os::unix::fs::symlink;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let external = tempfile::tempdir().unwrap();
+        let important = external.path().join("important.txt");
+        fs::write(&important, b"preserve").unwrap();
+        symlink(external.path(), cache.root().join("offline")).unwrap();
+        let client = HttpClient::new().unwrap();
+        let config = test_sync_config("http://127.0.0.1:9".to_owned());
+
+        let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Cache(_)));
+        assert_eq!(fs::read(important).unwrap(), b"preserve");
+        assert!(!external.path().join("npm.zip").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_refuses_a_cache_root_swapped_to_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let original = cache.root().to_path_buf();
+        let moved = original.with_extension("owned-before-swap");
+        let external = tempfile::tempdir().unwrap();
+        let important = external.path().join("important.txt");
+        fs::write(&important, b"preserve").unwrap();
+        fs::rename(&original, &moved).unwrap();
+        symlink(external.path(), &original).unwrap();
+        let client = HttpClient::new().unwrap();
+        let config = test_sync_config("http://127.0.0.1:9".to_owned());
+
+        let result = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config).await;
+        fs::remove_file(&original).unwrap();
+        fs::rename(&moved, &original).unwrap();
+
+        assert!(matches!(result, Err(ProviderError::Cache(_))));
+        assert_eq!(fs::read(important).unwrap(), b"preserve");
+        assert!(!external.path().join("npm.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn sync_streams_a_slow_large_dump_before_atomic_replacement() {
+        let previous = dump_archive_bytes(32);
+        let replacement = dump_archive_bytes(4 * 1024 * 1024);
+        let paused = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let response = RawResponse {
+            status: 200,
+            retry_after: None,
+            body: RawResponseBody::Chunked {
+                body: replacement.clone(),
+                chunk_size: 64 * 1024,
+                delay: StdDuration::from_millis(3),
+                pause_after_chunks: Some(8),
+                paused: Some(paused.clone()),
+                resume: Some(resume.clone()),
+            },
+        };
+        let (base_url, requests, server) = spawn_raw_server(vec![response]).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let previous_marker = "2000-01-01T00:00:00Z";
+        seed_sync_files(&cache, &previous, previous_marker);
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_millis(50), StdDuration::from_secs(1))
+                .unwrap();
+        let observed_chunk_bytes = Arc::new(AtomicUsize::new(0));
+        let mut config = test_sync_config(base_url);
+        config.observed_max_chunk_bytes = Some(observed_chunk_bytes.clone());
+        let sync_cache = cache.clone();
+        let sync = tokio::spawn(async move {
+            sync_osv_dumps_with_config(&client, &sync_cache, &[Ecosystem::Npm], &config).await
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(2), paused.notified())
+            .await
+            .expect("slow response did not reach its pause");
+        let (archive_path, marker_path) = sync_paths(&cache);
+        assert_eq!(fs::read(&archive_path).unwrap(), previous);
+        assert_eq!(fs::read_to_string(&marker_path).unwrap(), previous_marker);
+
+        let partial_size = tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                let partial = fs::read_dir(cache.root().join("offline"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.file_name().to_string_lossy().ends_with(".zip.tmp"))
+                    .and_then(|entry| entry.metadata().ok())
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default();
+                if partial > 0 {
+                    break partial;
+                }
+                sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("streamed bytes were not written to the temporary file");
+        assert!(partial_size < replacement.len() as u64);
+
+        resume.notify_one();
+        let paths = sync.await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(paths, vec![archive_path.clone()]);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(observed_chunk_bytes.load(Ordering::SeqCst) > 0);
+        assert!(observed_chunk_bytes.load(Ordering::SeqCst) < replacement.len());
+        assert_eq!(fs::read(&archive_path).unwrap(), replacement);
+        assert_ne!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[tokio::test]
+    async fn sync_retries_an_interrupted_body_from_an_empty_temp_file() {
+        let previous = dump_archive_bytes(32);
+        let replacement = dump_archive_bytes(256 * 1024);
+        let responses = vec![
+            RawResponse::truncated(replacement.clone(), replacement.len() / 2),
+            RawResponse::fixed(200, replacement.clone()),
+        ];
+        let (base_url, requests, server) = spawn_raw_server(responses).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        seed_sync_files(&cache, &previous, "2000-01-01T00:00:00Z");
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let config = test_sync_config(base_url);
+
+        sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let (archive_path, _) = sync_paths(&cache);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read(archive_path).unwrap(), replacement);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[tokio::test]
+    async fn sync_retries_429_and_5xx_and_caps_delta_retry_after() {
+        let replacement = dump_archive_bytes(1024);
+        let responses = vec![
+            RawResponse {
+                status: 429,
+                retry_after: Some("999999".to_owned()),
+                body: RawResponseBody::Fixed(Vec::new()),
+            },
+            RawResponse::fixed(500, Vec::new()),
+            RawResponse::fixed(200, replacement.clone()),
+        ];
+        let (base_url, requests, server) = spawn_raw_server(responses).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let config = test_sync_config(base_url);
+
+        tokio::time::timeout(
+            StdDuration::from_secs(1),
+            sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config),
+        )
+        .await
+        .expect("Retry-After was not capped")
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), replacement);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[tokio::test]
+    async fn failed_interrupted_transfers_preserve_known_good_files_and_clean_temps() {
+        let previous = dump_archive_bytes(32);
+        let replacement = dump_archive_bytes(64 * 1024);
+        let responses = (0..OSV_DUMP_ATTEMPTS)
+            .map(|_| RawResponse::truncated(replacement.clone(), replacement.len() / 3))
+            .collect();
+        let (base_url, requests, server) = spawn_raw_server(responses).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let previous_marker = "2000-01-01T00:00:00Z";
+        seed_sync_files(&cache, &previous, previous_marker);
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let config = test_sync_config(base_url);
+
+        let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::Network(_)));
+        assert_eq!(requests.load(Ordering::SeqCst), OSV_DUMP_ATTEMPTS);
+        let (archive_path, marker_path) = sync_paths(&cache);
+        assert_eq!(fs::read(archive_path).unwrap(), previous);
+        assert_eq!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[tokio::test]
+    async fn corrupt_zip_preserves_known_good_files_and_is_not_retried() {
+        let previous = dump_archive_bytes(32);
+        let corrupt = b"this is not a zip archive".to_vec();
+        let (base_url, requests, server) =
+            spawn_raw_server(vec![RawResponse::fixed(200, corrupt)]).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let previous_marker = "2000-01-01T00:00:00Z";
+        seed_sync_files(&cache, &previous, previous_marker);
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let config = test_sync_config(base_url);
+
+        let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::InvalidResponse(_)));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let (archive_path, marker_path) = sync_paths(&cache);
+        assert_eq!(fs::read(archive_path).unwrap(), previous);
+        assert_eq!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[tokio::test]
+    async fn syntactically_valid_non_osv_json_preserves_known_good_files() {
+        let previous = dump_archive_bytes(32);
+        let invalid = archive_with_entry("TEST-1.json", b"{}");
+        let (base_url, requests, server) =
+            spawn_raw_server(vec![RawResponse::fixed(200, invalid)]).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let previous_marker = "2000-01-01T00:00:00Z";
+        seed_sync_files(&cache, &previous, previous_marker);
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let config = test_sync_config(base_url);
+
+        let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::InvalidResponse(_)));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let (archive_path, marker_path) = sync_paths(&cache);
+        assert_eq!(fs::read(archive_path).unwrap(), previous);
+        assert_eq!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[tokio::test]
+    async fn rollback_staging_failure_leaves_the_previous_pair_untouched() {
+        let previous = dump_archive_bytes(32);
+        let replacement = dump_archive_bytes(1024);
+        let (base_url, requests, server) =
+            spawn_raw_server(vec![RawResponse::fixed(200, replacement)]).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let previous_marker = "2000-01-01T00:00:00Z";
+        seed_sync_files(&cache, &previous, previous_marker);
+        let backup_blocker = cache.root().join("backup-blocker");
+        fs::write(&backup_blocker, b"not a directory").unwrap();
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let mut config = test_sync_config(base_url);
+        config.backup_directory = Some(backup_blocker);
+
+        let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::Cache(_)));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let (archive_path, marker_path) = sync_paths(&cache);
+        assert_eq!(fs::read(archive_path).unwrap(), previous);
+        assert_eq!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[tokio::test]
+    async fn invalid_marker_target_is_rejected_before_download_or_replacement() {
+        let previous = dump_archive_bytes(32);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        seed_sync_files(&cache, &previous, "2000-01-01T00:00:00Z");
+        let (archive_path, marker_path) = sync_paths(&cache);
+        fs::remove_file(&marker_path).unwrap();
+        fs::create_dir(&marker_path).unwrap();
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let config = test_sync_config("http://127.0.0.1:9".to_owned());
+
+        let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Cache(_)));
+        assert_eq!(fs::read(archive_path).unwrap(), previous);
+        assert!(marker_path.is_dir());
+        assert_no_sync_temps(&cache);
+    }
+
+    #[test]
+    fn staged_backup_restores_a_replaced_archive_without_copying_after_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("npm.zip");
+        let previous = dump_archive_bytes(32);
+        fs::write(&archive, &previous).unwrap();
+        let backup = stage_previous_archive(&archive, directory.path(), ".npm-")
+            .unwrap()
+            .unwrap();
+
+        let mut replacement = TempFileBuilder::new()
+            .suffix(".zip.tmp")
+            .tempfile_in(directory.path())
+            .unwrap();
+        replacement.write_all(&dump_archive_bytes(1024)).unwrap();
+        replacement.into_temp_path().persist(&archive).unwrap();
+        restore_previous_archive(Some(backup), &archive).unwrap();
+
+        assert_eq!(fs::read(archive).unwrap(), previous);
+    }
+
+    #[test]
+    fn failed_restore_retains_the_last_recovery_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("npm.zip");
+        let previous = dump_archive_bytes(32);
+        fs::write(&archive, &previous).unwrap();
+        let backup = stage_previous_archive(&archive, directory.path(), ".npm-")
+            .unwrap()
+            .unwrap();
+        fs::remove_file(&archive).unwrap();
+        fs::create_dir(&archive).unwrap();
+
+        let error = restore_previous_archive(Some(backup), &archive).unwrap_err();
+        let recovery_files = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".zip.rollback.tmp")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+
+        assert!(error.to_string().contains("rollback copy retained at"));
+        assert_eq!(recovery_files.len(), 1);
+        assert_eq!(fs::read(&recovery_files[0]).unwrap(), previous);
+        assert!(archive.is_dir());
+    }
+
+    #[test]
+    fn marker_publication_failure_exercises_pair_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("npm.zip");
+        let marker = directory.path().join("npm.synced-at");
+        let previous_archive = dump_archive_bytes(32);
+        let previous_marker = b"2000-01-01T00:00:00Z";
+        fs::write(&archive, &previous_archive).unwrap();
+        fs::write(&marker, previous_marker).unwrap();
+        let backup = stage_previous_archive(&archive, directory.path(), ".npm-").unwrap();
+
+        let mut archive_temp = TempFileBuilder::new()
+            .prefix(".npm-")
+            .suffix(".zip.tmp")
+            .tempfile_in(directory.path())
+            .unwrap();
+        archive_temp.write_all(&dump_archive_bytes(1024)).unwrap();
+        let mut marker_temp = TempFileBuilder::new()
+            .prefix(".npm-")
+            .suffix(".synced-at.tmp")
+            .tempfile_in(directory.path())
+            .unwrap();
+        marker_temp.write_all(b"2026-08-19T00:00:00Z").unwrap();
+        let marker_blocker = directory.path().join("marker-blocker");
+        fs::create_dir(&marker_blocker).unwrap();
+
+        let error = publish_osv_pair_with(
+            archive_temp.into_temp_path(),
+            marker_temp.into_temp_path(),
+            &archive,
+            &marker,
+            backup,
+            |temporary, _| temporary.persist(&marker_blocker),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("restored previous archive"));
+        assert_eq!(fs::read(&archive).unwrap(), previous_archive);
+        assert_eq!(fs::read(&marker).unwrap(), previous_marker);
+        let temporary = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert!(
+            temporary.is_empty(),
+            "temporary files remain: {temporary:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configurable_transfer_deadline_preserves_known_good_files() {
+        let previous = dump_archive_bytes(32);
+        let replacement = dump_archive_bytes(512 * 1024);
+        let responses = (0..2)
+            .map(|_| RawResponse {
+                status: 200,
+                retry_after: None,
+                body: RawResponseBody::Chunked {
+                    body: replacement.clone(),
+                    chunk_size: 32 * 1024,
+                    delay: StdDuration::from_millis(20),
+                    pause_after_chunks: None,
+                    paused: None,
+                    resume: None,
+                },
+            })
+            .collect();
+        let (base_url, requests, server) = spawn_raw_server(responses).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_for_sync(cache_dir.path());
+        let previous_marker = "2000-01-01T00:00:00Z";
+        seed_sync_files(&cache, &previous, previous_marker);
+        let client =
+            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
+                .unwrap();
+        let mut config = test_sync_config(base_url);
+        config.transfer_timeout = StdDuration::from_millis(45);
+        config.attempts = 2;
+
+        let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::Network(_)));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let (archive_path, marker_path) = sync_paths(&cache);
+        assert_eq!(fs::read(archive_path).unwrap(), previous);
+        assert_eq!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+        assert_no_sync_temps(&cache);
+    }
+
+    #[test]
+    fn dump_validation_requires_complete_bounded_osv_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.zip");
+        let config = test_sync_config("http://unused.test".to_owned());
+        let valid =
+            br#"{"id":"TEST-1","modified":"2026-08-19T00:00:00Z","details":"forward-compatible"}"#;
+
+        fs::write(&path, archive_with_entry("TEST-1.json", valid)).unwrap();
+        validate_osv_dump(&path, Ecosystem::Npm, &config).unwrap();
+
+        for (name, contents) in [
+            ("README.txt", b"not JSON".as_slice()),
+            ("TEST-1.json", b"{}".as_slice()),
+            ("TEST-1.json", b"null".as_slice()),
+            ("TEST-1.json", b"[]".as_slice()),
+            (
+                "TEST-1.json",
+                br#"{"id":"TEST-1","modified":"not-a-timestamp"}"#.as_slice(),
+            ),
+            (
+                "TEST-1.json",
+                br#"{"id":"UNKNOWN","modified":"2026-08-19T00:00:00Z"}"#.as_slice(),
+            ),
+            ("TEST-1.json", br#"{"id":"TEST-1""#.as_slice()),
+        ] {
+            fs::write(&path, archive_with_entry(name, contents)).unwrap();
+            assert!(
+                matches!(
+                    validate_osv_dump(&path, Ecosystem::Npm, &config),
+                    Err(ProviderError::InvalidResponse(_))
+                ),
+                "accepted invalid entry {name:?}: {}",
+                String::from_utf8_lossy(contents)
+            );
+        }
+
+        fs::write(&path, archive_with_entry("OTHER-1.json", valid)).unwrap();
+        assert!(matches!(
+            validate_osv_dump(&path, Ecosystem::Npm, &config),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+
+        let mut limited = config;
+        limited.max_entry_bytes = valid.len() as u64 - 1;
+        fs::write(&path, archive_with_entry("TEST-1.json", valid)).unwrap();
+        assert!(matches!(
+            validate_osv_dump(&path, Ecosystem::Npm, &limited),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+
+        let mut forged = archive_with_entry("TEST-1.json", valid);
+        let central_header = forged
+            .windows(4)
+            .rposition(|window| window == b"PK\x01\x02")
+            .unwrap();
+        let forged_declared_size = u32::try_from(valid.len() - 2).unwrap();
+        forged[central_header + 24..central_header + 28]
+            .copy_from_slice(&forged_declared_size.to_le_bytes());
+        fs::write(&path, forged).unwrap();
+        limited.max_entry_bytes = valid.len() as u64 - 1;
+        let error = validate_osv_dump(&path, Ecosystem::Npm, &limited).unwrap_err();
+        assert!(
+            error.to_string().contains("actual uncompressed"),
+            "unexpected forged-size error: {error}"
+        );
     }
 
     fn nuget_package(name: &str) -> Package {

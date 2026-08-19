@@ -974,7 +974,10 @@ fn typed_cli_values_and_required_arguments_fail_during_clap_parsing() {
     let directory = TestDirectory::new("typed-cli-errors");
     let cases = vec![
         (vec!["scan", "--ecosystem", "ruby"], "possible values"),
-        (vec!["sync", "--ecosystem", "ruby"], "possible values"),
+        (
+            vec!["sync", "--transfer-timeout", "1s", "--ecosystem", "ruby"],
+            "possible values",
+        ),
         (vec!["scan", "--format", "xml"], "possible values"),
         (vec!["scan", "--fail-on", "severe"], "possible values"),
         (
@@ -993,6 +996,22 @@ fn typed_cli_values_and_required_arguments_fail_during_clap_parsing() {
         ),
         (
             vec!["scan", "--max-cache-age", "9223372036854775807d"],
+            "outside the supported range",
+        ),
+        (
+            vec!["sync", "--transfer-timeout", "0s"],
+            "must be greater than zero",
+        ),
+        (
+            vec!["sync", "--transfer-timeout", "24"],
+            "requires one of s, m, h, or d",
+        ),
+        (
+            vec![
+                "sync",
+                "--transfer-timeout",
+                "999999999999999999999999999999h",
+            ],
             "outside the supported range",
         ),
         (vec!["completions", "tcsh"], "possible values"),
@@ -1169,7 +1188,7 @@ fn help_and_subcommand_contracts_match_byte_snapshots() {
         ),
         (
             &["sync", "--help"][..],
-            "ff54447075c00fbee270d829811893444eb2ef35d7bb3fda2bd6b706b09fd10f",
+            "fd120e80384cb8a4b1cd7e3452e4d46512f88791c6f5a856514e19f2cbdc5dc0",
         ),
         (
             &["cache", "--help"][..],
@@ -1195,11 +1214,11 @@ fn generated_completions_match_byte_snapshots_and_advertise_typed_values() {
     for (shell, expected_sha256) in [
         (
             "bash",
-            "83d85fcf42b14d0a16c16e8308a411137cbc456c7f0947af038cd7c83293bd08",
+            "e9e469922e7cffb61efeffe0382827ba91caa129effdd824dee5c70aa292285c",
         ),
         (
             "fish",
-            "3dcf1bbbf5159325faa2eaef118cd32526945ef46a6bc5a7b06fb021ad7dea4c",
+            "989e635d8898854f7614f18bbc8f3256bbc4fac7537e173cb810d0932a39f1bf",
         ),
     ] {
         let output = command(&directory.path().join("cache"))

@@ -34,7 +34,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-013](DS-013.md) | P1 | Closed | Fail closed on malformed OSV batch responses |
 | [DS-014](DS-014.md) | P1 | Closed | Follow OSV per-query pagination |
 | [DS-015](DS-015.md) | P1 | Closed | Revalidate OSV and registry caches |
-| [DS-016](DS-016.md) | P1 | Open | Make offline dump sync streaming and resilient |
+| [DS-016](DS-016.md) | P1 | Closed | Make offline dump sync streaming and resilient |
 | [DS-017](DS-017.md) | P1 | Closed | Contain recursive requirements includes to the scan root |
 | [DS-018](DS-018.md) | P1 | Closed | Prevent sparse-index path panics on invalid crate names |
 | [DS-019](DS-019.md) | P1 | Closed | Implement the specified exit-code taxonomy |
@@ -65,3 +65,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-044](DS-044.md) | P1 | Closed | Strengthen CLI help and typed value parsing |
 | [DS-045](DS-045.md) | P2 | Open | Generate release automation and complete the target matrix |
 | [DS-046](DS-046.md) | P2 | Open | Deliver and verify genuinely static Linux artifacts |
+| [DS-047](DS-047.md) | P1 | Open | Make offline sync publication capability-safe during directory swaps |
