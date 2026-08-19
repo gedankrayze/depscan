@@ -332,6 +332,12 @@ fn python_fixture(case: &str) -> PathBuf {
         .join(case)
 }
 
+fn npm_fixture(case: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../depscan-parsers/tests/fixtures")
+        .join(case)
+}
+
 fn lock_schema_fixture(format: &str, case: &str, file: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../depscan-parsers/tests/fixtures/schema-validation")
@@ -342,6 +348,10 @@ fn lock_schema_fixture(format: &str, case: &str, file: &str) -> PathBuf {
 
 fn seed_empty_pypi_dump(cache: &Path) {
     seed_empty_osv_dump(cache, "PyPI");
+}
+
+fn seed_empty_npm_dump(cache: &Path) {
+    seed_empty_osv_dump(cache, "npm");
 }
 
 fn seed_empty_cargo_dump(cache: &Path) {
@@ -412,6 +422,86 @@ fn report_package_names(report: &serde_json::Value) -> BTreeSet<&str> {
                 .expect("reported package name")
         })
         .collect()
+}
+
+#[test]
+fn npm_direct_only_uses_lock_edges_and_retains_unbound_unknowns() {
+    let directory = TestDirectory::new("npm-lock-directness-filter");
+    let cache = directory.path().join("cache");
+    fs::copy(
+        npm_fixture("npm-v3-directness").join("package-lock.json"),
+        directory.path().join("package-lock.json"),
+    )
+    .expect("copy lock-only npm directness fixture");
+    seed_empty_npm_dump(&cache);
+
+    let output = command(&cache)
+        .args([
+            "scan",
+            "--offline",
+            "--format",
+            "json",
+            "--direct-only",
+            directory.path().to_str().expect("UTF-8 project path"),
+        ])
+        .output()
+        .expect("run direct-only npm scan");
+
+    assert_exit(&output, 0);
+    let report = json_report(&output);
+    assert_eq!(
+        report_package_names(&report),
+        BTreeSet::from([
+            "duplicate",
+            "hoisted",
+            "parent",
+            "root-actual",
+            "root-direct",
+            "shared",
+            "unreferenced",
+            "unreferenced-child",
+            "unreferenced-parent",
+            "workspace-actual",
+        ])
+    );
+    let packages = report_packages(&report);
+    assert!(
+        packages.iter().all(|result| {
+            let name = result
+                .pointer("/package/name")
+                .and_then(serde_json::Value::as_str)
+                .expect("package name");
+            if name.starts_with("unreferenced") {
+                result
+                    .pointer("/package/direct_known")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            } else {
+                result
+                    .pointer("/package/direct")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && result
+                        .pointer("/package/direct_known")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            }
+        }),
+        "direct-only must retain Direct and Unknown packages only"
+    );
+    assert!(
+        packages.iter().all(|result| {
+            !(result
+                .pointer("/package/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("duplicate")
+                && result
+                    .pointer("/package/version")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("1.0.0"))
+        }),
+        "proven-transitive duplicate@1.0.0 must be filtered"
+    );
 }
 
 #[test]
@@ -705,6 +795,62 @@ source = { registry = "https://pypi.org/simple" }
             .pointer("/package/name")
             .and_then(serde_json::Value::as_str),
         Some("orphan")
+    );
+    assert_eq!(
+        packages[0]
+            .pointer("/package/dev_known")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
+
+#[test]
+fn no_dev_retains_pnpm_packages_with_unknown_scope() {
+    let directory = TestDirectory::new("pnpm-unknown-scope");
+    let cache = directory.path().join("cache");
+    fs::write(
+        directory.path().join("pnpm-lock.yaml"),
+        r#"lockfileVersion: '9.0'
+importers:
+  .:
+    devDependencies:
+      known-development:
+        specifier: 1.0.0
+        version: 1.0.0
+packages:
+  known-development@1.0.0:
+    resolution: {integrity: sha512-known}
+  unknown-scope@1.0.0:
+    resolution: {integrity: sha512-unknown}
+snapshots:
+  known-development@1.0.0: {}
+  unknown-scope@1.0.0: {}
+"#,
+    )
+    .expect("write pnpm lockfile with mixed development confidence");
+    seed_empty_npm_dump(&cache);
+
+    let output = command(&cache)
+        .args([
+            "scan",
+            "--offline",
+            "--format",
+            "json",
+            "--no-dev",
+            directory.path().to_str().expect("UTF-8 project path"),
+        ])
+        .output()
+        .expect("run pnpm scan with unknown scope");
+
+    assert_exit(&output, 0);
+    let report = json_report(&output);
+    let packages = report_packages(&report);
+    assert_eq!(packages.len(), 1);
+    assert_eq!(
+        packages[0]
+            .pointer("/package/name")
+            .and_then(serde_json::Value::as_str),
+        Some("unknown-scope")
     );
     assert_eq!(
         packages[0]

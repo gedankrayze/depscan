@@ -1,0 +1,8 @@
+{
+  "name": "arbitrary-non-workspace",
+  "private": true,
+  "dependencies": {
+    "ignored-direct": "1.0.0",
+    "same-name": "^2.0.0"
+  }
+}

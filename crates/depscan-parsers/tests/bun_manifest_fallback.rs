@@ -9,7 +9,7 @@ fn parses_root_and_workspace_manifests_with_range_provenance() {
     fs::write(
         directory.path().join("package.json"),
         r#"{
-            "workspaces": ["packages/*"],
+            "workspaces": [".", "packages/*"],
             "dependencies": {"root-production": "^1.2.0", "local-workspace": "workspace:*"},
             "devDependencies": {"root-development": "~2.0.0"}
         }"#,
@@ -56,7 +56,7 @@ fn parses_root_and_workspace_manifests_with_range_provenance() {
     assert!(!packages["local-workspace"].enrichable);
     assert_eq!(
         packages["workspace-production"].source_file,
-        workspace.join("package.json")
+        fs::canonicalize(workspace.join("package.json")).unwrap()
     );
 }
 
@@ -97,4 +97,37 @@ fn rejects_missing_malformed_and_escaping_manifests() {
         malformed_dependency.contains("must have a non-empty string constraint"),
         "{malformed_dependency}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_workspace_manifest_symlinks_to_inside_and_outside_targets() {
+    use std::os::unix::fs::symlink;
+
+    for outside in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("bun.lockb");
+        fs::write(&lock, b"binary fixture").unwrap();
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let workspace = directory.path().join("packages/member");
+        fs::create_dir_all(&workspace).unwrap();
+        let target = if outside {
+            external.path().join("package.json")
+        } else {
+            directory.path().join("validated-inside-package.json")
+        };
+        fs::write(&target, r#"{"dependencies":{"unexpected":"1.0.0"}}"#).unwrap();
+        symlink(&target, workspace.join("package.json")).unwrap();
+
+        let error = parse_bun_manifest_fallback(&lock).unwrap_err().to_string();
+        assert!(
+            error.contains("must be a non-symlink regular file"),
+            "workspace symlink outside={outside} returned: {error}"
+        );
+    }
 }

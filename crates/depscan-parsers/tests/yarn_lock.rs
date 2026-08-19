@@ -2,7 +2,10 @@ use depscan_core::{DetectedSource, EcosystemParser, Package, SourceKind};
 use depscan_parsers::NodeParser;
 use semver::Version;
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn fixture(case: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -12,8 +15,12 @@ fn fixture(case: &str) -> PathBuf {
 }
 
 fn parse(case: &str) -> Result<Vec<Package>, depscan_core::ParseError> {
+    parse_path(fixture(case))
+}
+
+fn parse_path(path: PathBuf) -> Result<Vec<Package>, depscan_core::ParseError> {
     NodeParser.parse(&DetectedSource {
-        path: fixture(case),
+        path,
         kind: SourceKind::YarnLock,
     })
 }
@@ -38,6 +45,124 @@ fn snapshot(packages: &[Package]) -> Value {
 }
 
 #[test]
+fn deep_declared_yarn_workspaces_are_direct_but_arbitrary_manifests_are_ignored() {
+    let packages = parse("deep-workspace-directness").unwrap();
+    let package = |name: &str, version: &str| {
+        packages
+            .iter()
+            .find(|package| package.name == name && package.version == version)
+            .unwrap_or_else(|| panic!("missing Yarn package {name}@{version}"))
+    };
+
+    for (name, version) in [
+        ("alias-target", "3.1.0"),
+        ("deep-direct", "1.0.0"),
+        ("normalized-direct", "6.2.2"),
+        ("root-direct", "1.0.0"),
+        ("same-name", "1.5.0"),
+    ] {
+        let package = package(name, version);
+        assert!(package.direct, "{name}@{version} was not direct");
+        assert!(package.direct_known);
+        assert!(
+            package.dev_known,
+            "{name}@{version} had unknown development scope"
+        );
+    }
+    for (name, version) in [
+        ("alias-target", "4.1.0"),
+        ("ambiguous-direct", "7.1.0"),
+        ("ambiguous-direct", "7.2.0"),
+        ("ignored-direct", "1.0.0"),
+        ("mismatched-selector", "2.1.0"),
+        ("same-name", "2.5.0"),
+        ("transitive", "1.0.0"),
+    ] {
+        let package = package(name, version);
+        assert!(!package.direct, "{name}@{version} was spuriously direct");
+        assert!(
+            !package.direct_known,
+            "unbound {name}@{version} was spuriously classified as transitive"
+        );
+        assert!(
+            !package.dev_known,
+            "unbound {name}@{version} had spuriously known development scope"
+        );
+    }
+}
+
+#[test]
+fn missing_and_malformed_yarn_manifests_keep_directness_unknown() {
+    let source = fixture("deep-workspace-directness");
+    for malformed in [false, true] {
+        let project = tempfile::tempdir().unwrap();
+        let lock = project.path().join("yarn.lock");
+        fs::copy(&source, &lock).unwrap();
+        if malformed {
+            fs::write(project.path().join("package.json"), "{not-json").unwrap();
+        }
+
+        let packages = parse_path(lock).unwrap();
+        assert!(packages.iter().all(|package| !package.direct));
+        assert!(packages.iter().all(|package| !package.direct_known));
+        assert!(packages.iter().all(|package| !package.dev_known));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_root_manifest_cannot_prove_yarn_directness() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let lock = project.path().join("yarn.lock");
+    fs::copy(fixture("deep-workspace-directness"), &lock).unwrap();
+    let outside_manifest = outside.path().join("package.json");
+    fs::write(
+        &outside_manifest,
+        r#"{"dependencies":{"root-direct":"1.0.0"}}"#,
+    )
+    .unwrap();
+    symlink(&outside_manifest, project.path().join("package.json")).unwrap();
+
+    let packages = parse_path(lock).unwrap();
+    assert!(packages.iter().all(|package| !package.direct));
+    assert!(packages.iter().all(|package| !package.direct_known));
+    assert!(packages.iter().all(|package| !package.dev_known));
+}
+
+#[test]
+fn proven_yarn_directness_survives_an_unreadable_workspace_manifest() {
+    let project = tempfile::tempdir().unwrap();
+    let lock = project.path().join("yarn.lock");
+    fs::copy(fixture("deep-workspace-directness"), &lock).unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"workspaces":["packages/*"],"dependencies":{"root-direct":"1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::create_dir(project.path().join("packages")).unwrap();
+    fs::create_dir(project.path().join("packages/bad")).unwrap();
+    fs::write(project.path().join("packages/bad/package.json"), "{bad").unwrap();
+
+    let packages = parse_path(lock).unwrap();
+    let root = packages
+        .iter()
+        .find(|package| package.name == "root-direct")
+        .unwrap();
+    assert!(root.direct);
+    assert!(root.direct_known);
+    assert!(root.dev_known);
+    assert!(
+        packages
+            .iter()
+            .filter(|package| package.name != "root-direct")
+            .all(|package| !package.direct && !package.direct_known && !package.dev_known)
+    );
+}
+
+#[test]
 fn parses_current_yarn_berry_with_aliases_workspaces_and_protocols() {
     let lock = fixture("berry-v10");
     let packages = parse("berry-v10").unwrap();
@@ -53,6 +178,11 @@ fn parses_current_yarn_berry_with_aliases_workspaces_and_protocols() {
         packages
             .iter()
             .all(|package| !matches!(package.name.as_str(), "berry-root" | "workspace-pkg"))
+    );
+    assert!(
+        packages
+            .iter()
+            .all(|package| package.dev_known == package.direct)
     );
     insta::assert_json_snapshot!(snapshot(&packages), @r#"
     [
@@ -143,6 +273,11 @@ fn preserves_yarn_classic_parsing_and_manifest_provenance() {
             .iter()
             .filter(|package| package.enrichable)
             .all(|package| Version::parse(&package.version).is_ok())
+    );
+    assert!(
+        packages
+            .iter()
+            .all(|package| package.dev_known == package.direct)
     );
     insta::assert_json_snapshot!(snapshot(&packages), @r#"
     [

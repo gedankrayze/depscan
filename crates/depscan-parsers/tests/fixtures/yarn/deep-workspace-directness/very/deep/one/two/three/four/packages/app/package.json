@@ -1,0 +1,8 @@
+{
+  "name": "deep-workspace-app",
+  "private": true,
+  "dependencies": {
+    "deep-direct": "1.0.0",
+    "same-name": "^1.0.0"
+  }
+}

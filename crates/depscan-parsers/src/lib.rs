@@ -167,29 +167,6 @@ fn source(root: &Path, name: &str, kind: SourceKind) -> Option<DetectedSource> {
     candidate(root, name, kind)
 }
 
-fn sorted_project_files(root: &Path, extensions: &[&str]) -> Vec<PathBuf> {
-    let mut paths: Vec<_> = WalkDir::new(root)
-        .max_depth(5)
-        .into_iter()
-        .filter_entry(|e| {
-            !matches!(
-                e.file_name().to_str(),
-                Some("node_modules" | ".git" | "target" | ".venv")
-            )
-        })
-        .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().is_file()
-                && extensions
-                    .iter()
-                    .any(|ext| e.path().extension().and_then(|x| x.to_str()) == Some(*ext))
-        })
-        .map(|e| e.into_path())
-        .collect();
-    paths.sort();
-    paths
-}
-
 pub struct NodeParser;
 impl EcosystemParser for NodeParser {
     fn ecosystem(&self) -> Ecosystem {
@@ -230,63 +207,96 @@ impl EcosystemParser for NodeParser {
 #[derive(Default)]
 struct NodeDirectDependencies {
     all: HashSet<String>,
-    by_directory: BTreeMap<PathBuf, HashSet<String>>,
+    complete: bool,
 }
 
 impl NodeDirectDependencies {
-    fn includes(&self, name: &str) -> bool {
-        self.all.contains(name)
+    fn directness(&self, name: &str) -> Option<bool> {
+        self.all
+            .contains(name)
+            .then_some(true)
+            .or_else(|| self.complete.then_some(false))
+    }
+}
+
+struct NodeProjectDependency {
+    name: String,
+    constraint: String,
+    development: bool,
+}
+
+#[derive(Default)]
+struct NodeProjectDependencies {
+    declarations: Vec<NodeProjectDependency>,
+    complete: bool,
+}
+
+fn append_node_manifest_dependencies(
+    path: &Path,
+    value: &Json,
+    dependencies: &mut NodeProjectDependencies,
+) -> Result<(), ParseError> {
+    dependencies
+        .declarations
+        .extend(
+            parse_package_json_value(path, value)?
+                .into_iter()
+                .map(|package| {
+                    let constraint = package
+                        .manifest_constraint
+                        .expect("package.json dependency has a manifest constraint")
+                        .raw()
+                        .to_owned();
+                    NodeProjectDependency {
+                        name: package.display_name,
+                        constraint,
+                        development: package.dev,
+                    }
+                }),
+        );
+    Ok(())
+}
+
+fn node_project_dependencies(root: &Path) -> NodeProjectDependencies {
+    let root_manifest = root.join("package.json");
+    let Ok(root_value) = read_validated_root_package_json(&root_manifest) else {
+        return NodeProjectDependencies::default();
+    };
+
+    let mut dependencies = NodeProjectDependencies::default();
+    if append_node_manifest_dependencies(&root_manifest, &root_value, &mut dependencies).is_err() {
+        return dependencies;
     }
 
-    fn includes_package_at(&self, install_parent: &Path, name: &str) -> bool {
-        if install_parent.as_os_str().is_empty() {
-            return self.includes(name);
+    let Ok(manifests) = workspace_manifests(&root_manifest, &root_value) else {
+        return dependencies;
+    };
+    let mut complete = true;
+    for manifest in manifests {
+        if manifest == root_manifest {
+            continue;
         }
-
-        self.by_directory
-            .get(install_parent)
-            .is_some_and(|names| names.contains(name))
+        let parsed = read_package_json(&manifest).and_then(|value| {
+            append_node_manifest_dependencies(&manifest, &value, &mut dependencies)
+        });
+        if parsed.is_err() {
+            complete = false;
+        }
     }
+    dependencies.complete = complete;
+    dependencies
 }
 
 fn node_direct_dependencies(root: &Path) -> NodeDirectDependencies {
-    let mut direct = NodeDirectDependencies::default();
-    for path in sorted_project_files(root, &["json"])
-        .into_iter()
-        .filter(|p| p.file_name().and_then(|x| x.to_str()) == Some("package.json"))
-    {
-        if let Ok(text) = fs::read_to_string(&path)
-            && let Ok(value) = serde_json::from_str::<Json>(&text)
-        {
-            let mut manifest_names = HashSet::new();
-            for key in [
-                "dependencies",
-                "devDependencies",
-                "optionalDependencies",
-                "peerDependencies",
-            ] {
-                if let Some(obj) = value.get(key).and_then(Json::as_object) {
-                    manifest_names.extend(obj.keys().cloned());
-                }
-            }
-            if let Some(directory) = path
-                .parent()
-                .and_then(|parent| parent.strip_prefix(root).ok())
-            {
-                direct
-                    .by_directory
-                    .entry(directory.to_path_buf())
-                    .or_default()
-                    .extend(manifest_names.iter().cloned());
-            }
-            direct.all.extend(manifest_names);
-        }
+    let dependencies = node_project_dependencies(root);
+    let mut direct = NodeDirectDependencies {
+        complete: dependencies.complete,
+        ..NodeDirectDependencies::default()
+    };
+    for declaration in dependencies.declarations {
+        direct.all.insert(declaration.name);
     }
     direct
-}
-
-fn node_direct_names(root: &Path) -> HashSet<String> {
-    node_direct_dependencies(root).all
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -295,35 +305,39 @@ struct YarnDirectness {
     development: bool,
 }
 
-fn yarn_direct_dependencies(root: &Path) -> HashMap<String, YarnDirectness> {
-    let mut direct = HashMap::<String, YarnDirectness>::new();
-    for path in sorted_project_files(root, &["json"])
-        .into_iter()
-        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json"))
-    {
-        let Ok(text) = fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Json>(&text) else {
-            continue;
-        };
-        for (group, is_development) in [
-            ("dependencies", false),
-            ("devDependencies", true),
-            ("optionalDependencies", false),
-            ("peerDependencies", false),
-        ] {
-            let Some(dependencies) = value.get(group).and_then(Json::as_object) else {
-                continue;
-            };
-            for name in dependencies.keys() {
-                let flags = direct.entry(name.clone()).or_default();
-                if is_development {
-                    flags.development = true;
-                } else {
-                    flags.production = true;
-                }
-            }
+#[derive(Clone)]
+struct YarnDirectSelector {
+    constraint: String,
+    directness: YarnDirectness,
+    matching_entries: usize,
+}
+
+#[derive(Default)]
+struct YarnDirectDependencies {
+    by_name: HashMap<String, Vec<YarnDirectSelector>>,
+}
+
+fn yarn_direct_dependencies(root: &Path) -> YarnDirectDependencies {
+    let dependencies = node_project_dependencies(root);
+    let mut direct = YarnDirectDependencies::default();
+    for declaration in dependencies.declarations {
+        let selectors = direct.by_name.entry(declaration.name).or_default();
+        let selector_index = selectors
+            .iter()
+            .position(|selector| selector.constraint == declaration.constraint)
+            .unwrap_or_else(|| {
+                selectors.push(YarnDirectSelector {
+                    constraint: declaration.constraint,
+                    directness: YarnDirectness::default(),
+                    matching_entries: 0,
+                });
+                selectors.len() - 1
+            });
+        let flags = &mut selectors[selector_index].directness;
+        if declaration.development {
+            flags.development = true;
+        } else {
+            flags.production = true;
         }
     }
     direct
@@ -331,7 +345,6 @@ fn yarn_direct_dependencies(root: &Path) -> HashMap<String, YarnDirectness> {
 
 struct NpmPackageLocation {
     name: String,
-    install_parent: PathBuf,
     install_parent_key: String,
 }
 
@@ -368,7 +381,6 @@ fn npm_package_location(location: &str) -> Option<NpmPackageLocation> {
 
     Some(NpmPackageLocation {
         name,
-        install_parent: segments[..node_modules].iter().collect(),
         install_parent_key: segments[..node_modules].join("/"),
     })
 }
@@ -821,11 +833,23 @@ impl NpmDependencyDeclarations {
 #[derive(Default)]
 struct NpmLockDeclarations {
     by_install_location: HashMap<String, NpmDependencyDeclarations>,
+    direct_locations: BTreeSet<String>,
+    reachable_locations: BTreeSet<String>,
 }
 
 impl NpmLockDeclarations {
     fn selected(&self, install_location: &str) -> Option<&NpmDependencyDeclarations> {
         self.by_install_location.get(install_location)
+    }
+
+    fn directness(&self, install_location: &str) -> Option<bool> {
+        if self.direct_locations.contains(install_location) {
+            Some(true)
+        } else if self.reachable_locations.contains(install_location) {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 
@@ -1091,6 +1115,7 @@ fn npm_lock_declarations(
     workspace_patterns: &NpmWorkspacePatterns,
 ) -> Result<NpmLockDeclarations, ParseError> {
     let mut declarations = NpmLockDeclarations::default();
+    let mut dependency_edges = BTreeMap::<String, BTreeSet<String>>::new();
     for (location, entry) in package_entries {
         let entry = entry.as_object().ok_or_else(|| {
             invalid(
@@ -1173,6 +1198,16 @@ fn npm_lock_declarations(
                     .entry(install_location.to_owned())
                     .or_default()
                     .merge(location, parsed);
+                if project_descriptor {
+                    declarations
+                        .direct_locations
+                        .insert(install_location.to_owned());
+                } else {
+                    dependency_edges
+                        .entry(location.to_owned())
+                        .or_default()
+                        .insert(install_location.to_owned());
+                }
             } else if required {
                 return Err(invalid(
                     path,
@@ -1180,6 +1215,25 @@ fn npm_lock_declarations(
                         "npm package entry {location:?} required dependency {name:?} in {group:?} has no installed package record"
                     ),
                 ));
+            }
+        }
+    }
+
+    let mut pending = declarations
+        .direct_locations
+        .iter()
+        .cloned()
+        .collect::<VecDeque<_>>();
+    declarations
+        .reachable_locations
+        .clone_from(&declarations.direct_locations);
+    while let Some(location) = pending.pop_front() {
+        let Some(children) = dependency_edges.get(&location) else {
+            continue;
+        };
+        for child in children {
+            if declarations.reachable_locations.insert(child.clone()) {
+                pending.push_back(child.clone());
             }
         }
     }
@@ -1234,8 +1288,6 @@ fn npm_descriptor_fallback_name(target: &str) -> Option<String> {
 
 fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let root = path.parent().unwrap_or(Path::new("."));
-    let direct = node_direct_dependencies(root);
     let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
     let document = value.as_object().ok_or_else(|| {
         invalid(
@@ -1255,6 +1307,8 @@ fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let mut packages = Vec::new();
     match lockfile_version {
         1 => {
+            let root = path.parent().unwrap_or(Path::new("."));
+            let direct = node_direct_dependencies(root);
             let dependencies = document
                 .get("dependencies")
                 .and_then(Json::as_object)
@@ -1264,7 +1318,7 @@ fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                         "detected npm package-lock.json version 1 without a dependencies object; expected the legacy dependency tree",
                     )
                 })?;
-            parse_legacy_npm_tree(dependencies, path, &direct.all, true, &mut packages);
+            parse_legacy_npm_tree(dependencies, path, &direct, true, &mut packages);
         }
         2 | 3 => {
             let package_entries = document
@@ -1692,8 +1746,12 @@ fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                 };
                 let mut package =
                     Package::new(Ecosystem::Npm, package_name, &version, path.to_path_buf());
-                package.direct =
-                    direct.includes_package_at(&location.install_parent, &location.name);
+                if let Some(direct) = declarations.directness(key) {
+                    package.direct = direct;
+                    package.direct_known = true;
+                } else {
+                    package.direct_known = false;
+                }
                 package.dev = dev;
                 package.enrichable = enrichable;
                 packages.push(package);
@@ -1713,7 +1771,7 @@ fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
 fn parse_legacy_npm_tree(
     dependencies: &serde_json::Map<String, Json>,
     path: &Path,
-    direct: &HashSet<String>,
+    direct: &NodeDirectDependencies,
     top_level: bool,
     out: &mut Vec<Package>,
 ) {
@@ -1734,7 +1792,12 @@ fn parse_legacy_npm_tree(
             };
             let mut package =
                 Package::new(Ecosystem::Npm, name, &report_version, path.to_path_buf());
-            package.direct = top_level && direct.contains(name);
+            if top_level {
+                match direct.directness(name) {
+                    Some(is_direct) => package.direct = is_direct,
+                    None => package.direct_known = false,
+                }
+            }
             package.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
             package.enrichable = parsed_version.is_ok()
                 && !npm_lock_source_locator(version)
@@ -2246,8 +2309,6 @@ fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
             ),
         ));
     }
-    let root = path.parent().unwrap_or(Path::new("."));
-    let direct = node_direct_names(root);
     let mut out = Vec::new();
     let packages = value
         .get("packages")
@@ -2258,6 +2319,7 @@ fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                 "detected a supported pnpm lockfile without a packages mapping; expected the resolved package map",
             )
         })?;
+    let direct_references = pnpm_direct_references(&value, packages);
     for (key, entry) in packages {
         let entry = entry.as_mapping().ok_or_else(|| {
             invalid(
@@ -2303,15 +2365,171 @@ fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                     )
                 })
             })
-            .transpose()?
-            .unwrap_or(false);
+            .transpose()?;
+        let exact_locator = key.trim_start_matches('/');
         let mut package = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-        package.direct = direct.contains(&package.name);
-        package.dev = dev;
+        package.dev = dev.unwrap_or(false);
+        package.dev_known = dev.is_some();
+        if let Some(direct) = direct_references.get(exact_locator) {
+            package.direct = true;
+            package.direct_known = true;
+            package.dev = direct.development && !direct.production;
+            package.dev_known = true;
+            if let Some(display_alias) = direct.display_alias() {
+                package.display_name = display_alias.to_owned();
+            }
+        } else {
+            package.direct_known = false;
+        }
         out.push(package);
     }
     Ok(dedup(out))
 }
+
+#[derive(Default)]
+struct PnpmDirectReference {
+    production: bool,
+    development: bool,
+    canonical: bool,
+    aliases: BTreeSet<String>,
+}
+
+impl PnpmDirectReference {
+    fn display_alias(&self) -> Option<&str> {
+        (!self.canonical && self.aliases.len() == 1)
+            .then(|| self.aliases.first().map(String::as_str))
+            .flatten()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.production |= other.production;
+        self.development |= other.development;
+        self.canonical |= other.canonical;
+        self.aliases.extend(other.aliases);
+    }
+}
+
+fn pnpm_direct_references(
+    value: &Yaml,
+    packages: &noyalib::Mapping,
+) -> BTreeMap<String, PnpmDirectReference> {
+    let mut requested = BTreeMap::new();
+    if let Some(importers) = value.get("importers").and_then(Yaml::as_mapping) {
+        for importer in importers.values().filter_map(Yaml::as_mapping) {
+            append_pnpm_importer_references(importer, &mut requested);
+        }
+    }
+
+    // pnpm v6 uses these document-level dependency groups for a non-workspace project.
+    if value.get("importers").is_none()
+        && let Some(root) = value.as_mapping()
+    {
+        append_pnpm_importer_references(root, &mut requested);
+    }
+
+    let package_locators = packages
+        .keys()
+        .map(|locator| locator.trim_start_matches('/').to_owned())
+        .collect::<BTreeSet<_>>();
+    let snapshot_locators = value
+        .get("snapshots")
+        .and_then(Yaml::as_mapping)
+        .into_iter()
+        .flat_map(|snapshots| snapshots.iter())
+        .filter(|(_, snapshot)| snapshot.as_mapping().is_some())
+        .map(|(locator, _)| locator.trim_start_matches('/').to_owned())
+        .collect::<BTreeSet<_>>();
+
+    let mut direct = BTreeMap::<String, PnpmDirectReference>::new();
+    for (resolved_locator, reference) in requested {
+        let package_locator = if package_locators.contains(&resolved_locator) {
+            Some(resolved_locator)
+        } else if snapshot_locators.contains(&resolved_locator) {
+            parse_pnpm_key(&resolved_locator).map(|(name, version)| format!("{name}@{version}"))
+        } else {
+            None
+        };
+        let Some(package_locator) =
+            package_locator.filter(|locator| package_locators.contains(locator))
+        else {
+            continue;
+        };
+        direct.entry(package_locator).or_default().merge(reference);
+    }
+    direct
+}
+
+fn append_pnpm_importer_references(
+    importer: &noyalib::Mapping,
+    direct: &mut BTreeMap<String, PnpmDirectReference>,
+) {
+    for (group, development) in [
+        ("dependencies", false),
+        ("optionalDependencies", false),
+        ("peerDependencies", false),
+        ("devDependencies", true),
+    ] {
+        let Some(dependencies) = importer.get(group).and_then(Yaml::as_mapping) else {
+            continue;
+        };
+        for (declared_name, dependency) in dependencies {
+            let Some(version) = pnpm_importer_version(dependency) else {
+                continue;
+            };
+            let Some((locator, package_name)) = pnpm_resolved_locator(declared_name, version)
+            else {
+                continue;
+            };
+            let reference = direct.entry(locator).or_default();
+            if development {
+                reference.development = true;
+            } else {
+                reference.production = true;
+            }
+            if package_name != declared_name.as_str() {
+                reference.aliases.insert(declared_name.clone());
+            } else {
+                reference.canonical = true;
+            }
+        }
+    }
+}
+
+fn pnpm_importer_version(dependency: &Yaml) -> Option<&str> {
+    dependency.as_str().or_else(|| {
+        dependency
+            .as_mapping()
+            .and_then(|entry| entry.get("version"))
+            .and_then(Yaml::as_str)
+    })
+}
+
+fn pnpm_resolved_locator(declared_name: &str, resolved: &str) -> Option<(String, String)> {
+    let resolved = resolved.trim_start_matches('/');
+    if resolved.is_empty()
+        || resolved.starts_with("file:")
+        || resolved.starts_with("link:")
+        || resolved.starts_with("workspace:")
+        || resolved.starts_with("git+")
+        || resolved.starts_with("github:")
+        || resolved.starts_with("http://")
+        || resolved.starts_with("https://")
+    {
+        return None;
+    }
+
+    let locator = if parse_pnpm_key(resolved).is_some() {
+        resolved.to_owned()
+    } else {
+        format!("{declared_name}@{resolved}")
+    };
+    let (package_name, version) = parse_pnpm_key(&locator)?;
+    validate_bun_package_name(package_name).ok()?;
+    semver::Version::parse(version).ok()?;
+    let package_name = package_name.to_owned();
+    Some((locator, package_name))
+}
+
 fn parse_pnpm_key(raw: &str) -> Option<(&str, &str)> {
     let key = raw.trim_start_matches('/').split('(').next().unwrap_or(raw);
     let at = if let Some(stripped) = key.strip_prefix('@') {
@@ -2457,26 +2675,126 @@ fn yarn_reference_source(reference: &str) -> YarnSource {
     }
 }
 
+type YarnSemverBounds = ((u64, u64, u64), (u64, u64, u64));
+
+fn yarn_caret_bounds(selector: &str) -> Option<YarnSemverBounds> {
+    let raw = selector.strip_prefix('^')?;
+    let parts = raw
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let major = parts[0];
+    let minor = parts.get(1).copied().unwrap_or(0);
+    let patch = parts.get(2).copied().unwrap_or(0);
+    let upper = if parts.len() == 1 || major > 0 {
+        (major.checked_add(1)?, 0, 0)
+    } else if parts.len() == 2 || minor > 0 {
+        (0, minor.checked_add(1)?, 0)
+    } else {
+        (0, 0, patch.checked_add(1)?)
+    };
+    Some(((major, minor, patch), upper))
+}
+
+fn yarn_semver_selector_equivalent(left: &str, right: &str) -> bool {
+    left == right
+        || yarn_caret_bounds(left)
+            .zip(yarn_caret_bounds(right))
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn yarn_npm_selector_equivalent(left: &str, right: &str) -> bool {
+    if yarn_semver_selector_equivalent(left, right) {
+        return true;
+    }
+    let (Ok(left), Ok(right)) = (parse_yarn_locator(left), parse_yarn_locator(right)) else {
+        return false;
+    };
+    left.name == right.name && yarn_semver_selector_equivalent(left.reference, right.reference)
+}
+
+fn yarn_dependency_selector_matches(reference: &str, constraint: &str) -> bool {
+    let reference = reference.split("::").next().unwrap_or(reference);
+    if reference == constraint || reference.strip_prefix("npm:") == Some(constraint) {
+        return true;
+    }
+    match (
+        reference.strip_prefix("npm:"),
+        constraint.strip_prefix("npm:"),
+    ) {
+        (Some(reference), Some(constraint)) => yarn_npm_selector_equivalent(reference, constraint),
+        (Some(reference), None) => yarn_semver_selector_equivalent(reference, constraint),
+        (None, Some(_)) => false,
+        (None, None) => yarn_semver_selector_equivalent(reference, constraint),
+    }
+}
+
+fn bind_yarn_direct_dependencies(
+    direct: &YarnDirectDependencies,
+    descriptor_groups: &[Vec<String>],
+) -> Result<YarnDirectDependencies, String> {
+    let mut bound = YarnDirectDependencies {
+        by_name: direct.by_name.clone(),
+    };
+    for descriptors in descriptor_groups {
+        let parsed = descriptors
+            .iter()
+            .map(|descriptor| parse_yarn_locator(descriptor))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut entry_matches = BTreeSet::new();
+        for locator in parsed {
+            if let Some(selectors) = bound.by_name.get(locator.name) {
+                for (index, selector) in selectors.iter().enumerate() {
+                    if yarn_dependency_selector_matches(locator.reference, &selector.constraint) {
+                        entry_matches.insert((locator.name.to_owned(), index));
+                    }
+                }
+            }
+        }
+        for (name, index) in entry_matches {
+            bound
+                .by_name
+                .get_mut(&name)
+                .expect("Yarn selector match came from an existing direct dependency")[index]
+                .matching_entries += 1;
+        }
+    }
+    Ok(bound)
+}
+
 fn yarn_direct_metadata(
     descriptors: &[String],
     registry_name: &str,
-    direct: &HashMap<String, YarnDirectness>,
-) -> Result<(bool, bool, Option<String>), String> {
+    direct: &YarnDirectDependencies,
+) -> Result<(bool, bool, bool, bool, Option<String>), String> {
     let mut flags = YarnDirectness::default();
     let mut display_alias = None;
     for descriptor in descriptors {
         let locator = parse_yarn_locator(descriptor)?;
-        if let Some(directness) = direct.get(locator.name) {
-            flags.production |= directness.production;
-            flags.development |= directness.development;
-            if locator.name != registry_name {
-                display_alias.get_or_insert_with(|| locator.name.to_owned());
+        if let Some(selectors) = direct.by_name.get(locator.name) {
+            for selector in selectors {
+                let selected = selector.matching_entries == 1
+                    && yarn_dependency_selector_matches(locator.reference, &selector.constraint);
+                if selected {
+                    flags.production |= selector.directness.production;
+                    flags.development |= selector.directness.development;
+                    if locator.name != registry_name {
+                        display_alias.get_or_insert_with(|| locator.name.to_owned());
+                    }
+                }
             }
         }
     }
+    let is_direct = flags.production || flags.development;
     Ok((
-        flags.production || flags.development,
+        is_direct,
+        is_direct,
         flags.development && !flags.production,
+        is_direct,
         display_alias,
     ))
 }
@@ -2510,7 +2828,7 @@ fn validate_yarn_registry_version(
 fn parse_yarn_berry(
     path: &Path,
     text: &str,
-    direct: &HashMap<String, YarnDirectness>,
+    direct: &YarnDirectDependencies,
 ) -> Result<Vec<Package>, ParseError> {
     let value = parse_yaml_document(path, text)?;
     let entries = value
@@ -2534,6 +2852,23 @@ fn parse_yarn_berry(
             ),
         ));
     }
+
+    let mut descriptor_groups = Vec::new();
+    for (raw_key, _) in entries {
+        let key = raw_key.as_str();
+        if key == "__metadata" {
+            continue;
+        }
+        let descriptors = split_yarn_descriptors(key).map_err(|error| {
+            invalid(
+                path,
+                format!("invalid Yarn Berry descriptor list {key:?}: {error}"),
+            )
+        })?;
+        descriptor_groups.push(descriptors);
+    }
+    let direct = bind_yarn_direct_dependencies(direct, &descriptor_groups)
+        .map_err(|error| invalid(path, format!("invalid Yarn Berry descriptor: {error}")))?;
 
     let mut packages = Vec::new();
     for (raw_key, raw_entry) in entries {
@@ -2591,8 +2926,8 @@ fn parse_yarn_berry(
             )
             .map_err(|error| invalid(path, error))?;
         }
-        let (is_direct, is_dev, display_alias) =
-            yarn_direct_metadata(&descriptors, locator.name, direct).map_err(|error| {
+        let (is_direct, direct_known, is_dev, dev_known, display_alias) =
+            yarn_direct_metadata(&descriptors, locator.name, &direct).map_err(|error| {
                 invalid(
                     path,
                     format!("Yarn Berry entry {key:?} has invalid descriptor: {error}"),
@@ -2600,7 +2935,9 @@ fn parse_yarn_berry(
             })?;
         let mut package = Package::new(Ecosystem::Npm, locator.name, version, path.to_path_buf());
         package.direct = is_direct;
+        package.direct_known = direct_known;
         package.dev = is_dev;
+        package.dev_known = dev_known;
         package.enrichable = source == YarnSource::Registry;
         if let Some(display_alias) = display_alias {
             package.display_name = display_alias;
@@ -2621,9 +2958,9 @@ struct YarnClassicEntry {
 fn parse_yarn_classic(
     path: &Path,
     text: &str,
-    direct: &HashMap<String, YarnDirectness>,
+    direct: &YarnDirectDependencies,
 ) -> Result<Vec<Package>, ParseError> {
-    let mut packages = Vec::new();
+    let mut entries = Vec::new();
     let mut current: Option<YarnClassicEntry> = None;
     for (line_index, line) in text.lines().enumerate() {
         let line_number = line_index + 1;
@@ -2632,7 +2969,7 @@ fn parse_yarn_classic(
         }
         if !line.starts_with(' ') && !line.starts_with('\t') {
             if let Some(entry) = current.take() {
-                push_yarn_classic_entry(path, entry, direct, &mut packages)?;
+                entries.push(entry);
             }
             let key = line.strip_suffix(':').ok_or_else(|| {
                 invalid(
@@ -2710,7 +3047,17 @@ fn parse_yarn_classic(
         }
     }
     if let Some(entry) = current {
-        push_yarn_classic_entry(path, entry, direct, &mut packages)?;
+        entries.push(entry);
+    }
+    let descriptor_groups = entries
+        .iter()
+        .map(|entry| entry.descriptors.clone())
+        .collect::<Vec<_>>();
+    let direct = bind_yarn_direct_dependencies(direct, &descriptor_groups)
+        .map_err(|error| invalid(path, format!("invalid Yarn Classic descriptor: {error}")))?;
+    let mut packages = Vec::new();
+    for entry in entries {
+        push_yarn_classic_entry(path, entry, &direct, &mut packages)?;
     }
     Ok(dedup(packages))
 }
@@ -2718,7 +3065,7 @@ fn parse_yarn_classic(
 fn push_yarn_classic_entry(
     path: &Path,
     entry: YarnClassicEntry,
-    direct: &HashMap<String, YarnDirectness>,
+    direct: &YarnDirectDependencies,
     packages: &mut Vec<Package>,
 ) -> Result<(), ParseError> {
     let version = entry.version.ok_or_else(|| {
@@ -2774,7 +3121,7 @@ fn push_yarn_classic_entry(
             )
         })?;
     }
-    let (is_direct, is_dev, display_alias) =
+    let (is_direct, direct_known, is_dev, dev_known, display_alias) =
         yarn_direct_metadata(&entry.descriptors, &package_name, direct).map_err(|error| {
             invalid(
                 path,
@@ -2786,7 +3133,9 @@ fn push_yarn_classic_entry(
         })?;
     let mut package = Package::new(Ecosystem::Npm, package_name, version, path.to_path_buf());
     package.direct = is_direct;
+    package.direct_known = direct_known;
     package.dev = is_dev;
+    package.dev_known = dev_known;
     package.enrichable = source == YarnSource::Registry;
     if let Some(display_alias) = display_alias {
         package.display_name = display_alias;
@@ -2813,9 +3162,8 @@ fn yarn_classic_descriptor_source(locator: YarnLocator<'_>) -> Result<(&str, Yar
     Ok((locator.name, source))
 }
 
-fn read_package_json(path: &Path) -> Result<Json, ParseError> {
-    let text = fs::read_to_string(path).map_err(|error| io_error(path, error))?;
-    let value: Json = serde_json::from_str(&text).map_err(|error| invalid(path, error))?;
+fn parse_package_json_text(path: &Path, text: &str) -> Result<Json, ParseError> {
+    let value: Json = serde_json::from_str(text).map_err(|error| invalid(path, error))?;
     if !value.is_object() {
         return Err(invalid(
             path,
@@ -2823,6 +3171,49 @@ fn read_package_json(path: &Path) -> Result<Json, ParseError> {
         ));
     }
     Ok(value)
+}
+
+fn read_package_json(path: &Path) -> Result<Json, ParseError> {
+    let text = fs::read_to_string(path).map_err(|error| io_error(path, error))?;
+    parse_package_json_text(path, &text)
+}
+
+fn validated_package_json_root(root_manifest: &Path) -> Result<(PathBuf, PathBuf), ParseError> {
+    let metadata =
+        fs::symlink_metadata(root_manifest).map_err(|error| io_error(root_manifest, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid(
+            root_manifest,
+            "root package.json must be a non-symlink regular file",
+        ));
+    }
+    let root = nonempty_parent(root_manifest);
+    let canonical_root = fs::canonicalize(root).map_err(|error| io_error(root, error))?;
+    let canonical_manifest =
+        fs::canonicalize(root_manifest).map_err(|error| io_error(root_manifest, error))?;
+    if !canonical_manifest.starts_with(&canonical_root) || !canonical_manifest.is_file() {
+        return Err(invalid(
+            root_manifest,
+            "root package.json must resolve to a regular file inside the project root",
+        ));
+    }
+    Ok((canonical_root, canonical_manifest))
+}
+
+fn read_validated_root_package_json(path: &Path) -> Result<Json, ParseError> {
+    let (_, canonical_manifest) = validated_package_json_root(path)?;
+    let mut file = fs::File::open(&canonical_manifest).map_err(|error| io_error(path, error))?;
+    if !file
+        .metadata()
+        .map_err(|error| io_error(path, error))?
+        .is_file()
+    {
+        return Err(invalid(path, "root package.json is not a regular file"));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| io_error(path, error))?;
+    parse_package_json_text(path, &text)
 }
 
 fn npm_manifest_constraint_is_registry(range: &str) -> bool {
@@ -2954,15 +3345,7 @@ fn workspace_manifests(
     root_value: &Json,
 ) -> Result<Vec<PathBuf>, ParseError> {
     let root = nonempty_parent(root_manifest);
-    let canonical_root = fs::canonicalize(root).map_err(|error| io_error(root, error))?;
-    let canonical_manifest =
-        fs::canonicalize(root_manifest).map_err(|error| io_error(root_manifest, error))?;
-    if !canonical_manifest.starts_with(&canonical_root) || !canonical_manifest.is_file() {
-        return Err(invalid(
-            root_manifest,
-            "root package.json must resolve to a regular file inside the project root",
-        ));
-    }
+    let (canonical_root, canonical_manifest) = validated_package_json_root(root_manifest)?;
     let mut manifests = BTreeSet::from([root_manifest.to_path_buf()]);
     for workspace_pattern in workspace_patterns(root_manifest, root_value)? {
         let relative_pattern = Path::new(&workspace_pattern).join("package.json");
@@ -2994,6 +3377,17 @@ fn workspace_manifests(
                     format!("reading workspace pattern {workspace_pattern:?}: {error}"),
                 )
             })?;
+            let metadata =
+                fs::symlink_metadata(&candidate).map_err(|error| io_error(&candidate, error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(invalid(
+                    root_manifest,
+                    format!(
+                        "workspace manifest {} must be a non-symlink regular file",
+                        candidate.display()
+                    ),
+                ));
+            }
             let canonical_candidate =
                 fs::canonicalize(&candidate).map_err(|error| io_error(&candidate, error))?;
             if !canonical_candidate.starts_with(&canonical_root) {
@@ -3015,7 +3409,9 @@ fn workspace_manifests(
                 ));
             }
             matched = true;
-            manifests.insert(candidate);
+            if canonical_candidate != canonical_manifest {
+                manifests.insert(canonical_candidate);
+            }
             if manifests.len() > 10_000 {
                 return Err(invalid(
                     root_manifest,
@@ -3036,7 +3432,7 @@ fn workspace_manifests(
 }
 
 fn parse_package_json_project(root_manifest: &Path) -> Result<Vec<Package>, ParseError> {
-    let root_value = read_package_json(root_manifest)?;
+    let root_value = read_validated_root_package_json(root_manifest)?;
     let manifests = workspace_manifests(root_manifest, &root_value)?;
     let mut packages = Vec::new();
     for manifest in manifests {
@@ -4835,6 +5231,68 @@ mod tests {
         let lock = directory.path().join("package-lock.json");
         fs::write(&lock, serde_json::to_vec_pretty(value).unwrap()).unwrap();
         parse_package_lock(&lock)
+    }
+
+    fn assert_npm_lock_edge_directness(packages: &[Package]) {
+        let package = |name: &str, version: &str| {
+            packages
+                .iter()
+                .find(|package| package.name == name && package.version == version)
+                .unwrap_or_else(|| panic!("missing npm package {name}@{version}"))
+        };
+
+        for (name, version) in [
+            ("duplicate", "2.0.0"),
+            ("hoisted", "1.0.0"),
+            ("parent", "1.0.0"),
+            ("root-actual", "1.0.0"),
+            ("root-direct", "2.0.0"),
+            ("shared", "1.0.0"),
+            ("workspace-actual", "1.0.0"),
+        ] {
+            let package = package(name, version);
+            assert!(package.direct, "{name}@{version} was not direct");
+            assert!(
+                package.direct_known,
+                "{name}@{version} directness was not proven"
+            );
+        }
+
+        let nested_duplicate = package("duplicate", "1.0.0");
+        assert!(!nested_duplicate.direct);
+        assert!(nested_duplicate.direct_known);
+
+        for name in ["unreferenced", "unreferenced-parent", "unreferenced-child"] {
+            let unreferenced = package(name, "9.0.0");
+            assert!(!unreferenced.direct);
+            assert!(
+                !unreferenced.direct_known,
+                "disconnected {name} was spuriously classified as known transitive"
+            );
+        }
+        assert_eq!(
+            packages
+                .iter()
+                .filter(|package| package.name == "shared" && package.version == "1.0.0")
+                .count(),
+            1,
+            "dedup must retain one existentially direct shared coordinate"
+        );
+    }
+
+    #[test]
+    fn npm_v3_lock_edges_prove_exact_directness_without_external_manifests() {
+        assert_npm_lock_edge_directness(&npm_fixture_packages("npm-v3-directness"));
+    }
+
+    #[test]
+    fn npm_v2_lock_edges_prove_exact_directness_without_external_manifest() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/npm-v3-directness/package-lock.json");
+        let mut value: Json = serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+        value["lockfileVersion"] = json!(2);
+        let packages = parse_npm_value(&value).unwrap();
+        assert_npm_lock_edge_directness(&packages);
     }
 
     #[test]

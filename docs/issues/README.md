@@ -76,7 +76,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-055](DS-055.md) | P1 | Closed | Fail hard when every manifest vulnerability coordinate is unresolved |
 | [DS-056](DS-056.md) | P1 | Closed | Reject future-dated reusable provider-cache entries |
 | [DS-057](DS-057.md) | P1 | Closed | Reject malformed npm v2/v3 package records |
-| [DS-058](DS-058.md) | P1 | Open | Do not classify unproven Node dependencies as known transitive |
+| [DS-058](DS-058.md) | P1 | Closed | Do not classify unproven Node dependencies as known transitive |
 | [DS-059](DS-059.md) | P1 | Open | Bind Cargo direct and development metadata to exact locked identities |
 | [DS-060](DS-060.md) | P1 | Open | Make requirements include reads capability-safe |
 | [DS-061](DS-061.md) | P1 | In progress | Preserve the verified GitHub Action executable identity |

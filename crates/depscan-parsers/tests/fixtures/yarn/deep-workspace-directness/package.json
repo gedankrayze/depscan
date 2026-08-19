@@ -1,0 +1,12 @@
+{
+  "name": "deep-workspace-root",
+  "private": true,
+  "workspaces": ["very/deep/**/packages/*"],
+  "dependencies": {
+    "alias-direct": "npm:alias-target@^3",
+    "ambiguous-direct": "^7",
+    "mismatched-selector": "^1.0.0",
+    "normalized-direct": "^6",
+    "root-direct": "1.0.0"
+  }
+}
