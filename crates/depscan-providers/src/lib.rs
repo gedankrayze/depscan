@@ -1,7 +1,7 @@
 //! Network providers, disk cache, and OSV offline-dump support.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use cvss::Cvss;
 use depscan_core::{
     Ecosystem, LatestVersions, NuGetVersion, Package, ProviderError, Severity, VersionProvider,
@@ -14,13 +14,13 @@ use futures::{StreamExt, stream};
 use rand::RngExt;
 use reqwest::{
     Client, StatusCode,
-    header::{ACCEPT, ETAG, HeaderMap, HeaderValue, RETRY_AFTER},
+    header::{ACCEPT, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH, RETRY_AFTER},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
@@ -40,6 +40,7 @@ const USER_AGENT_VALUE: &str = concat!(
 const OSV_QUERY_TTL_SECS: i64 = 60 * 60;
 const OSV_MAX_QUERY_PAGES: usize = 1_000;
 const REGISTRY_TTL_SECS: i64 = 6 * 60 * 60;
+const CACHE_COMMIT_ATTEMPTS: usize = 3;
 const CRATES_IO_INDEX_BASE_URL: &str = "https://index.crates.io";
 const CRATES_IO_MAX_NAME_LEN: usize = 64;
 const CRATES_IO_MAX_INDEX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -118,9 +119,85 @@ fn valid_osv_id(id: &str) -> bool {
         && entry.bytes().all(valid_component)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OsvVulnerabilityRevision {
+    id: String,
+    modified: DateTime<Utc>,
+}
+
+impl OsvVulnerabilityRevision {
+    fn cache_key(&self) -> String {
+        format!(
+            "{}@{}",
+            self.id,
+            self.modified.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+        )
+    }
+}
+
+fn canonical_osv_revisions(value: Value) -> Option<Vec<OsvVulnerabilityRevision>> {
+    let parsed = serde_json::from_value::<Vec<OsvVulnerabilityRevision>>(value).ok()?;
+    let mut revisions = BTreeMap::<String, DateTime<Utc>>::new();
+    for revision in parsed {
+        if !valid_osv_id(&revision.id) {
+            return None;
+        }
+        revisions
+            .entry(revision.id)
+            .and_modify(|modified| *modified = std::cmp::max(*modified, revision.modified))
+            .or_insert(revision.modified);
+    }
+    Some(
+        revisions
+            .into_iter()
+            .map(|(id, modified)| OsvVulnerabilityRevision { id, modified })
+            .collect(),
+    )
+}
+
+fn osv_document_modified(doc: &Value, expected_id: &str) -> Result<DateTime<Utc>, ProviderError> {
+    let id = doc.get("id").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::InvalidResponse(format!(
+            "OSV hydration for {expected_id} returned no string id"
+        ))
+    })?;
+    if id != expected_id {
+        return Err(ProviderError::InvalidResponse(format!(
+            "OSV hydration for {expected_id} returned advisory {id}"
+        )));
+    }
+    let raw = doc.get("modified").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::InvalidResponse(format!(
+            "OSV hydration for {expected_id} returned no string modified timestamp"
+        ))
+    })?;
+    DateTime::parse_from_rfc3339(raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| {
+            ProviderError::InvalidResponse(format!(
+                "OSV hydration for {expected_id} returned an invalid modified timestamp"
+            ))
+        })
+}
+
+fn parse_osv_modified(
+    value: &Value,
+    context: impl std::fmt::Display,
+) -> Result<DateTime<Utc>, ProviderError> {
+    let raw = value.as_str().ok_or_else(|| {
+        invalid_osv_batch_response(format!("{context} has no string modified timestamp"))
+    })?;
+    DateTime::parse_from_rfc3339(raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| {
+            invalid_osv_batch_response(format!("{context} has an invalid modified timestamp"))
+        })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct OsvQueryBatchPage {
-    ids: Vec<String>,
+    revisions: Vec<OsvVulnerabilityRevision>,
     next_page_token: Option<String>,
 }
 
@@ -171,7 +248,7 @@ fn parse_osv_query_batch_response(
                 // OSV's protobuf JSON encoding represents a legitimate empty result as `{}`.
                 return if result.is_empty() || (result.len() == 1 && next_page_token.is_some()) {
                     Ok(OsvQueryBatchPage {
-                        ids: Vec::new(),
+                        revisions: Vec::new(),
                         next_page_token,
                     })
                 } else {
@@ -186,7 +263,7 @@ fn parse_osv_query_batch_response(
                 ))
             })?;
 
-            let ids = vulns
+            let revisions = vulns
                 .iter()
                 .enumerate()
                 .map(|(vuln_index, vulnerability)| {
@@ -208,11 +285,18 @@ fn parse_osv_query_batch_response(
                             "result {result_index} vulnerability {vuln_index} has an invalid id"
                         )));
                     }
-                    Ok(id.to_owned())
+                    let modified = parse_osv_modified(
+                        vulnerability.get("modified").unwrap_or(&Value::Null),
+                        format_args!("result {result_index} vulnerability {vuln_index}"),
+                    )?;
+                    Ok(OsvVulnerabilityRevision {
+                        id: id.to_owned(),
+                        modified,
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(OsvQueryBatchPage {
-                ids,
+                revisions,
                 next_page_token,
             })
         })
@@ -252,6 +336,34 @@ struct CacheEntry {
 }
 
 #[derive(Debug, Clone)]
+struct CacheLookup {
+    etag: Option<String>,
+    value: Value,
+    fresh: bool,
+}
+
+enum CacheCommit {
+    Written,
+    Conflict(Option<CacheLookup>),
+}
+
+fn add_if_none_match(headers: &mut HeaderMap, cached: Option<&CacheLookup>) -> bool {
+    let Some(etag) = cached.and_then(|entry| entry.etag.as_deref()) else {
+        return false;
+    };
+    match HeaderValue::from_str(etag) {
+        Ok(value) => {
+            headers.insert(IF_NONE_MATCH, value);
+            true
+        }
+        Err(error) => {
+            debug!(%error, "ignoring invalid cached ETag");
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
     policy: CachePolicy,
@@ -288,35 +400,46 @@ impl Cache {
         key: &str,
         ttl: Duration,
     ) -> Option<(Value, Option<String>)> {
+        self.lookup(namespace, key, ttl)
+            .filter(|entry| entry.fresh)
+            .map(|entry| (entry.value, entry.etag))
+    }
+    fn lookup(&self, namespace: &str, key: &str, ttl: Duration) -> Option<CacheLookup> {
         if !self.policy.read {
             return None;
         }
+        self.snapshot(namespace, key, ttl)
+    }
+    fn snapshot(&self, namespace: &str, key: &str, ttl: Duration) -> Option<CacheLookup> {
         let path = self.filename(namespace, key);
+        let entry = Self::read_entry(&path)?;
+        Some(self.lookup_from_entry(entry, ttl))
+    }
+    fn read_entry(path: &Path) -> Option<CacheEntry> {
         let text = fs::read_to_string(path).ok()?;
-        let entry: CacheEntry = serde_json::from_str(&text).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+    fn lookup_from_entry(&self, entry: CacheEntry, ttl: Duration) -> CacheLookup {
         let limit = self
             .policy
             .max_age
             .map_or(ttl, |max| std::cmp::min(ttl, max));
-        if Utc::now() - entry.stored_at > limit {
-            return None;
+        CacheLookup {
+            etag: entry.etag,
+            value: entry.value,
+            fresh: Utc::now() - entry.stored_at <= limit,
         }
-        Some((entry.value, entry.etag))
     }
-    pub fn put(
-        &self,
-        namespace: &str,
-        key: &str,
-        value: &Value,
-        etag: Option<String>,
-    ) -> Result<(), ProviderError> {
-        let path = self.filename(namespace, key);
+    fn lock_for(&self, path: &Path) -> Result<File, ProviderError> {
         let parent = path.parent().expect("cache filename has parent");
         fs::create_dir_all(parent).map_err(|e| ProviderError::Cache(e.to_string()))?;
-        let lock_path = parent.join(".lock");
-        let lock = File::create(lock_path).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        let lock =
+            File::create(parent.join(".lock")).map_err(|e| ProviderError::Cache(e.to_string()))?;
         lock.lock_exclusive()
             .map_err(|e| ProviderError::Cache(e.to_string()))?;
+        Ok(lock)
+    }
+    fn write_entry(path: &Path, value: &Value, etag: Option<String>) -> Result<(), ProviderError> {
         let entry = CacheEntry {
             stored_at: Utc::now(),
             etag,
@@ -328,9 +451,48 @@ impl Cache {
             serde_json::to_vec(&entry).map_err(|e| ProviderError::Cache(e.to_string()))?,
         )
         .map_err(|e| ProviderError::Cache(e.to_string()))?;
-        fs::rename(tmp, path).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        fs::rename(tmp, path).map_err(|e| ProviderError::Cache(e.to_string()))
+    }
+    pub fn put(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: &Value,
+        etag: Option<String>,
+    ) -> Result<(), ProviderError> {
+        let path = self.filename(namespace, key);
+        let lock = self.lock_for(&path)?;
+        Self::write_entry(&path, value, etag)?;
         let _ = fs2::FileExt::unlock(&lock);
         Ok(())
+    }
+    fn put_if_unchanged(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Option<&CacheLookup>,
+        value: &Value,
+        etag: Option<String>,
+        ttl: Duration,
+    ) -> Result<CacheCommit, ProviderError> {
+        let path = self.filename(namespace, key);
+        let lock = self.lock_for(&path)?;
+        let current = Self::read_entry(&path);
+        let unchanged = match (&current, expected) {
+            (None, None) => true,
+            (Some(current), Some(expected)) => {
+                current.etag == expected.etag && current.value == expected.value
+            }
+            _ => false,
+        };
+        if !unchanged {
+            let conflict = current.map(|entry| self.lookup_from_entry(entry, ttl));
+            let _ = fs2::FileExt::unlock(&lock);
+            return Ok(CacheCommit::Conflict(conflict));
+        }
+        Self::write_entry(&path, value, etag)?;
+        let _ = fs2::FileExt::unlock(&lock);
+        Ok(CacheCommit::Written)
     }
     pub fn clear(&self) -> Result<(), ProviderError> {
         if self.root.exists() {
@@ -365,6 +527,16 @@ pub struct CacheStats {
     pub bytes: u64,
 }
 
+enum Revalidated<T> {
+    Modified { value: T, etag: Option<String> },
+    NotModified { etag: Option<String> },
+}
+
+struct PublishedHydration {
+    value: Value,
+    reusable: bool,
+}
+
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Client,
@@ -387,7 +559,7 @@ impl HttpClient {
         url: &str,
         body: Option<Value>,
         headers: HeaderMap,
-    ) -> Result<(Value, Option<String>), ProviderError> {
+    ) -> Result<Revalidated<Value>, ProviderError> {
         let mut last_error = String::new();
         for attempt in 0..3 {
             let mut request = self
@@ -398,6 +570,14 @@ impl HttpClient {
                 request = request.json(body);
             }
             match request.send().await {
+                Ok(response) if response.status() == StatusCode::NOT_MODIFIED => {
+                    let etag = response
+                        .headers()
+                        .get(ETAG)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    return Ok(Revalidated::NotModified { etag });
+                }
                 Ok(response) if response.status().is_success() => {
                     let etag = response
                         .headers()
@@ -408,7 +588,7 @@ impl HttpClient {
                         .json::<Value>()
                         .await
                         .map_err(|e| ProviderError::InvalidResponse(format!("{url}: {e}")))?;
-                    return Ok((value, etag));
+                    return Ok(Revalidated::Modified { value, etag });
                 }
                 Ok(response) => {
                     let status = response.status();
@@ -441,13 +621,34 @@ impl HttpClient {
         url: &str,
         headers: HeaderMap,
     ) -> Result<(Value, Option<String>), ProviderError> {
+        match self
+            .request_json(reqwest::Method::GET, url, None, headers)
+            .await?
+        {
+            Revalidated::Modified { value, etag } => Ok((value, etag)),
+            Revalidated::NotModified { .. } => Err(ProviderError::InvalidResponse(format!(
+                "{url}: received HTTP 304 without a conditional cache request"
+            ))),
+        }
+    }
+    async fn get_json_revalidated(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<Revalidated<Value>, ProviderError> {
         self.request_json(reqwest::Method::GET, url, None, headers)
             .await
     }
     pub async fn post_json(&self, url: &str, body: Value) -> Result<Value, ProviderError> {
-        self.request_json(reqwest::Method::POST, url, Some(body), HeaderMap::new())
-            .await
-            .map(|x| x.0)
+        match self
+            .request_json(reqwest::Method::POST, url, Some(body), HeaderMap::new())
+            .await?
+        {
+            Revalidated::Modified { value, .. } => Ok(value),
+            Revalidated::NotModified { .. } => Err(ProviderError::InvalidResponse(format!(
+                "{url}: received HTTP 304 for a POST request"
+            ))),
+        }
     }
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
         let response = self
@@ -465,17 +666,28 @@ impl HttpClient {
             .map_err(|e| ProviderError::Network(format!("{url}: {e}")))
     }
 
-    async fn get_bytes_limited(
+    async fn get_bytes_limited_revalidated(
         &self,
         url: &str,
         max_bytes: usize,
-    ) -> Result<Vec<u8>, ProviderError> {
-        let mut response = self
+        headers: HeaderMap,
+    ) -> Result<Revalidated<Vec<u8>>, ProviderError> {
+        let response = self
             .inner
             .get(url)
+            .headers(headers)
             .send()
             .await
-            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?
+            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(Revalidated::NotModified { etag });
+        }
+        let mut response = response
             .error_for_status()
             .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
         let content_length = response.content_length();
@@ -507,7 +719,7 @@ impl HttpClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok(bytes)
+        Ok(Revalidated::Modified { value: bytes, etag })
     }
 }
 
@@ -531,9 +743,12 @@ impl OsvClient {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
         }
     }
-    async fn query_batch(&self, batch: &[Package]) -> Result<Vec<Vec<String>>, ProviderError> {
+    async fn query_batch(
+        &self,
+        batch: &[Package],
+    ) -> Result<Vec<Vec<OsvVulnerabilityRevision>>, ProviderError> {
         let url = format!("{}/v1/querybatch", self.base_url);
-        let mut ids = vec![BTreeSet::new(); batch.len()];
+        let mut revisions = vec![BTreeMap::<String, DateTime<Utc>>::new(); batch.len()];
         let mut seen_tokens = vec![BTreeSet::new(); batch.len()];
         let mut pages_seen = vec![0usize; batch.len()];
         let mut pending = (0..batch.len())
@@ -557,7 +772,14 @@ impl OsvClient {
             let mut next = Vec::new();
             for ((index, _), page) in pending.into_iter().zip(pages) {
                 pages_seen[index] += 1;
-                ids[index].extend(page.ids);
+                for revision in page.revisions {
+                    revisions[index]
+                        .entry(revision.id)
+                        .and_modify(|modified| {
+                            *modified = std::cmp::max(*modified, revision.modified)
+                        })
+                        .or_insert(revision.modified);
+                }
                 if let Some(token) = page.next_page_token {
                     if !seen_tokens[index].insert(token.clone()) {
                         return Err(invalid_osv_batch_response(format!(
@@ -575,101 +797,248 @@ impl OsvClient {
             pending = next;
         }
 
-        Ok(ids
+        Ok(revisions
             .into_iter()
-            .map(|ids| ids.into_iter().collect())
+            .map(|revisions| {
+                revisions
+                    .into_iter()
+                    .map(|(id, modified)| OsvVulnerabilityRevision { id, modified })
+                    .collect()
+            })
             .collect())
     }
-    async fn hydrate(&self, id: &str) -> Result<Value, ProviderError> {
-        if let Some((value, _)) = self.cache.get("osv/vuln", id, Duration::hours(24 * 3650)) {
-            return Ok(value);
+    fn publish_hydrated_document(
+        &self,
+        cache_key: &str,
+        id: &str,
+        value: &Value,
+        etag: Option<String>,
+        candidate_reusable: bool,
+    ) -> Result<PublishedHydration, ProviderError> {
+        let candidate_modified = osv_document_modified(value, id)?;
+        let ttl = Duration::hours(24 * 3650);
+        let mut generation = self.cache.snapshot("osv/vuln", cache_key, ttl);
+        for _ in 0..CACHE_COMMIT_ATTEMPTS {
+            if let Some(current) = &generation
+                && let Ok(current_modified) = osv_document_modified(&current.value, id)
+                && current_modified >= candidate_modified
+            {
+                return Ok(PublishedHydration {
+                    value: current.value.clone(),
+                    reusable: self.cache.policy.read && current.fresh,
+                });
+            }
+            match self.cache.put_if_unchanged(
+                "osv/vuln",
+                cache_key,
+                generation.as_ref(),
+                value,
+                etag.clone(),
+                ttl,
+            )? {
+                CacheCommit::Written => {
+                    return Ok(PublishedHydration {
+                        value: value.clone(),
+                        reusable: candidate_reusable,
+                    });
+                }
+                CacheCommit::Conflict(current) => generation = current,
+            }
+        }
+        Err(ProviderError::Cache(format!(
+            "OSV hydration cache entry for {id} changed repeatedly during publication"
+        )))
+    }
+    async fn hydrate(&self, revision: &OsvVulnerabilityRevision) -> Result<Value, ProviderError> {
+        let cache_key = revision.cache_key();
+        if let Some((value, _)) = self
+            .cache
+            .get("osv/vuln", &cache_key, Duration::hours(24 * 3650))
+        {
+            match osv_document_modified(&value, &revision.id) {
+                Ok(modified) if modified >= revision.modified => return Ok(value),
+                Ok(_) => debug!(
+                    id = %revision.id,
+                    "ignoring hydrated OSV cache entry older than its query revision"
+                ),
+                Err(error) => debug!(
+                    id = %revision.id,
+                    %error,
+                    "ignoring invalid hydrated OSV cache entry"
+                ),
+            }
         }
         let _permit = self
             .concurrency
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = format!("{}/v1/vulns/{id}", self.base_url);
+        let url = format!("{}/v1/vulns/{}", self.base_url, revision.id);
         let (value, etag) = self.http.get_json(&url, HeaderMap::new()).await?;
-        self.cache.put("osv/vuln", id, &value, etag)?;
-        Ok(value)
+        let actual_modified = osv_document_modified(&value, &revision.id)?;
+        if actual_modified < revision.modified {
+            return Err(ProviderError::InvalidResponse(format!(
+                "OSV hydration for {} is older than query revision {}",
+                revision.id, revision.modified
+            )));
+        }
+        let actual_revision = OsvVulnerabilityRevision {
+            id: revision.id.clone(),
+            modified: actual_modified,
+        };
+        let mut published = self.publish_hydrated_document(
+            &actual_revision.cache_key(),
+            &revision.id,
+            &value,
+            etag,
+            true,
+        )?;
+        if actual_revision != *revision {
+            published = self.publish_hydrated_document(
+                &cache_key,
+                &revision.id,
+                &published.value,
+                None,
+                published.reusable,
+            )?;
+        }
+        if self.cache.policy.read && published.reusable {
+            Ok(published.value)
+        } else {
+            Ok(value)
+        }
     }
 }
 #[async_trait]
 impl VulnProvider for OsvClient {
     async fn query(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
-        let mut map = VulnMap::new();
+        let query_ttl = Duration::seconds(OSV_QUERY_TTL_SECS);
+        let mut revisions_by_package = HashMap::<String, Vec<OsvVulnerabilityRevision>>::new();
         let mut missing = Vec::new();
         for package in packages
             .iter()
             .filter(|p| p.enrichable && !p.resolved_from_range)
         {
             let query_cache_key = osv_query_cache_key(package);
-            if let Some((cached, _)) = self.cache.get(
-                "osv/query",
-                &query_cache_key,
-                Duration::seconds(OSV_QUERY_TTL_SECS),
-            ) {
-                let ids: Vec<String> = cached
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                map.insert(
-                    package.key(),
-                    ids.into_iter()
-                        .map(|id| Vulnerability {
-                            id,
-                            aliases: vec![],
-                            summary: String::new(),
-                            severity: None,
-                            cvss_score: None,
-                            fixed_in: vec![],
-                            references: vec![],
-                            withdrawn: false,
-                        })
-                        .collect(),
-                );
+            let generation = self
+                .cache
+                .snapshot("osv/query", &query_cache_key, query_ttl);
+            if self.cache.policy.read
+                && let Some(cached) = &generation
+                && cached.fresh
+            {
+                if let Some(revisions) = canonical_osv_revisions(cached.value.clone()) {
+                    revisions_by_package.insert(package.key(), revisions);
+                } else {
+                    debug!(
+                        package = %package.display_name,
+                        "ignoring legacy or invalid OSV query cache entry"
+                    );
+                    missing.push((package.clone(), generation, true));
+                }
             } else {
-                missing.push(package.clone());
+                missing.push((package.clone(), generation, self.cache.policy.read));
             }
         }
-        for chunk in missing.chunks(1000) {
-            let lists = self.query_batch(chunk).await?;
-            for (package, ids) in chunk.iter().cloned().zip(lists) {
-                self.cache.put(
-                    "osv/query",
-                    &osv_query_cache_key(&package),
-                    &json!(ids),
-                    None,
-                )?;
-                map.insert(
-                    package.key(),
-                    ids.into_iter()
-                        .map(|id| Vulnerability {
-                            id,
-                            aliases: vec![],
-                            summary: String::new(),
-                            severity: None,
-                            cvss_score: None,
-                            fixed_in: vec![],
-                            references: vec![],
-                            withdrawn: false,
+
+        for _ in 0..CACHE_COMMIT_ATTEMPTS {
+            if missing.is_empty() {
+                break;
+            }
+            let mut conflicts = Vec::new();
+            for chunk in missing.chunks(1000) {
+                let batch = chunk
+                    .iter()
+                    .map(|(package, _, _)| package.clone())
+                    .collect::<Vec<_>>();
+                let lists = self.query_batch(&batch).await?;
+                for ((package, generation, enforce_regression), revisions) in
+                    chunk.iter().cloned().zip(lists)
+                {
+                    if let Some(previous) = enforce_regression
+                        .then(|| {
+                            generation
+                                .as_ref()
+                                .and_then(|entry| canonical_osv_revisions(entry.value.clone()))
                         })
-                        .collect(),
-                );
+                        .flatten()
+                    {
+                        let next = revisions
+                            .iter()
+                            .map(|revision| (revision.id.as_str(), revision.modified))
+                            .collect::<HashMap<_, _>>();
+                        if let Some(regressed) = previous.iter().find(|revision| {
+                            next.get(revision.id.as_str())
+                                .is_some_and(|modified| *modified < revision.modified)
+                        }) {
+                            return Err(ProviderError::InvalidResponse(format!(
+                                "OSV query revision for {} regressed below {}",
+                                regressed.id, regressed.modified
+                            )));
+                        }
+                    }
+                    let value = serde_json::to_value(&revisions)
+                        .map_err(|error| ProviderError::Cache(error.to_string()))?;
+                    match self.cache.put_if_unchanged(
+                        "osv/query",
+                        &osv_query_cache_key(&package),
+                        generation.as_ref(),
+                        &value,
+                        None,
+                        query_ttl,
+                    )? {
+                        CacheCommit::Written => {
+                            revisions_by_package.insert(package.key(), revisions);
+                        }
+                        CacheCommit::Conflict(current) => {
+                            conflicts.push((package, current, true));
+                        }
+                    }
+                }
+            }
+            missing = conflicts;
+        }
+        if !missing.is_empty() {
+            return Err(ProviderError::Cache(
+                "OSV query cache changed repeatedly during refresh".to_owned(),
+            ));
+        }
+
+        let mut map = VulnMap::new();
+        let mut latest_revisions = BTreeMap::<String, OsvVulnerabilityRevision>::new();
+        for (key, revisions) in &revisions_by_package {
+            map.insert(
+                key.clone(),
+                revisions
+                    .iter()
+                    .map(|revision| Vulnerability {
+                        id: revision.id.clone(),
+                        aliases: vec![],
+                        summary: String::new(),
+                        severity: None,
+                        cvss_score: None,
+                        fixed_in: vec![],
+                        references: vec![],
+                        withdrawn: false,
+                    })
+                    .collect(),
+            );
+            for revision in revisions {
+                latest_revisions
+                    .entry(revision.id.clone())
+                    .and_modify(|current| {
+                        if revision.modified > current.modified {
+                            *current = revision.clone();
+                        }
+                    })
+                    .or_insert_with(|| revision.clone());
             }
         }
-        let ids: BTreeSet<String> = map.values().flatten().map(|v| v.id.clone()).collect();
-        let hydrated = stream::iter(ids.into_iter().map(|id| {
+        let hydrated = stream::iter(latest_revisions.into_values().map(|revision| {
             let client = self.clone();
             async move {
-                let doc = client.hydrate(&id).await?;
-                Ok::<_, ProviderError>((id, doc))
+                let doc = client.hydrate(&revision).await?;
+                Ok::<_, ProviderError>((revision.id, doc))
             }
         }))
         .buffer_unordered(16)
@@ -1064,15 +1433,78 @@ impl RegistryClient {
         url: &str,
         headers: HeaderMap,
     ) -> Result<Value, ProviderError> {
-        if let Some((value, _)) =
-            self.cache
-                .get("registry", namespace, Duration::seconds(REGISTRY_TTL_SECS))
-        {
-            return Ok(value);
+        let ttl = Duration::seconds(REGISTRY_TTL_SECS);
+        let mut generation = self.cache.snapshot("registry", namespace, ttl);
+        let mut cached = self.cache.policy.read.then(|| generation.clone()).flatten();
+        let mut force_revalidate = false;
+        for _ in 0..CACHE_COMMIT_ATTEMPTS {
+            if !force_revalidate
+                && let Some(cached) = &cached
+                && cached.fresh
+            {
+                return Ok(cached.value.clone());
+            }
+            force_revalidate = false;
+            let mut request_headers = headers.clone();
+            let conditional = add_if_none_match(&mut request_headers, cached.as_ref());
+            match self.http.get_json_revalidated(url, request_headers).await? {
+                Revalidated::Modified { value, etag } => {
+                    match self.cache.put_if_unchanged(
+                        "registry",
+                        namespace,
+                        generation.as_ref(),
+                        &value,
+                        etag,
+                        ttl,
+                    )? {
+                        CacheCommit::Written => return Ok(value),
+                        CacheCommit::Conflict(current) => {
+                            generation = current;
+                            cached = self.cache.policy.read.then(|| generation.clone()).flatten();
+                            force_revalidate = true;
+                        }
+                    }
+                }
+                Revalidated::NotModified { etag } => {
+                    if !conditional {
+                        return Err(ProviderError::InvalidResponse(format!(
+                            "{url}: received HTTP 304 without sending If-None-Match"
+                        )));
+                    }
+                    let snapshot = cached.as_ref().ok_or_else(|| {
+                        ProviderError::InvalidResponse(format!(
+                            "{url}: received HTTP 304 without a cached registry value"
+                        ))
+                    })?;
+                    let value = snapshot.value.clone();
+                    let etag = etag.or_else(|| snapshot.etag.clone());
+                    match self.cache.put_if_unchanged(
+                        "registry",
+                        namespace,
+                        generation.as_ref(),
+                        &value,
+                        etag,
+                        ttl,
+                    )? {
+                        CacheCommit::Written => return Ok(value),
+                        CacheCommit::Conflict(Some(current)) if current.fresh => {
+                            if self.cache.policy.read {
+                                return Ok(current.value);
+                            }
+                            generation = Some(current);
+                            cached = None;
+                        }
+                        CacheCommit::Conflict(current) => {
+                            generation = current;
+                            cached = self.cache.policy.read.then(|| generation.clone()).flatten();
+                        }
+                    }
+                }
+            }
         }
-        let (value, etag) = self.http.get_json(url, headers).await?;
-        self.cache.put("registry", namespace, &value, etag)?;
-        Ok(value)
+        Err(ProviderError::Cache(format!(
+            "registry cache entry {namespace:?} changed repeatedly during revalidation"
+        )))
     }
     async fn npm(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
         let _permit = self.limits[&Ecosystem::Npm]
@@ -1263,7 +1695,7 @@ struct CratesIndexEntry {
     yanked: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CratesIndexCache {
     schema_version: u32,
@@ -1382,6 +1814,25 @@ fn decode_crates_index(
     Ok(parsed.into_iter().map(|(_, entry)| entry).collect())
 }
 
+fn validated_cached_crates_index(
+    entry: &CacheLookup,
+    expected_name: &str,
+) -> Option<CratesIndexCache> {
+    let cached = serde_json::from_value::<CratesIndexCache>(entry.value.clone()).ok()?;
+    (cached.schema_version == CRATES_IO_INDEX_CACHE_SCHEMA_VERSION
+        && validate_crates_index_entries(
+            cached
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (index + 1, entry)),
+            expected_name,
+            "cached crates.io sparse index",
+        )
+        .is_ok())
+    .then_some(cached)
+}
+
 // crates.io sparse-index entries are newline-delimited JSON. Decode and validate the entire
 // response before writing the versioned cache envelope, so a truncated response cannot be reused.
 impl RegistryClient {
@@ -1391,51 +1842,141 @@ impl RegistryClient {
         expected_name: &str,
         url: &str,
     ) -> Result<Vec<CratesIndexEntry>, ProviderError> {
-        if let Some((value, _)) =
-            self.cache
-                .get("registry", key, Duration::seconds(REGISTRY_TTL_SECS))
-        {
-            if let Ok(cached) = serde_json::from_value::<CratesIndexCache>(value)
-                && cached.schema_version == CRATES_IO_INDEX_CACHE_SCHEMA_VERSION
-                && validate_crates_index_entries(
-                    cached
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .map(|(index, entry)| (index + 1, entry)),
-                    expected_name,
-                    "cached crates.io sparse index",
-                )
-                .is_ok()
+        let ttl = Duration::seconds(REGISTRY_TTL_SECS);
+        let mut generation = self.cache.snapshot("registry", key, ttl);
+        let mut force_revalidate = false;
+        for _ in 0..CACHE_COMMIT_ATTEMPTS {
+            let cached = self.cache.policy.read.then(|| {
+                generation
+                    .as_ref()
+                    .and_then(|entry| validated_cached_crates_index(entry, expected_name))
+            });
+            let cached = cached.flatten();
+            if !force_revalidate
+                && let (Some(entry), Some(cached)) = (&generation, &cached)
+                && entry.fresh
             {
-                return Ok(cached.entries);
+                return Ok(cached.entries.clone());
             }
-            debug!(%key, "ignoring legacy or invalid crates.io sparse-index cache entry");
+            force_revalidate = false;
+            if cached.is_none() && generation.is_some() && self.cache.policy.read {
+                debug!(%key, "ignoring legacy or invalid crates.io sparse-index cache entry");
+            }
+            let mut headers = HeaderMap::new();
+            let conditional =
+                add_if_none_match(&mut headers, cached.as_ref().and(generation.as_ref()));
+            let response = self
+                .http
+                .get_bytes_limited_revalidated(url, CRATES_IO_MAX_INDEX_RESPONSE_BYTES, headers)
+                .await?;
+            match response {
+                Revalidated::Modified { value: bytes, etag } => {
+                    let entries = decode_crates_index(&bytes, expected_name, url)?;
+                    let value = serde_json::to_value(CratesIndexCache {
+                        schema_version: CRATES_IO_INDEX_CACHE_SCHEMA_VERSION,
+                        entries: entries.clone(),
+                    })
+                    .map_err(|error| ProviderError::Cache(error.to_string()))?;
+                    match self.cache.put_if_unchanged(
+                        "registry",
+                        key,
+                        generation.as_ref(),
+                        &value,
+                        etag,
+                        ttl,
+                    )? {
+                        CacheCommit::Written => return Ok(entries),
+                        CacheCommit::Conflict(current) => {
+                            generation = current;
+                            force_revalidate = true;
+                        }
+                    }
+                }
+                Revalidated::NotModified { etag } => {
+                    if !conditional {
+                        return Err(ProviderError::InvalidResponse(format!(
+                            "{url}: received HTTP 304 without sending If-None-Match"
+                        )));
+                    }
+                    let cached = cached.ok_or_else(|| {
+                        ProviderError::InvalidResponse(format!(
+                            "{url}: received HTTP 304 without a valid cached sparse index"
+                        ))
+                    })?;
+                    let snapshot = generation.as_ref().expect("conditional cache exists");
+                    let value = snapshot.value.clone();
+                    let etag = etag.or_else(|| snapshot.etag.clone());
+                    match self.cache.put_if_unchanged(
+                        "registry",
+                        key,
+                        Some(snapshot),
+                        &value,
+                        etag,
+                        ttl,
+                    )? {
+                        CacheCommit::Written => return Ok(cached.entries),
+                        CacheCommit::Conflict(current) => {
+                            generation = current;
+                            if self.cache.policy.read
+                                && let Some(entry) = &generation
+                                && entry.fresh
+                                && let Some(current) =
+                                    validated_cached_crates_index(entry, expected_name)
+                            {
+                                return Ok(current.entries);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        let bytes = self
-            .http
-            .get_bytes_limited(url, CRATES_IO_MAX_INDEX_RESPONSE_BYTES)
-            .await?;
-        let entries = decode_crates_index(&bytes, expected_name, url)?;
-        let value = serde_json::to_value(CratesIndexCache {
-            schema_version: CRATES_IO_INDEX_CACHE_SCHEMA_VERSION,
-            entries: entries.clone(),
-        })
-        .map_err(|error| ProviderError::Cache(error.to_string()))?;
-        self.cache.put("registry", key, &value, None)?;
-        Ok(entries)
+        Err(ProviderError::Cache(format!(
+            "crates.io cache entry {key:?} changed repeatedly during revalidation"
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_json, method, path},
+        matchers::{body_json, header, method, path},
     };
     use zip::write::SimpleFileOptions;
+
+    const TEST_OSV_MODIFIED: &str = "2026-08-19T00:00:00Z";
+
+    fn osv_query_vulnerability_at(id: &str, modified: &str) -> Value {
+        json!({"id": id, "modified": modified})
+    }
+
+    fn osv_query_vulnerability(id: &str) -> Value {
+        osv_query_vulnerability_at(id, TEST_OSV_MODIFIED)
+    }
+
+    fn read_cache_entry(cache: &Cache, namespace: &str, key: &str) -> CacheEntry {
+        serde_json::from_str(
+            &fs::read_to_string(cache.filename(namespace, key)).expect("read cache entry"),
+        )
+        .expect("decode cache entry")
+    }
+
+    fn write_cache_entry(cache: &Cache, namespace: &str, key: &str, entry: &CacheEntry) {
+        let path = cache.filename(namespace, key);
+        fs::create_dir_all(path.parent().unwrap()).expect("create cache namespace");
+        fs::write(path, serde_json::to_vec(entry).unwrap()).expect("write cache entry");
+    }
+
+    fn age_cache_entry(cache: &Cache, namespace: &str, key: &str, age: Duration) {
+        let mut entry = read_cache_entry(cache, namespace, key);
+        entry.stored_at = Utc::now() - age;
+        write_cache_entry(cache, namespace, key, &entry);
+    }
 
     #[derive(Debug, Deserialize)]
     struct OsvRangeFixture {
@@ -1511,12 +2052,19 @@ mod tests {
     }
 
     fn cache_osv_document(cache: &Cache, package: &Package, id: &str) {
+        let revision = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: DateTime::parse_from_rfc3339(TEST_OSV_MODIFIED)
+                .unwrap()
+                .with_timezone(&Utc),
+        };
         cache
             .put(
                 "osv/vuln",
-                id,
+                &revision.cache_key(),
                 &json!({
                     "id": id,
+                    "modified": TEST_OSV_MODIFIED,
                     "summary": "pagination fixture",
                     "affected": [{
                         "package": {
@@ -1986,6 +2534,479 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_sparse_index_revalidates_with_etag_and_refreshes_on_304() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fi/xt/fixture"))
+            .and(header("if-none-match", "\"sparse-1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "crates:fixture",
+                &json!({
+                    "schema_version": CRATES_IO_INDEX_CACHE_SCHEMA_VERSION,
+                    "entries": [
+                        {"name": "fixture", "vers": "1.0.0", "yanked": true},
+                        {"name": "fixture", "vers": "2.0.0", "yanked": false}
+                    ]
+                }),
+                Some("\"sparse-1\"".to_owned()),
+            )
+            .unwrap();
+        age_cache_entry(&cache, "registry", "crates:fixture", Duration::hours(7));
+        let before = read_cache_entry(&cache, "registry", "crates:fixture").stored_at;
+        let client = RegistryClient::with_crates_index_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            server.uri(),
+        );
+
+        let latest = client.latest(&crates_package("fixture")).await.unwrap();
+
+        assert_eq!(latest.latest_stable, "2.0.0");
+        assert!(latest.yanked);
+        let refreshed = read_cache_entry(&cache, "registry", "crates:fixture");
+        assert!(refreshed.stored_at > before);
+        assert_eq!(refreshed.etag.as_deref(), Some("\"sparse-1\""));
+        assert_eq!(
+            refreshed
+                .value
+                .pointer("/entries/1/vers")
+                .and_then(Value::as_str),
+            Some("2.0.0")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn late_sparse_304_cannot_overwrite_a_concurrent_changed_index() {
+        let server = MockServer::start().await;
+        let slow_received = Arc::new(tokio::sync::Notify::new());
+        let slow_responder_received = slow_received.clone();
+        Mock::given(method("GET"))
+            .and(path("/slow/fi/xt/fixture"))
+            .and(header("if-none-match", "\"sparse-1\""))
+            .respond_with(move |_: &wiremock::Request| {
+                slow_responder_received.notify_one();
+                ResponseTemplate::new(304).set_delay(std::time::Duration::from_millis(200))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let changed_body = concat!(
+            "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+            "{\"name\":\"fixture\",\"vers\":\"2.0.0\",\"yanked\":false}\n",
+        );
+        Mock::given(method("GET"))
+            .and(path("/fast/fi/xt/fixture"))
+            .and(header("if-none-match", "\"sparse-1\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"sparse-2\"")
+                    .set_body_raw(changed_body, "text/plain"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "crates:fixture",
+                &json!({
+                    "schema_version": CRATES_IO_INDEX_CACHE_SCHEMA_VERSION,
+                    "entries": [
+                        {"name": "fixture", "vers": "1.0.0", "yanked": false}
+                    ]
+                }),
+                Some("\"sparse-1\"".to_owned()),
+            )
+            .unwrap();
+        age_cache_entry(&cache, "registry", "crates:fixture", Duration::hours(7));
+        let slow_client = RegistryClient::with_crates_index_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            format!("{}/slow", server.uri()),
+        );
+        let fast_client = RegistryClient::with_crates_index_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            format!("{}/fast", server.uri()),
+        );
+        let package = crates_package("fixture");
+        let slow_package = package.clone();
+        let slow_started = slow_received.notified();
+        let slow = tokio::spawn(async move { slow_client.latest(&slow_package).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_started)
+            .await
+            .expect("slow sparse-index request was not received");
+
+        let fast = fast_client.latest(&package).await.unwrap();
+        let slow = slow.await.unwrap().unwrap();
+
+        assert_eq!(fast.latest_stable, "2.0.0");
+        assert_eq!(slow.latest_stable, "2.0.0");
+        let cached = read_cache_entry(&cache, "registry", "crates:fixture");
+        assert_eq!(cached.etag.as_deref(), Some("\"sparse-2\""));
+        assert_eq!(
+            cached
+                .value
+                .pointer("/entries/1/vers")
+                .and_then(Value::as_str),
+            Some("2.0.0")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn stale_registry_metadata_revalidates_with_etag_and_refreshes_on_304() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .and(header("if-none-match", "\"revision-1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "etag-304",
+                &json!({"revision": 1}),
+                Some("\"revision-1\"".to_owned()),
+            )
+            .unwrap();
+        age_cache_entry(&cache, "registry", "etag-304", Duration::hours(7));
+        let before = read_cache_entry(&cache, "registry", "etag-304").stored_at;
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+
+        let value = client
+            .metadata(
+                "etag-304",
+                &format!("{}/metadata", server.uri()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({"revision": 1}));
+        let refreshed = read_cache_entry(&cache, "registry", "etag-304");
+        assert!(refreshed.stored_at > before);
+        assert_eq!(refreshed.etag.as_deref(), Some("\"revision-1\""));
+        assert_eq!(refreshed.value, value);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn late_registry_304_cannot_overwrite_a_concurrent_changed_response() {
+        let server = MockServer::start().await;
+        let slow_received = Arc::new(tokio::sync::Notify::new());
+        let slow_responder_received = slow_received.clone();
+        Mock::given(method("GET"))
+            .and(path("/slow-not-modified"))
+            .and(header("if-none-match", "\"revision-1\""))
+            .respond_with(move |_: &wiremock::Request| {
+                slow_responder_received.notify_one();
+                ResponseTemplate::new(304).set_delay(std::time::Duration::from_millis(200))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fast-modified"))
+            .and(header("if-none-match", "\"revision-1\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"revision-2\"")
+                    .set_body_json(json!({"revision": 2})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "revalidation-race",
+                &json!({"revision": 1}),
+                Some("\"revision-1\"".to_owned()),
+            )
+            .unwrap();
+        age_cache_entry(&cache, "registry", "revalidation-race", Duration::hours(7));
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+        let slow_client = client.clone();
+        let slow_url = format!("{}/slow-not-modified", server.uri());
+        let slow_started = slow_received.notified();
+        let slow = tokio::spawn(async move {
+            slow_client
+                .metadata("revalidation-race", &slow_url, HeaderMap::new())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_started)
+            .await
+            .expect("slow revalidation request was not received");
+
+        let fast = client
+            .metadata(
+                "revalidation-race",
+                &format!("{}/fast-modified", server.uri()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        let slow = slow.await.unwrap().unwrap();
+
+        assert_eq!(fast, json!({"revision": 2}));
+        assert_eq!(slow, fast);
+        let cached = read_cache_entry(&cache, "registry", "revalidation-race");
+        assert_eq!(cached.value, fast);
+        assert_eq!(cached.etag.as_deref(), Some("\"revision-2\""));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cache_bypass_still_prevents_out_of_order_publication() {
+        let server = MockServer::start().await;
+        let slow_received = Arc::new(tokio::sync::Notify::new());
+        let slow_responder_received = slow_received.clone();
+        let slow_calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = slow_calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/slow-refresh"))
+            .respond_with(move |_: &wiremock::Request| {
+                if responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    slow_responder_received.notify_one();
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"revision-1\"")
+                        .set_body_json(json!({"revision": 1}))
+                        .set_delay(std::time::Duration::from_millis(200))
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"revision-2\"")
+                        .set_body_json(json!({"revision": 2}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fast-refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"revision-2\"")
+                    .set_body_json(json!({"revision": 2})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy {
+                read: false,
+                max_age: None,
+            },
+        };
+        cache
+            .put(
+                "registry",
+                "bypass-race",
+                &json!({"revision": 0}),
+                Some("\"revision-0\"".to_owned()),
+            )
+            .unwrap();
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+        let slow_client = client.clone();
+        let slow_url = format!("{}/slow-refresh", server.uri());
+        let slow_started = slow_received.notified();
+        let slow = tokio::spawn(async move {
+            slow_client
+                .metadata("bypass-race", &slow_url, HeaderMap::new())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_started)
+            .await
+            .expect("slow bypass request was not received");
+
+        let fast = client
+            .metadata(
+                "bypass-race",
+                &format!("{}/fast-refresh", server.uri()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        let slow = slow.await.unwrap().unwrap();
+
+        assert_eq!(fast, json!({"revision": 2}));
+        assert_eq!(slow, fast);
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
+        let cached = read_cache_entry(&cache, "registry", "bypass-race");
+        assert_eq!(cached.value, fast);
+        assert_eq!(cached.etag.as_deref(), Some("\"revision-2\""));
+        for request in server.received_requests().await.unwrap() {
+            assert!(request.headers.get("if-none-match").is_none());
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn changed_registry_etag_replaces_the_cached_body_atomically() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .and(header("if-none-match", "\"revision-1\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"revision-2\"")
+                    .set_body_json(json!({"revision": 2})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "etag-changed",
+                &json!({"revision": 1}),
+                Some("\"revision-1\"".to_owned()),
+            )
+            .unwrap();
+        age_cache_entry(&cache, "registry", "etag-changed", Duration::hours(7));
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+
+        let value = client
+            .metadata(
+                "etag-changed",
+                &format!("{}/metadata", server.uri()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({"revision": 2}));
+        let cached = read_cache_entry(&cache, "registry", "etag-changed");
+        assert_eq!(cached.value, value);
+        assert_eq!(cached.etag.as_deref(), Some("\"revision-2\""));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn missing_registry_etag_forces_an_unconditional_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"revision": 2})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put("registry", "missing-etag", &json!({"revision": 1}), None)
+            .unwrap();
+        age_cache_entry(&cache, "registry", "missing-etag", Duration::hours(7));
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+
+        let value = client
+            .metadata(
+                "missing-etag",
+                &format!("{}/metadata", server.uri()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({"revision": 2}));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("if-none-match").is_none());
+        let cached = read_cache_entry(&cache, "registry", "missing-etag");
+        assert_eq!(cached.value, value);
+        assert!(cached.etag.is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn failed_registry_revalidation_preserves_the_stale_cache_entry() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .and(header("if-none-match", "\"revision-1\""))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "failed-revalidation",
+                &json!({"revision": 1}),
+                Some("\"revision-1\"".to_owned()),
+            )
+            .unwrap();
+        age_cache_entry(
+            &cache,
+            "registry",
+            "failed-revalidation",
+            Duration::hours(7),
+        );
+        let before = read_cache_entry(&cache, "registry", "failed-revalidation");
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+
+        let error = client
+            .metadata(
+                "failed-revalidation",
+                &format!("{}/metadata", server.uri()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HTTP 400"));
+        let after = read_cache_entry(&cache, "registry", "failed-revalidation");
+        assert_eq!(after.stored_at, before.stored_at);
+        assert_eq!(after.etag, before.etag);
+        assert_eq!(after.value, before.value);
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_utf8_with_the_source_line_number() {
         let mut body = b"{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false}\n".to_vec();
         body.extend_from_slice(&[0xff, b'\n']);
@@ -2148,7 +3169,7 @@ mod tests {
             .and(body_json(&expected_body))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [{
-                    "vulns": [{"id": "GHSA-5crp-9r3c-p9vr"}]
+                    "vulns": [osv_query_vulnerability("GHSA-5crp-9r3c-p9vr")]
                 }]
             })))
             .expect(1)
@@ -2163,7 +3184,9 @@ mod tests {
 
         let results = client.query_batch(&[package]).await.unwrap();
 
-        assert_eq!(results, vec![vec!["GHSA-5crp-9r3c-p9vr".to_owned()]]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].len(), 1);
+        assert_eq!(results[0][0].id, "GHSA-5crp-9r3c-p9vr");
     }
 
     #[tokio::test]
@@ -2177,13 +3200,13 @@ mod tests {
                 "results": [
                     {
                         "vulns": [
-                            {"id": "TEST-ALPHA-1"},
-                            {"id": "TEST-ALPHA-DUP"}
+                            osv_query_vulnerability("TEST-ALPHA-1"),
+                            osv_query_vulnerability("TEST-ALPHA-DUP")
                         ],
                         "next_page_token": "alpha-page-2"
                     },
                     {
-                        "vulns": [{"id": "TEST-BETA-1"}],
+                        "vulns": [osv_query_vulnerability("TEST-BETA-1")],
                         "next_page_token": "beta-page-2"
                     }
                 ]
@@ -2201,14 +3224,14 @@ mod tests {
                 "results": [
                     {
                         "vulns": [
-                            {"id": "TEST-ALPHA-DUP"},
-                            {"id": "TEST-ALPHA-2"}
+                            osv_query_vulnerability("TEST-ALPHA-DUP"),
+                            osv_query_vulnerability("TEST-ALPHA-2")
                         ]
                     },
                     {
                         "vulns": [
-                            {"id": "TEST-BETA-1"},
-                            {"id": "TEST-BETA-2"}
+                            osv_query_vulnerability("TEST-BETA-1"),
+                            osv_query_vulnerability("TEST-BETA-2")
                         ],
                         "next_page_token": "beta-page-3"
                     }
@@ -2224,7 +3247,9 @@ mod tests {
                 Some("beta-page-3"),
             )])))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "results": [{"vulns": [{"id": "TEST-BETA-3"}]}]
+                "results": [{
+                    "vulns": [osv_query_vulnerability("TEST-BETA-3")]
+                }]
             })))
             .expect(1)
             .mount(&server)
@@ -2262,11 +3287,19 @@ mod tests {
         for (package, expected) in [
             (
                 &packages[0],
-                json!(["TEST-ALPHA-1", "TEST-ALPHA-2", "TEST-ALPHA-DUP"]),
+                json!([
+                    osv_query_vulnerability("TEST-ALPHA-1"),
+                    osv_query_vulnerability("TEST-ALPHA-2"),
+                    osv_query_vulnerability("TEST-ALPHA-DUP")
+                ]),
             ),
             (
                 &packages[1],
-                json!(["TEST-BETA-1", "TEST-BETA-2", "TEST-BETA-3"]),
+                json!([
+                    osv_query_vulnerability("TEST-BETA-1"),
+                    osv_query_vulnerability("TEST-BETA-2"),
+                    osv_query_vulnerability("TEST-BETA-3")
+                ]),
             ),
         ] {
             let (cached, _) = cache
@@ -2282,6 +3315,618 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_regressing_osv_query_revision_without_downgrading_cache() {
+        let server = MockServer::start().await;
+        let package = npm_package("regressing-revision");
+        let id = "TEST-REGRESSION-1";
+        let older = "2026-08-18T00:00:00Z";
+        let newer = "2026-08-19T00:00:00Z";
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [osv_query_vulnerability_at(id, older)]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let query_key = osv_query_cache_key(&package);
+        cache
+            .put(
+                "osv/query",
+                &query_key,
+                &json!([osv_query_vulnerability_at(id, newer)]),
+                None,
+            )
+            .unwrap();
+        age_cache_entry(&cache, "osv/query", &query_key, Duration::hours(2));
+        let before = read_cache_entry(&cache, "osv/query", &query_key);
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let error = client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("regressed below"));
+        let after = read_cache_entry(&cache, "osv/query", &query_key);
+        assert_eq!(after.stored_at, before.stored_at);
+        assert_eq!(after.value, before.value);
+        server.verify().await;
+    }
+
+    #[test]
+    fn hydration_cache_keys_never_downgrade_newer_alias_documents() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            "https://unused.invalid",
+        );
+        let id = "TEST-HYDRATION-MONOTONIC-1";
+        let requested = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let newer_document = json!({
+            "id": id,
+            "modified": "2026-08-20T00:00:00Z",
+            "summary": "newer alias document"
+        });
+        let older_document = json!({
+            "id": id,
+            "modified": "2026-08-19T00:00:00Z",
+            "summary": "late older document"
+        });
+        cache
+            .put("osv/vuln", &requested.cache_key(), &newer_document, None)
+            .unwrap();
+
+        let winner = client
+            .publish_hydrated_document(&requested.cache_key(), id, &older_document, None, true)
+            .unwrap();
+
+        assert_eq!(winner.value, newer_document);
+        assert_eq!(
+            read_cache_entry(&cache, "osv/vuln", &requested.cache_key()).value,
+            newer_document
+        );
+    }
+
+    #[test]
+    fn cache_bypass_publication_preserves_the_newer_disk_winner() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy {
+                read: false,
+                max_age: None,
+            },
+        };
+        let client = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            "https://unused.invalid",
+        );
+        let id = "TEST-HYDRATION-BYPASS-1";
+        let revision = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let cached_newer = json!({
+            "id": id,
+            "modified": "2026-08-20T00:00:00Z",
+            "summary": "cached representation"
+        });
+        let network_candidate = json!({
+            "id": id,
+            "modified": "2026-08-19T00:00:00Z",
+            "summary": "network representation"
+        });
+        cache
+            .put("osv/vuln", &revision.cache_key(), &cached_newer, None)
+            .unwrap();
+
+        let reported = client
+            .publish_hydrated_document(&revision.cache_key(), id, &network_candidate, None, true)
+            .unwrap();
+
+        assert_eq!(reported.value, cached_newer);
+        assert_eq!(
+            read_cache_entry(&cache, "osv/vuln", &revision.cache_key()).value,
+            cached_newer
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_hydration_is_reused_under_the_requested_revision_without_etag_aliasing() {
+        let server = MockServer::start().await;
+        let id = "TEST-HYDRATION-ALIAS-1";
+        let requested = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let actual = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: DateTime::parse_from_rfc3339("2026-08-19T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let document = json!({
+            "id": id,
+            "modified": "2026-08-19T00:00:00Z",
+            "summary": "newer than querybatch"
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"hydration-2\"")
+                    .set_body_json(&document),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        assert_eq!(client.hydrate(&requested).await.unwrap(), document);
+        assert_eq!(client.hydrate(&requested).await.unwrap(), document);
+
+        let actual_entry = read_cache_entry(&cache, "osv/vuln", &actual.cache_key());
+        assert_eq!(actual_entry.value, document);
+        assert_eq!(actual_entry.etag.as_deref(), Some("\"hydration-2\""));
+        let alias_entry = read_cache_entry(&cache, "osv/vuln", &requested.cache_key());
+        assert_eq!(alias_entry.value, document);
+        assert!(alias_entry.etag.is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cache_bypass_returns_network_hydration_but_aliases_the_newer_disk_winner() {
+        let server = MockServer::start().await;
+        let id = "TEST-HYDRATION-BYPASS-ALIAS-1";
+        let requested = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let actual = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: DateTime::parse_from_rfc3339("2026-08-19T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let network_document = json!({
+            "id": id,
+            "modified": "2026-08-19T00:00:00Z",
+            "summary": "fresh network representation"
+        });
+        let cached_newer = json!({
+            "id": id,
+            "modified": "2026-08-20T00:00:00Z",
+            "summary": "newer cached representation"
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&network_document))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy {
+                read: false,
+                max_age: None,
+            },
+        };
+        cache
+            .put(
+                "osv/vuln",
+                &actual.cache_key(),
+                &cached_newer,
+                Some("\"hydration-3\"".to_owned()),
+            )
+            .unwrap();
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let reported = client.hydrate(&requested).await.unwrap();
+
+        assert_eq!(reported, network_document);
+        assert_eq!(
+            read_cache_entry(&cache, "osv/vuln", &actual.cache_key()).value,
+            cached_newer
+        );
+        let alias = read_cache_entry(&cache, "osv/vuln", &requested.cache_key());
+        assert_eq!(alias.value, cached_newer);
+        assert!(alias.etag.is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cache_bypass_ignores_a_stale_future_osv_revision() {
+        let server = MockServer::start().await;
+        let package = npm_package("bypass-future-revision");
+        let id = "TEST-BYPASS-FUTURE-1";
+        let origin_modified = "2026-08-19T00:00:00Z";
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [osv_query_vulnerability_at(id, origin_modified)]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": id,
+                "modified": origin_modified,
+                "summary": "fresh bypass response",
+                "affected": [{
+                    "package": {"ecosystem": "npm", "name": "bypass-future-revision"},
+                    "versions": ["1.0.0"]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy {
+                read: false,
+                max_age: None,
+            },
+        };
+        let query_key = osv_query_cache_key(&package);
+        cache
+            .put(
+                "osv/query",
+                &query_key,
+                &json!([osv_query_vulnerability_at(id, "2026-08-21T00:00:00Z")]),
+                None,
+            )
+            .unwrap();
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let result = client.query(std::slice::from_ref(&package)).await.unwrap();
+
+        assert_eq!(result[&package.key()][0].summary, "fresh bypass response");
+        assert_eq!(
+            read_cache_entry(&cache, "osv/query", &query_key).value,
+            json!([osv_query_vulnerability_at(id, origin_modified)])
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_osv_query_refresh_retries_instead_of_publishing_stale_results() {
+        let server = MockServer::start().await;
+        let package = npm_package("query-race");
+        let id = "TEST-QUERY-RACE-1";
+        let initial = "2026-08-17T00:00:00Z";
+        let older = "2026-08-18T00:00:00Z";
+        let newer = "2026-08-19T00:00:00Z";
+        let slow_received = Arc::new(tokio::sync::Notify::new());
+        let slow_responder_received = slow_received.clone();
+        let slow_calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = slow_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/slow/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(move |_: &wiremock::Request| {
+                if responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    slow_responder_received.notify_one();
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({
+                            "results": [{
+                                "vulns": [osv_query_vulnerability_at(id, older)]
+                            }]
+                        }))
+                        .set_delay(std::time::Duration::from_secs(1))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "results": [{
+                            "vulns": [osv_query_vulnerability_at(id, newer)]
+                        }]
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/fast/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [osv_query_vulnerability_at(id, newer)]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let newer_document = json!({
+            "id": id,
+            "modified": newer,
+            "summary": "newest concurrent revision",
+            "affected": [{
+                "package": {"ecosystem": "npm", "name": "query-race"},
+                "versions": ["1.0.0"]
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/fast/v1/vulns/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&newer_document))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/slow/v1/vulns/{id}")))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let query_key = osv_query_cache_key(&package);
+        cache
+            .put(
+                "osv/query",
+                &query_key,
+                &json!([osv_query_vulnerability_at(id, initial)]),
+                None,
+            )
+            .unwrap();
+        age_cache_entry(&cache, "osv/query", &query_key, Duration::hours(2));
+        let slow_client = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            format!("{}/slow", server.uri()),
+        );
+        let fast_client = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            format!("{}/fast", server.uri()),
+        );
+        let slow_package = package.clone();
+        let slow_started = slow_received.notified();
+        let slow =
+            tokio::spawn(
+                async move { slow_client.query(std::slice::from_ref(&slow_package)).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_started)
+            .await
+            .expect("slow OSV query request was not received");
+
+        let fast = fast_client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap();
+        let slow = slow.await.unwrap().unwrap();
+
+        assert_eq!(
+            fast[&package.key()][0].summary,
+            "newest concurrent revision"
+        );
+        assert_eq!(
+            slow[&package.key()][0].summary,
+            "newest concurrent revision"
+        );
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            read_cache_entry(&cache, "osv/query", &query_key).value,
+            json!([osv_query_vulnerability_at(id, newer)])
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn query_revisions_invalidate_legacy_and_changed_hydrated_advisories() {
+        let package = npm_package("revisioned");
+        let id = "TEST-REVISION-1";
+        let first_modified = "2026-08-18T00:00:00Z";
+        let second_modified = "2026-08-19T00:00:00Z";
+        let first_document = json!({
+            "id": id,
+            "modified": first_modified,
+            "summary": "first revision",
+            "severity": [{
+                "type": "CVSS_V3",
+                "score": "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"
+            }],
+            "affected": [{
+                "package": {"ecosystem": "npm", "name": "revisioned"},
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{"introduced": "0"}, {"fixed": "2.0.0"}]
+                }]
+            }]
+        });
+        let second_document = json!({
+            "id": id,
+            "modified": second_modified,
+            "withdrawn": "2026-08-19T00:00:00Z",
+            "summary": "updated revision",
+            "severity": [{
+                "type": "CVSS_V3",
+                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+            }],
+            "affected": [{
+                "package": {"ecosystem": "npm", "name": "revisioned"},
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{"introduced": "0"}, {"fixed": "3.0.0"}]
+                }]
+            }]
+        });
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        // These are the two legacy ID-only cache shapes. Neither may be treated as revisioned.
+        cache
+            .put(
+                "osv/query",
+                &osv_query_cache_key(&package),
+                &json!([id]),
+                None,
+            )
+            .unwrap();
+        cache.put("osv/vuln", id, &first_document, None).unwrap();
+
+        let first_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [osv_query_vulnerability_at(id, first_modified)]
+                }]
+            })))
+            .expect(1)
+            .mount(&first_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&first_document))
+            .expect(1)
+            .mount(&first_server)
+            .await;
+        let first_client = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            first_server.uri(),
+        );
+
+        let first = first_client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap();
+        let first = &first[&package.key()][0];
+        assert_eq!(first.summary, "first revision");
+        assert_eq!(first.fixed_in, ["2.0.0"]);
+        assert!(!first.withdrawn);
+        let first_score = first.cvss_score.unwrap();
+        first_server.verify().await;
+
+        age_cache_entry(
+            &cache,
+            "osv/query",
+            &osv_query_cache_key(&package),
+            Duration::hours(2),
+        );
+        let second_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [osv_query_vulnerability_at(id, second_modified)]
+                }]
+            })))
+            .expect(1)
+            .mount(&second_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&second_document))
+            .expect(1)
+            .mount(&second_server)
+            .await;
+        let second_client = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            second_server.uri(),
+        );
+
+        let second = second_client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap();
+        let second = &second[&package.key()][0];
+        assert_eq!(second.summary, "updated revision");
+        assert_eq!(second.fixed_in, ["3.0.0"]);
+        assert!(second.withdrawn);
+        assert!(second.cvss_score.unwrap() > first_score);
+        second_server.verify().await;
+
+        // Refreshing the query with an unchanged revision must reuse the hydrated revision cache.
+        age_cache_entry(
+            &cache,
+            "osv/query",
+            &osv_query_cache_key(&package),
+            Duration::hours(2),
+        );
+        let unchanged_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [osv_query_vulnerability_at(id, second_modified)]
+                }]
+            })))
+            .expect(1)
+            .mount(&unchanged_server)
+            .await;
+        let unchanged_client = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            unchanged_server.uri(),
+        );
+
+        let unchanged = unchanged_client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap();
+
+        assert_eq!(unchanged[&package.key()][0].summary, "updated revision");
+        unchanged_server.verify().await;
+        let cached_query = read_cache_entry(&cache, "osv/query", &osv_query_cache_key(&package));
+        assert_eq!(
+            cached_query.value,
+            json!([osv_query_vulnerability_at(id, second_modified)])
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_repeated_page_tokens_without_caching_partial_ids() {
         let server = MockServer::start().await;
         let package = npm_package("repeated-token");
@@ -2290,7 +3935,7 @@ mod tests {
             .and(body_json(osv_query_body(std::slice::from_ref(&package))))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [{
-                    "vulns": [{"id": "TEST-PARTIAL-1"}],
+                    "vulns": [osv_query_vulnerability("TEST-PARTIAL-1")],
                     "next_page_token": "repeat-me"
                 }]
             })))
@@ -2305,7 +3950,7 @@ mod tests {
             )])))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [{
-                    "vulns": [{"id": "TEST-PARTIAL-2"}],
+                    "vulns": [osv_query_vulnerability("TEST-PARTIAL-2")],
                     "next_page_token": "repeat-me"
                 }]
             })))
@@ -2343,7 +3988,7 @@ mod tests {
             .and(body_json(osv_query_body(std::slice::from_ref(&package))))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [{
-                    "vulns": [{"id": "TEST-PARTIAL-1"}],
+                    "vulns": [osv_query_vulnerability("TEST-PARTIAL-1")],
                     "next_page_token": "broken-page"
                 }]
             })))
@@ -2462,6 +4107,30 @@ mod tests {
                 json!({"results": [{"vulns": [{"id": 42}]}]}),
                 1,
                 "vulnerability 0 has no string id",
+            ),
+            (
+                "missing modified timestamp",
+                json!({"results": [{"vulns": [{"id": "TEST-MISSING-MODIFIED"}]}]}),
+                1,
+                "vulnerability 0 has no string modified timestamp",
+            ),
+            (
+                "non-string modified timestamp",
+                json!({"results": [{"vulns": [{
+                    "id": "TEST-NONSTRING-MODIFIED",
+                    "modified": 42
+                }]}]}),
+                1,
+                "vulnerability 0 has no string modified timestamp",
+            ),
+            (
+                "invalid modified timestamp",
+                json!({"results": [{"vulns": [{
+                    "id": "TEST-INVALID-MODIFIED",
+                    "modified": "not-a-timestamp"
+                }]}]}),
+                1,
+                "vulnerability 0 has an invalid modified timestamp",
             ),
             (
                 "malformed later result",
@@ -2673,18 +4342,23 @@ mod tests {
         let server = MockServer::start().await;
         for (fixture, package) in fixtures.iter().zip(&packages) {
             let id = fixture.document.get("id").and_then(Value::as_str).unwrap();
+            let mut hydrated_document = fixture.document.clone();
+            hydrated_document
+                .as_object_mut()
+                .unwrap()
+                .insert("modified".to_owned(), json!(TEST_OSV_MODIFIED));
             Mock::given(method("POST"))
                 .and(path("/v1/querybatch"))
                 .and(body_json(osv_query_body(std::slice::from_ref(package))))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "results": [{"vulns": [{"id": id}]}]
+                    "results": [{"vulns": [osv_query_vulnerability(id)]}]
                 })))
                 .expect(1)
                 .mount(&server)
                 .await;
             Mock::given(method("GET"))
                 .and(path(format!("/v1/vulns/{id}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&fixture.document))
+                .respond_with(ResponseTemplate::new(200).set_body_json(hydrated_document))
                 .expect(1)
                 .mount(&server)
                 .await;

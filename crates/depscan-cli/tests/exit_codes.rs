@@ -14,7 +14,7 @@ use std::os::windows::fs::symlink_file;
 const QUERY_DIGEST: &str = "2f422c499305285ab2b6919c9f3a7749a0ae65f244b52b53b78ea8a3d83444c7";
 const REGISTRY_DIGEST: &str = "73a7010ca3d255918cf210add4252cd48f0d933c881b68ea9bcf11cf8a400ac1";
 const VULNERABILITY_DIGEST: &str =
-    "4db23d5d929b343edf9ffc1e02564b51eefd8392410c14f87892d246abed1289";
+    "12c66ec82798932e9795db87745d1ac1cebf373cee0ffe9cbd57b2533e2f4530";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -109,7 +109,11 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
     }
 
     fn seed_vulnerability_record(&self, withdrawn: bool, aliases: &[&str]) {
-        self.seed_cache("osv/query", QUERY_DIGEST, r#"["RUSTSEC-TEST"]"#);
+        self.seed_cache(
+            "osv/query",
+            QUERY_DIGEST,
+            r#"[{"id":"RUSTSEC-TEST","modified":"2026-08-19T00:00:00Z"}]"#,
+        );
         let withdrawn_field = if withdrawn {
             r#""withdrawn":"2026-08-19T00:00:00Z","#
         } else {
@@ -122,6 +126,7 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
             &format!(
                 r#"{{
                 "id":"RUSTSEC-TEST",
+                "modified":"2026-08-19T00:00:00Z",
                 {withdrawn_field}
                 "summary":"process-test vulnerability",
                 "aliases":{aliases},
