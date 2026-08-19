@@ -283,6 +283,14 @@ fn python_fixture(case: &str) -> PathBuf {
 }
 
 fn seed_empty_pypi_dump(cache: &Path) {
+    seed_empty_osv_dump(cache, "PyPI");
+}
+
+fn seed_empty_cargo_dump(cache: &Path) {
+    seed_empty_osv_dump(cache, "crates_io");
+}
+
+fn seed_empty_osv_dump(cache: &Path, ecosystem: &str) {
     fs::create_dir_all(cache).expect("create cache directory");
     fs::write(
         cache.join(".depscan-cache.json"),
@@ -291,9 +299,11 @@ fn seed_empty_pypi_dump(cache: &Path) {
     .expect("write cache ownership sentinel");
     let offline = cache.join("offline");
     fs::create_dir_all(&offline).expect("create offline cache directory");
-    zip::ZipWriter::new(fs::File::create(offline.join("PyPI.zip")).expect("create PyPI dump"))
-        .finish()
-        .expect("finish empty PyPI dump");
+    zip::ZipWriter::new(
+        fs::File::create(offline.join(format!("{ecosystem}.zip"))).expect("create offline dump"),
+    )
+    .finish()
+    .expect("finish empty offline dump");
 }
 
 fn report_packages(report: &serde_json::Value) -> &[serde_json::Value] {
@@ -1128,6 +1138,389 @@ fn invalid_config_value_exits_ten() {
 }
 
 #[test]
+fn complete_implicit_config_drives_the_default_scan_and_root_relative_output() {
+    let project = TestProject::rust("complete-config");
+    seed_empty_cargo_dump(&project.cache);
+    fs::write(
+        project.directory.path().join("Cargo.lock"),
+        r#"version = 3
+
+[[package]]
+name = "demo"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "devcrate"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "transitive"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+"#,
+    )
+    .expect("write Cargo lockfile with production, development, and transitive packages");
+    fs::write(
+        project.directory.path().join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+demo = "1"
+
+[dev-dependencies]
+devcrate = "1"
+"#,
+    )
+    .expect("write direct Cargo manifest");
+    let report_directory = project.directory.path().join("reports");
+    fs::create_dir(&report_directory).expect("create report directory");
+    fs::write(
+        project.directory.path().join("depscan.toml"),
+        r#"ecosystem = ["cargo"]
+no-dev = true
+direct-only = true
+format = "json"
+output = "reports/configured.json"
+fail-on = "never"
+fail-on-outdated = "never"
+offline = true
+no-cache = true
+max-cache-age = "7d"
+include-withdrawn = true
+allow-tools = false
+quiet = 1
+verbose = 0
+"#,
+    )
+    .expect("write complete implicit config");
+
+    let output = project.run(&[project.directory.path().to_str().expect("UTF-8 path")]);
+
+    assert_exit(&output, 0);
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    let report_path = report_directory.join("configured.json");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report_path).expect("read configured root-relative report"),
+    )
+    .expect("parse configured JSON report");
+    assert_eq!(report_package_names(&report), BTreeSet::from(["demo"]));
+}
+
+#[test]
+fn configured_verbose_level_is_applied_before_origin_diagnostics() {
+    let project = TestProject::rust("configured-verbose");
+    seed_empty_cargo_dump(&project.cache);
+    fs::write(
+        project.directory.path().join("depscan.toml"),
+        "offline = true\nformat = \"json\"\nverbose = 1\n",
+    )
+    .expect("write verbose config");
+
+    let output = project.run(&[
+        "scan",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"schema_version\""));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("configuration loaded"));
+    assert!(stderr.contains("origin=\"implicit-default\""));
+
+    let quiet = project.run(&[
+        "scan",
+        "--quiet",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&quiet, 0);
+    assert!(quiet.stderr.is_empty());
+}
+
+#[test]
+fn configured_ecosystem_withdrawn_and_failure_policies_are_effective() {
+    let ecosystem_project = TestProject::rust("configured-ecosystem");
+    fs::write(
+        ecosystem_project.directory.path().join("depscan.toml"),
+        "ecosystem = [\"pypi\"]\n",
+    )
+    .expect("write ecosystem config");
+    let output = ecosystem_project.run(&[
+        "scan",
+        ecosystem_project
+            .directory
+            .path()
+            .to_str()
+            .expect("UTF-8 path"),
+    ]);
+    assert_exit(&output, 20);
+
+    let withdrawn_project = TestProject::rust("configured-withdrawn");
+    withdrawn_project.seed_clean("1.0.0");
+    withdrawn_project.seed_withdrawn_vulnerability();
+    fs::write(
+        withdrawn_project.directory.path().join("depscan.toml"),
+        "format = \"json\"\ninclude-withdrawn = true\nfail-on = \"never\"\n",
+    )
+    .expect("write withdrawn config");
+    let output = withdrawn_project.run(&[
+        "scan",
+        withdrawn_project
+            .directory
+            .path()
+            .to_str()
+            .expect("UTF-8 path"),
+    ]);
+    assert_exit(&output, 0);
+    let report = json_report(&output);
+    assert_eq!(
+        report
+            .pointer("/results/0/vulns/0/withdrawn")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    let outdated_project = TestProject::rust("configured-outdated-threshold");
+    outdated_project.seed_clean("1.0.1");
+    fs::write(
+        outdated_project.directory.path().join("depscan.toml"),
+        "format = \"json\"\nfail-on-outdated = \"patch\"\n",
+    )
+    .expect("write outdated threshold config");
+    let output = outdated_project.run(&[
+        "scan",
+        outdated_project
+            .directory
+            .path()
+            .to_str()
+            .expect("UTF-8 path"),
+    ]);
+    assert_exit(&output, 2);
+    let report = json_report(&output);
+    assert_eq!(
+        report
+            .pointer("/results/0/latest/staleness")
+            .and_then(serde_json::Value::as_str),
+        Some("patch")
+    );
+}
+
+#[test]
+fn cli_groups_override_config_fieldwise() {
+    let project = TestProject::rust("config-cli-precedence");
+    project.seed_clean("1.0.0");
+    project.seed_vulnerability();
+    let configured_output = project.directory.path().join("configured.json");
+    let cli_output = project.directory.path().join("cli.sarif");
+    fs::write(
+        project.directory.path().join("depscan.toml"),
+        r#"ecosystem = ["pypi"]
+format = "json"
+output = "configured.json"
+fail-on = "never"
+quiet = 1
+verbose = 0
+"#,
+    )
+    .expect("write overridden config");
+
+    let output = project.run(&[
+        "scan",
+        "--ecosystem",
+        "cargo",
+        "--output",
+        cli_output.to_str().expect("UTF-8 output path"),
+        "--fail-on",
+        "high",
+        "--verbose",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 1);
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("configuration loaded"));
+    assert!(!configured_output.exists());
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(cli_output).expect("read CLI-selected output path"))
+            .expect("parse configured JSON report");
+    assert_eq!(
+        report
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64),
+        Some(3)
+    );
+}
+
+#[test]
+fn strict_config_schema_and_values_fail_before_provider_access() {
+    let project = TestProject::rust("strict-config");
+    let cases = [
+        ("unknown = true\n", "unknown field"),
+        ("ecosystems = [\"cargo\"]\n", "unknown field"),
+        (
+            "[[ignore]]\nid = \"RUSTSEC-TEST\"\nreasno = \"typo\"\n",
+            "unknown field",
+        ),
+        ("offline = \"yes\"\n", "invalid config"),
+        ("ecosystem = [\"made-up\"]\n", "invalid config value"),
+        ("format = \"JSON\"\n", "invalid config value"),
+        ("max-cache-age = \"tomorrow\"\n", "invalid config value"),
+        ("quiet = 1\nverbose = 1\n", "cannot both"),
+    ];
+
+    for (contents, expected) in cases {
+        fs::write(project.directory.path().join("depscan.toml"), contents)
+            .expect("write invalid config case");
+        let output = project.run(&[
+            "scan",
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ]);
+        assert_exit(&output, 10);
+        assert_diagnostic_only_on_stderr(&output, expected);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("provider hard failure"));
+    }
+}
+
+#[test]
+fn implicit_config_cannot_authorize_tools_or_escape_the_scan_root() {
+    let project = TestProject::rust("implicit-config-security");
+    let escaped = project
+        .directory
+        .path()
+        .parent()
+        .expect("test directory parent")
+        .join(format!("depscan-escaped-{}.json", std::process::id()));
+    let _ = fs::remove_file(&escaped);
+
+    fs::write(
+        project.directory.path().join("depscan.toml"),
+        "allow-tools = true\n",
+    )
+    .expect("write implicit tool permission");
+    let output = project.run(&[
+        "scan",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&output, 10);
+    assert_diagnostic_only_on_stderr(&output, "cannot enable allow-tools");
+
+    fs::write(
+        project.directory.path().join("depscan.toml"),
+        format!(
+            "format = \"json\"\noutput = \"../{}\"\n",
+            escaped
+                .file_name()
+                .expect("escaped filename")
+                .to_string_lossy()
+        ),
+    )
+    .expect("write escaping output config");
+    let output = project.run(&[
+        "scan",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&output, 10);
+    assert_diagnostic_only_on_stderr(&output, "escapes scan root");
+    assert!(!escaped.exists());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn implicit_config_cannot_write_through_an_output_symlink() {
+    let project = TestProject::rust("implicit-output-symlink");
+    let target = project.directory.path().join("target.json");
+    let linked = project.directory.path().join("report.json");
+    fs::write(&target, "preserve me").expect("write output symlink target");
+    if let Err(error) = symlink_file(&target, &linked) {
+        #[cfg(windows)]
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("create output symlink: {error}");
+    }
+    fs::write(
+        project.directory.path().join("depscan.toml"),
+        "format = \"json\"\noutput = \"report.json\"\n",
+    )
+    .expect("write implicit output config");
+
+    let output = project.run(&[
+        "scan",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 10);
+    assert_diagnostic_only_on_stderr(&output, "symbolic link");
+    assert_eq!(
+        fs::read_to_string(target).expect("read preserved target"),
+        "preserve me"
+    );
+}
+
+#[test]
+fn explicit_config_can_authorize_tools_and_write_to_an_explicit_location() {
+    let project = TestProject::rust("explicit-config-trust");
+    seed_empty_cargo_dump(&project.cache);
+    let trusted_config = project.directory.path().join("trusted.toml");
+    let output_path = project.directory.path().join("trusted-output.json");
+    fs::write(
+        &trusted_config,
+        format!(
+            "offline = true\nformat = \"json\"\noutput = {:?}\nallow-tools = true\n",
+            output_path.to_string_lossy()
+        ),
+    )
+    .expect("write explicitly trusted config");
+
+    let output = project.run(&[
+        "scan",
+        "--config",
+        trusted_config.to_str().expect("UTF-8 config path"),
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 0);
+    assert!(output.stdout.is_empty());
+    assert!(output_path.is_file());
+}
+
+#[test]
+fn malformed_scan_config_does_not_affect_non_scan_commands() {
+    let project = TestProject::rust("config-command-isolation");
+    fs::write(project.directory.path().join("depscan.toml"), "offline = [")
+        .expect("write malformed scan config");
+
+    let output = command(&project.cache)
+        .current_dir(project.directory.path())
+        .args(["cache", "path"])
+        .output()
+        .expect("run non-scan command beside malformed config");
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&project.cache.to_string_lossy()[..]));
+
+    for arguments in [&["completions", "bash"][..], &["sync", "--help"][..]] {
+        let output = command(&project.cache)
+            .current_dir(project.directory.path())
+            .args(arguments)
+            .output()
+            .expect("run non-scan command beside malformed config");
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty());
+        assert!(!output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn invalid_cli_value_exits_ten_before_project_detection() {
     let directory = TestDirectory::new("invalid-cli-value");
 
@@ -1431,11 +1824,11 @@ fn help_and_subcommand_contracts_match_byte_snapshots() {
     let cases = [
         (
             &["--help"][..],
-            "b46e02b1596dac60affb9bf94f8a2bbd3693a8b69635520c8dd50205a7c9f0eb",
+            "079cac0ca6d98ca5ea6836b3bf810ac95014e4a742c5697e0a96b8fa7ec3837d",
         ),
         (
             &["scan", "--help"][..],
-            "a58cf98c89984db967b375a2d80dee0e28451d50688e132eead06b3bd9d3cefd",
+            "81b27ef05de0f48c2b8d88ab2ce9f90888fad608f09b1b91bfd5c4c3fe415d5c",
         ),
         (
             &["sync", "--help"][..],
@@ -1469,7 +1862,7 @@ fn generated_completions_match_byte_snapshots_and_advertise_typed_values() {
         ),
         (
             "fish",
-            "989e635d8898854f7614f18bbc8f3256bbc4fac7537e173cb810d0932a39f1bf",
+            "67e4452c02e51ef351895c346dc217733f0bb09af794559d93017afbe6fdf4f5",
         ),
     ] {
         let output = command(&directory.path().join("cache"))

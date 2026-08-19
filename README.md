@@ -89,17 +89,35 @@ An installed version reported as yanked or deprecated is an independent freshnes
 
 ## Configuration and suppressions
 
-`depscan.toml` is read from the scan root unless `--config` is supplied. Command-line values take precedence.
+`depscan.toml` is read from the scan root unless `--config` selects another readable, non-symlink regular file. The schema is strict: unknown keys, wrong TOML types, invalid enum values, invalid durations, and simultaneous non-zero `quiet`/`verbose` settings are configuration errors (exit `10`).
 
 ```toml
+ecosystem = ["cargo", "npm"]
+no-dev = false
+direct-only = false
+format = "json"
+output = "reports/depscan.json"
 fail-on = "high"
 fail-on-outdated = "never"
+offline = false
+no-cache = false
+max-cache-age = "24h"
+include-withdrawn = false
+allow-tools = false
+quiet = 0
+verbose = 0
 
 [[ignore]]
 id = "GHSA-xxxx-xxxx-xxxx"
 reason = "Documented exploitability assessment"
 expires = 2026-12-31
 ```
+
+Scalar precedence is CLI value, then config value, then the documented CLI default. Format is merged independently: CLI `--format`, then configured `format`, then inference from the effective output path or TTY. Enable-only switches such as `--offline`, `--no-cache`, and `--include-withdrawn` set their effective value to true when present; when absent, the configured boolean is used. There are no negative CLI forms. Any CLI `--ecosystem` entries replace the configured `ecosystem` array; an empty configured array means auto-detect all ecosystems. CLI and configured ignores are combined with their provenance retained. Any CLI quiet/verbose occurrence replaces the entire configured logging group.
+
+The remaining defaults are: all detected ecosystems, development and transitive dependencies included, output to stdout, format inferred from output/TTY, vulnerability threshold `high`, outdated threshold `never`, online/cache reads enabled, no maximum cache age, withdrawn advisories excluded, external tools disabled, and warning-level diagnostics. A configured relative `output` resolves from the scan root; pre-existing auto-discovered output paths are checked for root escape and symlinks before scanning. CLI output paths and output paths from an explicitly selected trusted config resolve normally and may target other locations. DS-048 tracks capability-relative file access that remains safe against a concurrent pathname swap after validation.
+
+`allow-tools` is a supply-chain boundary. An auto-discovered project config cannot self-authorize it: `allow-tools = true` requires either the CLI `--allow-tools` flag or an explicitly selected trusted `--config` file. Once authorized, supported fallbacks may execute package-manager binaries in the scanned checkout. Inspect the checkout and configuration before enabling this for untrusted input.
 
 Expired suppressions are not applied and are emitted as warnings and report metadata. Active suppressions remain visible in table, JSON, SARIF, and summary output but do not affect failure thresholds. Suppression reasons are intentionally included in reports for auditability, so they should not contain secrets. Repeated `--ignore <ID>` arguments are also supported for ephemeral CI suppression.
 

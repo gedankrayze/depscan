@@ -40,7 +40,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-019](DS-019.md) | P1 | Closed | Implement the specified exit-code taxonomy |
 | [DS-020](DS-020.md) | P1 | Closed | Render included withdrawn advisories consistently |
 | [DS-021](DS-021.md) | P1 | Closed | Preserve auditable suppression details |
-| [DS-022](DS-022.md) | P1 | Open | Support the full CLI surface in configuration |
+| [DS-022](DS-022.md) | P1 | Closed | Support the full CLI surface in configuration |
 | [DS-023](DS-023.md) | P1 | Open | Implement explicitly allowed Bun and dotnet tool fallbacks |
 | [DS-024](DS-024.md) | P1 | Open | Make workspace crates publishable |
 | [DS-025](DS-025.md) | P1 | Closed | Modernize the Rust toolchain, edition, resolver, and MSRV policy |
@@ -66,3 +66,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-045](DS-045.md) | P2 | Open | Generate release automation and complete the target matrix |
 | [DS-046](DS-046.md) | P2 | Open | Deliver and verify genuinely static Linux artifacts |
 | [DS-047](DS-047.md) | P1 | Open | Make offline sync publication capability-safe during directory swaps |
+| [DS-048](DS-048.md) | P1 | Open | Make configuration and report file access capability-safe |

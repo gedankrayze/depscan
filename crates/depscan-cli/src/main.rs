@@ -74,7 +74,7 @@ impl CliError {
     version,
     about = "Scan dependency lockfiles for known vulnerabilities and version freshness",
     long_about = "Scan dependency lockfiles and manifests for OSV vulnerabilities, yanked releases, and newer stable versions. By default depscan auto-detects every supported ecosystem in the current directory, writes a human summary to non-interactive stdout, and uses the network plus its local cache.",
-    after_long_help = "Exit status:\n  0  scan completed below both failure thresholds\n  1  vulnerability at or above --fail-on (takes precedence over 2)\n  2  outdated or yanked dependency at or above --fail-on-outdated\n 10  command-line or configuration error\n 20  no supported project or dependency was detected\n 30  provider hard failure without a usable fallback",
+    after_long_help = "Configuration:\n  PATH/depscan.toml is loaded by default; --config selects another regular file.\n  CLI scalar values win; present enable-only switches set true. CLI --ecosystem values replace\n  the configured list; CLI --ignore values combine with configured ignore rules. Configured\n  relative output paths resolve from PATH, and implicit config output is validated inside PATH.\n  An implicit project config cannot self-enable allow-tools; pass --allow-tools or explicitly\n  select a trusted config containing allow-tools=true.\n\nExit status:\n  0  scan completed below both failure thresholds\n  1  vulnerability at or above --fail-on (takes precedence over 2)\n  2  outdated or yanked dependency at or above --fail-on-outdated\n 10  command-line or configuration error\n 20  no supported project or dependency was detected\n 30  provider hard failure without a usable fallback",
     arg_required_else_help = false
 )]
 struct Cli {
@@ -88,7 +88,7 @@ struct Cli {
 enum Command {
     /// Scan one project directory (the default command).
     #[command(
-        after_long_help = "Exit status:\n  0  scan completed below both failure thresholds\n  1  vulnerability at or above --fail-on (takes precedence over 2)\n  2  outdated or yanked dependency at or above --fail-on-outdated\n 10  command-line or configuration error\n 20  no supported project or dependency was detected\n 30  provider hard failure without a usable fallback"
+        after_long_help = "Configuration:\n  PATH/depscan.toml is loaded by default; --config selects another regular file.\n  CLI scalar values win; present enable-only switches set true. CLI --ecosystem values replace\n  the configured list; CLI --ignore values combine with configured ignore rules. Configured\n  relative output paths resolve from PATH, and implicit config output is validated inside PATH.\n  An implicit project config cannot self-enable allow-tools; pass --allow-tools or explicitly\n  select a trusted config containing allow-tools=true.\n\nExit status:\n  0  scan completed below both failure thresholds\n  1  vulnerability at or above --fail-on (takes precedence over 2)\n  2  outdated or yanked dependency at or above --fail-on-outdated\n 10  command-line or configuration error\n 20  no supported project or dependency was detected\n 30  provider hard failure without a usable fallback"
     )]
     Scan(ScanArgs),
     /// Download or refresh OSV dumps used by offline scans.
@@ -248,8 +248,8 @@ struct ScanArgs {
     #[arg(
         long,
         value_name = "FILE",
-        help = "Read configuration from FILE; CLI failure thresholds win and ignore lists combine",
-        long_help = "Read configuration from FILE instead of PATH/depscan.toml. FILE must be a readable regular file; symbolic links are rejected. Command-line failure thresholds take precedence over configured thresholds, while ignore rules are combined. Ignore reasons are included in reports, so they must not contain secrets."
+        help = "Read configuration from FILE; CLI settings win and ignore lists combine",
+        long_help = "Read configuration from FILE instead of PATH/depscan.toml. FILE must be a readable regular file; symbolic links are rejected. Command-line scalar values take precedence; a present enable-only switch sets true. Command-line ecosystem values replace the configured list, while ignore rules are combined. Relative configured output paths resolve from PATH; implicit config output must remain within PATH. Ignore reasons are included in reports, so they must not contain secrets. Explicitly selecting a trusted config containing allow-tools=true authorizes package-manager execution; an implicit project config cannot self-authorize it."
     )]
     config: Option<PathBuf>,
     /// Permit explicitly supported package-manager fallbacks.
@@ -319,20 +319,71 @@ enum CompletionShell {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct Config {
-    #[serde(rename = "fail-on")]
+    #[serde(rename = "ecosystem")]
+    ecosystems: Option<Vec<String>>,
+    no_dev: Option<bool>,
+    direct_only: Option<bool>,
+    format: Option<String>,
+    output: Option<PathBuf>,
     fail_on: Option<String>,
-    #[serde(rename = "fail-on-outdated")]
     fail_on_outdated: Option<String>,
+    offline: Option<bool>,
+    no_cache: Option<bool>,
+    max_cache_age: Option<String>,
+    include_withdrawn: Option<bool>,
     #[serde(default, rename = "ignore")]
     ignores: Vec<IgnoreConfig>,
+    allow_tools: Option<bool>,
+    quiet: Option<u8>,
+    verbose: Option<u8>,
 }
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IgnoreConfig {
     id: String,
     reason: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_date")]
     expires: Option<NaiveDate>,
+}
+
+#[derive(Debug)]
+struct ConfigOrigin {
+    path: PathBuf,
+    origin: &'static str,
+    loaded: bool,
+}
+
+impl ConfigOrigin {
+    fn log(&self) {
+        if self.loaded {
+            debug!(path = %self.path.display(), origin = self.origin, "configuration loaded");
+        } else {
+            debug!(
+                path = %self.path.display(),
+                origin = self.origin,
+                "configuration file not found; using defaults"
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LoadedConfig {
+    value: Config,
+    origin: ConfigOrigin,
+}
+
+#[derive(Debug)]
+struct PreparedScan {
+    args: ScanArgs,
+    format: OutputFormat,
+    fail_on: VulnerabilityThreshold,
+    fail_on_outdated: OutdatedThreshold,
+    configured_ignores: Vec<IgnoreConfig>,
+    config_origin: ConfigOrigin,
+    implicit_config_output: bool,
 }
 
 fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
@@ -383,25 +434,50 @@ async fn main() -> ExitCode {
             };
         }
     };
-    let level = match &cli.command {
-        Some(Command::Scan(args)) => log_level(args),
-        None => log_level(&cli.default_scan),
-        _ => "warn",
+    match cli.command {
+        Some(Command::Scan(args)) => run_scan(args).await,
+        None => run_scan(cli.default_scan).await,
+        Some(command) => run_non_scan(command).await,
+    }
+}
+
+async fn run_scan(args: ScanArgs) -> ExitCode {
+    let prepared = match prepare_scan(args) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("{error}");
+            return error.exit_code();
+        }
     };
+    initialize_tracing(log_level(prepared.args.quiet, prepared.args.verbose));
+    prepared.config_origin.log();
+    finish(scan(prepared).await)
+}
+
+async fn run_non_scan(command: Command) -> ExitCode {
+    initialize_tracing("warn");
+    let code = match command {
+        Command::Scan(_) => {
+            unreachable!("scan commands are prepared before tracing initialization")
+        }
+        Command::Sync(args) => sync(args).await,
+        Command::Cache(args) => cache_command(args),
+        Command::Completions { shell } => {
+            completions(shell);
+            Ok(AppExit::Clean)
+        }
+    };
+    finish(code)
+}
+
+fn initialize_tracing(level: &str) {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(level))
         .with_writer(io::stderr)
         .init();
-    let code = match cli.command {
-        Some(Command::Scan(args)) => scan(args).await,
-        Some(Command::Sync(args)) => sync(args).await,
-        Some(Command::Cache(args)) => cache_command(args),
-        Some(Command::Completions { shell }) => {
-            completions(shell);
-            Ok(AppExit::Clean)
-        }
-        None => scan(cli.default_scan).await,
-    };
+}
+
+fn finish(code: Result<AppExit, CliError>) -> ExitCode {
     match code {
         Ok(exit) => exit.into(),
         Err(error) => {
@@ -410,50 +486,29 @@ async fn main() -> ExitCode {
         }
     }
 }
-fn log_level(args: &ScanArgs) -> &'static str {
-    if args.quiet > 0 {
+
+fn log_level(quiet: u8, verbose: u8) -> &'static str {
+    if quiet > 0 {
         "error"
-    } else if args.verbose > 0 {
+    } else if verbose > 0 {
         "debug"
     } else {
         "warn"
     }
 }
 
-async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
-    if !args.path.is_dir() {
-        return Err(CliError::usage(format!(
-            "{} is not a directory",
-            args.path.display()
-        )));
-    }
+async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
+    let PreparedScan {
+        args,
+        format,
+        fail_on,
+        fail_on_outdated,
+        configured_ignores,
+        config_origin: _,
+        implicit_config_output: _,
+    } = prepared;
     let generated_at = scan_timestamp()?;
-    let config = load_config(&args.path, args.config.as_deref())?;
-    let fail_on = args.fail_on.map_or_else(
-        || {
-            config
-                .fail_on
-                .as_deref()
-                .map_or(Ok(VulnerabilityThreshold::High), |value| {
-                    parse_config_threshold(value, "fail-on")
-                })
-        },
-        Ok,
-    )?;
-    let fail_outdated = args.fail_on_outdated.map_or_else(
-        || {
-            config
-                .fail_on_outdated
-                .as_deref()
-                .map_or(Ok(OutdatedThreshold::Never), |value| {
-                    parse_config_threshold(value, "fail-on-outdated")
-                })
-        },
-        Ok,
-    )?;
     let max_cache_age = args.max_cache_age.map(|age| age.0);
-    let format = determine_format(&args).map_err(CliError::usage)?;
-    validate_output_path(args.output.as_deref())?;
     let mut suppression_rules = args
         .ignore
         .iter()
@@ -465,7 +520,7 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
             state: SuppressionState::Active,
         })
         .collect::<Vec<_>>();
-    for ignored in config.ignores {
+    for ignored in configured_ignores {
         let state = if ignored
             .expires
             .is_some_and(|date| date < generated_at.date_naive())
@@ -585,7 +640,7 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
     }
     if has_vulnerability_failure(&document, fail_on) {
         Ok(AppExit::Vulnerabilities)
-    } else if has_outdated_failure(&document, fail_outdated) {
+    } else if has_outdated_failure(&document, fail_on_outdated) {
         Ok(AppExit::Outdated)
     } else {
         Ok(AppExit::Clean)
@@ -680,7 +735,137 @@ async fn fetch_latest(
     .await
 }
 
-fn load_config(root: &Path, explicit: Option<&Path>) -> Result<Config, CliError> {
+fn prepare_scan(args: ScanArgs) -> Result<PreparedScan, CliError> {
+    if !args.path.is_dir() {
+        return Err(CliError::usage(format!(
+            "{} is not a directory",
+            args.path.display()
+        )));
+    }
+    let loaded = load_config(&args.path, args.config.as_deref())?;
+    let prepared = merge_scan_config(args, loaded)?;
+    validate_output_path(prepared.args.output.as_deref())?;
+    if prepared.implicit_config_output
+        && let Some(output) = prepared.args.output.as_deref()
+    {
+        validate_implicit_config_output(&prepared.args.path, output)?;
+    }
+    Ok(prepared)
+}
+
+fn merge_scan_config(mut args: ScanArgs, loaded: LoadedConfig) -> Result<PreparedScan, CliError> {
+    let explicit_config = args.config.is_some();
+    let Config {
+        ecosystems,
+        no_dev,
+        direct_only,
+        format,
+        output,
+        fail_on,
+        fail_on_outdated,
+        offline,
+        no_cache,
+        max_cache_age,
+        include_withdrawn,
+        ignores,
+        allow_tools,
+        quiet,
+        verbose,
+    } = loaded.value;
+
+    let configured_ecosystems = ecosystems
+        .map(|values| parse_config_values::<EcosystemArg>(&values, "ecosystem", true))
+        .transpose()?;
+    let configured_format = format
+        .as_deref()
+        .map(|value| parse_config_value::<ReportFormat>(value, "format", false))
+        .transpose()?;
+    let configured_fail_on = fail_on
+        .as_deref()
+        .map(|value| parse_config_threshold(value, "fail-on"))
+        .transpose()?;
+    let configured_fail_on_outdated = fail_on_outdated
+        .as_deref()
+        .map(|value| parse_config_threshold(value, "fail-on-outdated"))
+        .transpose()?;
+    let configured_max_cache_age = max_cache_age
+        .as_deref()
+        .map(|value| {
+            value.parse::<CacheAge>().map_err(|error| {
+                CliError::usage(format!(
+                    "invalid config value {value:?} for max-cache-age: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+
+    let configured_quiet = quiet.unwrap_or(0);
+    let configured_verbose = verbose.unwrap_or(0);
+    if configured_quiet > 0 && configured_verbose > 0 {
+        return Err(CliError::usage(
+            "config quiet and verbose cannot both be greater than zero",
+        ));
+    }
+
+    if args.ecosystems.is_empty()
+        && let Some(values) = configured_ecosystems
+    {
+        args.ecosystems = values;
+    }
+    args.no_dev = args.no_dev || no_dev.unwrap_or(false);
+    args.direct_only = args.direct_only || direct_only.unwrap_or(false);
+    if args.format.is_none() {
+        args.format = configured_format;
+    }
+    let configured_output_selected = args.output.is_none() && output.is_some();
+    if args.output.is_none()
+        && let Some(configured) = output
+    {
+        args.output = Some(if configured.is_absolute() {
+            configured
+        } else {
+            args.path.join(configured)
+        });
+    }
+    let fail_on = args
+        .fail_on
+        .or(configured_fail_on)
+        .unwrap_or(VulnerabilityThreshold::High);
+    let fail_on_outdated = args
+        .fail_on_outdated
+        .or(configured_fail_on_outdated)
+        .unwrap_or(OutdatedThreshold::Never);
+    args.offline = args.offline || offline.unwrap_or(false);
+    args.no_cache = args.no_cache || no_cache.unwrap_or(false);
+    if args.max_cache_age.is_none() {
+        args.max_cache_age = configured_max_cache_age;
+    }
+    args.include_withdrawn = args.include_withdrawn || include_withdrawn.unwrap_or(false);
+    let configured_allow_tools = allow_tools.unwrap_or(false);
+    if configured_allow_tools && !args.allow_tools && !explicit_config {
+        return Err(CliError::usage(
+            "implicit project config cannot enable allow-tools; pass --allow-tools or select a trusted file with --config",
+        ));
+    }
+    args.allow_tools = args.allow_tools || (explicit_config && configured_allow_tools);
+    if args.quiet == 0 && args.verbose == 0 {
+        args.quiet = configured_quiet;
+        args.verbose = configured_verbose;
+    }
+    let format = determine_format(&args).map_err(CliError::usage)?;
+
+    Ok(PreparedScan {
+        args,
+        format,
+        fail_on,
+        fail_on_outdated,
+        configured_ignores: ignores,
+        config_origin: loaded.origin,
+        implicit_config_output: configured_output_selected && !explicit_config,
+    })
+}
+
+fn load_config(root: &Path, explicit: Option<&Path>) -> Result<LoadedConfig, CliError> {
     let (path, origin) = explicit.map_or_else(
         || (root.join("depscan.toml"), "implicit-default"),
         |path| (path.to_path_buf(), "explicit"),
@@ -688,12 +873,14 @@ fn load_config(root: &Path, explicit: Option<&Path>) -> Result<Config, CliError>
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound && explicit.is_none() => {
-            debug!(
-                path = %path.display(),
-                origin,
-                "configuration file not found; using defaults"
-            );
-            return Ok(Config::default());
+            return Ok(LoadedConfig {
+                value: Config::default(),
+                origin: ConfigOrigin {
+                    path,
+                    origin,
+                    loaded: false,
+                },
+            });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(CliError::usage(format!(
@@ -724,12 +911,50 @@ fn load_config(root: &Path, explicit: Option<&Path>) -> Result<Config, CliError>
         .map_err(|e| CliError::usage(format!("reading config {}: {e}", path.display())))?;
     let config = toml::from_str(&text)
         .map_err(|e| CliError::usage(format!("invalid config {}: {e}", path.display())))?;
-    debug!(path = %path.display(), origin, "configuration loaded");
-    Ok(config)
+    Ok(LoadedConfig {
+        value: config,
+        origin: ConfigOrigin {
+            path,
+            origin,
+            loaded: true,
+        },
+    })
 }
 fn parse_ecosystems(values: &[EcosystemArg]) -> HashSet<Ecosystem> {
     values.iter().copied().map(Ecosystem::from).collect()
 }
+
+fn parse_config_values<T>(
+    values: &[String],
+    setting: &str,
+    ignore_case: bool,
+) -> Result<Vec<T>, CliError>
+where
+    T: ValueEnum + Clone,
+{
+    values
+        .iter()
+        .map(|value| parse_config_value(value, setting, ignore_case))
+        .collect()
+}
+
+fn parse_config_value<T>(value: &str, setting: &str, ignore_case: bool) -> Result<T, CliError>
+where
+    T: ValueEnum + Clone,
+{
+    <T as ValueEnum>::from_str(value, ignore_case).map_err(|_| {
+        let allowed = T::value_variants()
+            .iter()
+            .filter_map(ValueEnum::to_possible_value)
+            .map(|possible| possible.get_name().to_owned())
+            .collect::<Vec<_>>()
+            .join("|");
+        CliError::usage(format!(
+            "invalid config value {value:?} for {setting}; expected {allowed}"
+        ))
+    })
+}
+
 fn parse_config_threshold<T>(value: &str, setting: &str) -> Result<T, CliError>
 where
     T: ValueEnum + Clone,
@@ -796,6 +1021,45 @@ fn validate_output_path(path: Option<&Path>) -> Result<(), CliError> {
     }
     Ok(())
 }
+
+fn validate_implicit_config_output(root: &Path, output: &Path) -> Result<(), CliError> {
+    let canonical_root = fs::canonicalize(root).map_err(|error| {
+        CliError::usage(format!(
+            "resolving scan root {} for configured output: {error}",
+            root.display()
+        ))
+    })?;
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+        CliError::usage(format!(
+            "resolving configured output directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(CliError::usage(format!(
+            "implicit configured output {} escapes scan root {}; use --output or an explicitly selected trusted config to write elsewhere",
+            output.display(),
+            root.display()
+        )));
+    }
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::usage(format!(
+            "implicit configured output {} is a symbolic link",
+            output.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CliError::usage(format!(
+            "inspecting implicit configured output {}: {error}",
+            output.display()
+        ))),
+    }
+}
+
 fn has_vulnerability_failure(document: &ScanDocument, threshold: VulnerabilityThreshold) -> bool {
     let min = match threshold {
         VulnerabilityThreshold::Never => return false,
@@ -912,6 +1176,213 @@ fn completions(shell: CompletionShell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_args(arguments: &[&str]) -> ScanArgs {
+        let cli = Cli::try_parse_from(
+            std::iter::once("depscan")
+                .chain(std::iter::once("scan"))
+                .chain(arguments.iter().copied()),
+        )
+        .expect("parse scan arguments");
+        match cli.command {
+            Some(Command::Scan(args)) => args,
+            _ => panic!("expected explicit scan command"),
+        }
+    }
+
+    fn loaded_config(contents: &str, explicit: bool) -> LoadedConfig {
+        LoadedConfig {
+            value: toml::from_str(contents).expect("parse test config"),
+            origin: ConfigOrigin {
+                path: PathBuf::from("policy.toml"),
+                origin: if explicit {
+                    "explicit"
+                } else {
+                    "implicit-default"
+                },
+                loaded: true,
+            },
+        }
+    }
+
+    #[test]
+    fn configuration_can_populate_the_complete_scan_surface() {
+        let args = scan_args(&["--config", "policy.toml", "scan-root"]);
+        let prepared = merge_scan_config(
+            args,
+            loaded_config(
+                r#"
+ecosystem = ["Cargo", "rust"]
+no-dev = true
+direct-only = true
+format = "json"
+output = "reports/audit.json"
+fail-on = "medium"
+fail-on-outdated = "minor"
+offline = true
+no-cache = true
+max-cache-age = "7d"
+include-withdrawn = true
+allow-tools = true
+quiet = 0
+verbose = 2
+
+[[ignore]]
+id = "RUSTSEC-TEST"
+reason = "fixture"
+expires = 2099-01-01
+"#,
+                true,
+            ),
+        )
+        .expect("merge complete config");
+
+        assert_eq!(
+            prepared.args.ecosystems,
+            vec![EcosystemArg::Cargo, EcosystemArg::Cargo]
+        );
+        assert!(prepared.args.no_dev);
+        assert!(prepared.args.direct_only);
+        assert_eq!(prepared.args.format, Some(ReportFormat::Json));
+        assert_eq!(
+            prepared.args.output,
+            Some(PathBuf::from("scan-root/reports/audit.json"))
+        );
+        assert_eq!(prepared.fail_on, VulnerabilityThreshold::Medium);
+        assert_eq!(prepared.fail_on_outdated, OutdatedThreshold::Minor);
+        assert!(prepared.args.offline);
+        assert!(prepared.args.no_cache);
+        assert_eq!(
+            prepared.args.max_cache_age.map(|age| age.0),
+            Duration::try_days(7)
+        );
+        assert!(prepared.args.include_withdrawn);
+        assert!(prepared.args.allow_tools);
+        assert_eq!(prepared.args.quiet, 0);
+        assert_eq!(prepared.args.verbose, 2);
+        assert_eq!(prepared.configured_ignores.len(), 1);
+    }
+
+    #[test]
+    fn cli_groups_override_config_fieldwise() {
+        let args = scan_args(&[
+            "--ecosystem",
+            "npm",
+            "--no-dev",
+            "--output",
+            "cli.sarif",
+            "--fail-on",
+            "high",
+            "--fail-on-outdated",
+            "patch",
+            "--offline",
+            "--no-cache",
+            "--max-cache-age",
+            "2h",
+            "--include-withdrawn",
+            "--allow-tools",
+            "--quiet",
+            "--ignore",
+            "CLI-ID",
+            "scan-root",
+        ]);
+        let prepared = merge_scan_config(
+            args,
+            loaded_config(
+                r#"
+ecosystem = ["pypi"]
+no-dev = false
+direct-only = true
+format = "json"
+output = "configured.json"
+fail-on = "never"
+fail-on-outdated = "never"
+offline = false
+no-cache = false
+max-cache-age = "30m"
+include-withdrawn = false
+allow-tools = false
+quiet = 0
+verbose = 2
+
+[[ignore]]
+id = "CONFIG-ID"
+"#,
+                false,
+            ),
+        )
+        .expect("merge CLI overrides");
+
+        assert_eq!(prepared.args.ecosystems, vec![EcosystemArg::Npm]);
+        assert!(prepared.args.no_dev);
+        assert!(prepared.args.direct_only);
+        assert_eq!(prepared.args.format, Some(ReportFormat::Json));
+        assert_eq!(prepared.format, OutputFormat::Json);
+        assert_eq!(prepared.args.output, Some(PathBuf::from("cli.sarif")));
+        assert_eq!(prepared.fail_on, VulnerabilityThreshold::High);
+        assert_eq!(prepared.fail_on_outdated, OutdatedThreshold::Patch);
+        assert!(prepared.args.offline);
+        assert!(prepared.args.no_cache);
+        assert_eq!(
+            prepared.args.max_cache_age.map(|age| age.0),
+            Duration::try_hours(2)
+        );
+        assert!(prepared.args.include_withdrawn);
+        assert!(prepared.args.allow_tools);
+        assert_eq!(prepared.args.quiet, 1);
+        assert_eq!(prepared.args.verbose, 0);
+        assert_eq!(prepared.args.ignore, vec!["CLI-ID"]);
+        assert_eq!(prepared.configured_ignores.len(), 1);
+    }
+
+    #[test]
+    fn implicit_configuration_cannot_self_authorize_external_tools() {
+        let error = merge_scan_config(
+            scan_args(&["scan-root"]),
+            loaded_config("allow-tools = true", false),
+        )
+        .expect_err("implicit allow-tools must fail closed");
+        assert!(error.to_string().contains("cannot enable allow-tools"));
+
+        let prepared = merge_scan_config(
+            scan_args(&["--allow-tools", "scan-root"]),
+            loaded_config("allow-tools = true", false),
+        )
+        .expect("explicit CLI permission wins");
+        assert!(prepared.args.allow_tools);
+    }
+
+    #[test]
+    fn format_output_precedence_and_empty_ecosystem_policy_are_explicit() {
+        let configured_output = merge_scan_config(
+            scan_args(&["scan-root"]),
+            loaded_config("ecosystem = []\noutput = \"report.sarif\"", false),
+        )
+        .expect("infer format from configured output");
+        assert!(configured_output.args.ecosystems.is_empty());
+        assert_eq!(configured_output.format, OutputFormat::Sarif);
+
+        let cli_format = merge_scan_config(
+            scan_args(&["--format", "summary", "scan-root"]),
+            loaded_config("format = \"json\"\noutput = \"report.json\"", false),
+        )
+        .expect("CLI format must override configured format and output inference");
+        assert_eq!(cli_format.format, OutputFormat::Summary);
+        assert_eq!(
+            cli_format.args.output,
+            Some(PathBuf::from("scan-root/report.json"))
+        );
+    }
+
+    #[test]
+    fn conflicting_configured_log_settings_are_rejected_even_when_cli_is_set() {
+        let error = merge_scan_config(
+            scan_args(&["--quiet", "scan-root"]),
+            loaded_config("quiet = 1\nverbose = 1", false),
+        )
+        .expect_err("conflicting config must not be silently overridden");
+        assert!(error.to_string().contains("cannot both"));
+    }
 
     #[test]
     fn package_filters_run_after_conservative_coordinate_merge() {
