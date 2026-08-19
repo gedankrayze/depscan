@@ -52,7 +52,7 @@ sha2 = "0.11.0"
 toml = "1.1.4"
 thiserror = "2.0.20"
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 urlencoding = "2.1.3"

@@ -22,6 +22,9 @@ use walkdir::WalkDir;
 mod python_locks;
 mod python_manifest;
 mod requirements;
+mod tool_outputs;
+
+pub use tool_outputs::{parse_bun_lockb_output, parse_dotnet_list_json};
 
 fn io_error(path: &Path, error: impl ToString) -> ParseError {
     ParseError::Io {
@@ -1027,6 +1030,10 @@ fn parse_pnpm_key(raw: &str) -> Option<(&str, &str)> {
 
 fn parse_yarn_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = read_yaml_text(path)?;
+    parse_yarn_lock_text(path, &text)
+}
+
+fn parse_yarn_lock_text(path: &Path, text: &str) -> Result<Vec<Package>, ParseError> {
     let root = path.parent().unwrap_or(Path::new("."));
     let direct = yarn_direct_dependencies(root);
     let has_berry_metadata = text.lines().any(|line| {
@@ -1034,9 +1041,9 @@ fn parse_yarn_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
         line.starts_with("__metadata:") || line.starts_with("\"__metadata\":")
     });
     if has_berry_metadata {
-        parse_yarn_berry(path, &text, &direct)
+        parse_yarn_berry(path, text, &direct)
     } else if text.lines().any(|line| line.trim() == "# yarn lockfile v1") {
-        parse_yarn_classic(path, &text, &direct)
+        parse_yarn_classic(path, text, &direct)
     } else {
         Err(invalid(
             path,

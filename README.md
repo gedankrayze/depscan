@@ -8,9 +8,9 @@
 
 | Ecosystem | Normal sources | Manifest-only fallback |
 |---|---|---|
-| npm / Bun | `bun.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock` | `package.json` |
+| npm / Bun | `bun.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`; authorized `bun.lockb` extraction | `package.json` |
 | Python | `uv.lock`, `poetry.lock`, `Pipfile.lock`, `requirements.txt` | `pyproject.toml` |
-| .NET | `packages.lock.json`, project XML, `packages.config` | project XML ranges |
+| .NET | `packages.lock.json`, project XML, `packages.config`; authorized SDK transitive enumeration | project XML ranges |
 | Rust | `Cargo.lock` | `Cargo.toml` |
 
 Resolved lockfile versions are preferred. Manifest-only records are marked as range-derived, because they are not an installed dependency resolution.
@@ -142,6 +142,8 @@ The remaining defaults are: all detected ecosystems, development and transitive 
 
 `allow-tools` is a supply-chain boundary. An auto-discovered project config cannot self-authorize it: `allow-tools = true` requires either the CLI `--allow-tools` flag or an explicitly selected trusted `--config` file. Once authorized, supported fallbacks may execute package-manager binaries in the scanned checkout. Inspect the checkout and configuration before enabling this for untrusted input.
 
+The authorized Bun fallback runs `bun bun.lockb` in the lockfile directory and parses its Yarn Classic output. The authorized .NET fallback runs `dotnet list ./<project> package --include-transitive --format json --output-version 1 --verbosity quiet` for each unlocked project; the explicit `./` prevents a project filename from being interpreted as an option, and an offline scan adds `--no-restore` so the SDK cannot restore over the network. Both commands use an absolute executable resolved only from absolute `PATH` entries, a canonical working directory, a temporary home, an allowlisted environment, null standard input, a 10-second timeout, and bounded stdout/stderr capture. No shell is involved. A missing executable, non-zero status, timeout, oversized output, invalid UTF-8, or malformed machine output is a configuration/parse failure (exit `10`), never a clean or partial dependency result.
+
 Expired suppressions are not applied and are emitted as warnings and report metadata. Active suppressions remain visible in table, JSON, SARIF, and summary output but do not affect failure thresholds. Suppression reasons are intentionally included in reports for auditability, so they should not contain secrets. Repeated `--ignore <ID>` arguments are also supported for ephemeral CI suppression.
 
 Withdrawn OSV advisories are excluded by default, so they do not render, contribute to totals, or affect exit thresholds. `--include-withdrawn` retains them in the scan model; table, JSON, SARIF, and summary output then label and count them explicitly, and their severity participates in `--fail-on` like any other retained advisory.
@@ -188,7 +190,7 @@ cargo test --workspace --all-targets
 
 ## Known v0.1 limitations
 
-The implementation does not execute package-manager binaries automatically. `bun.lockb` is recognized but requires a textual `bun.lock` for parsing at present. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
+The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
 
 ## License
 

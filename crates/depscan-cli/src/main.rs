@@ -30,6 +30,8 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
 
+mod external_tools;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum AppExit {
@@ -259,7 +261,7 @@ struct ScanArgs {
     /// Permit explicitly supported package-manager fallbacks.
     #[arg(
         long,
-        long_help = "Permit explicitly supported package-manager fallbacks. This may execute bun or dotnet while scanning an attacker-controlled checkout; leave disabled for untrusted projects unless that execution is acceptable."
+        long_help = "Permit Bun binary-lock extraction and .NET transitive JSON enumeration. This may execute bun or dotnet with fixed arguments in an attacker-controlled checkout; commands use a minimized environment, bounded output, and a 10-second timeout. Offline dotnet enumeration disables restore. Leave this disabled unless that execution is acceptable."
     )]
     allow_tools: bool,
     /// Reduce diagnostics. Repeatable; conflicts with --verbose. Reports still use stdout or --output.
@@ -554,19 +556,22 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
     }
     let mut packages = Vec::new();
     for source in sources {
-        match parsers.parse(&source) {
-            Ok(mut parsed) => packages.append(&mut parsed),
-            Err(error)
-                if args.allow_tools
-                    && matches!(source.kind, depscan_core::SourceKind::BunLockBinary) =>
-            {
-                warn!(
-                    "{}; automatic binary lockfile extraction is not currently available",
-                    error
-                );
+        let mut parsed = match &source.kind {
+            depscan_core::SourceKind::BunLockBinary if args.allow_tools => {
+                external_tools::parse_bun_binary_lock(&source.path)
+                    .await
+                    .map_err(|error| CliError::usage(error.to_string()))?
             }
-            Err(error) => return Err(CliError::usage(error.to_string())),
-        }
+            depscan_core::SourceKind::ProjectFile if args.allow_tools => {
+                external_tools::parse_dotnet_project(&source.path, args.offline)
+                    .await
+                    .map_err(|error| CliError::usage(error.to_string()))?
+            }
+            _ => parsers
+                .parse(&source)
+                .map_err(|error| CliError::usage(error.to_string()))?,
+        };
+        packages.append(&mut parsed);
     }
     packages = consolidate_packages(packages, args.no_dev, args.direct_only);
     if packages.is_empty() {

@@ -2345,11 +2345,11 @@ fn help_and_subcommand_contracts_match_byte_snapshots() {
     let cases = [
         (
             &["--help"][..],
-            "baa7f6c44933106a0a3ec64f014dee0a272aae48fd0971dde3492712526b1dda",
+            "7aa169cc6b63d554bd0aac2a4d360d7cc04edd40bd5987c9ddf43a88993e7197",
         ),
         (
             &["scan", "--help"][..],
-            "fa6d266aaa1eb37ce609b639f854ca5744c12d964c2a5cfdf933185e450f7c27",
+            "689cc87270ee399eeae2df12359382b695c1a2a0d27c8043f6ab192352e6c8bb",
         ),
         (
             &["sync", "--help"][..],
