@@ -1,0 +1,32 @@
+name: Pull Request Policy
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - edited
+
+permissions:
+  contents: read
+
+jobs:
+  require-develop-source:
+    name: Require develop as source branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify source branch
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [[ "$HEAD_BRANCH" != "develop" || "$HEAD_REPOSITORY" != "$BASE_REPOSITORY" ]]; then
+            echo "Pull requests into main must originate from this repository's develop branch."
+            echo "Received source: $HEAD_REPOSITORY:$HEAD_BRANCH"
+            exit 1
+          fi

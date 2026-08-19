@@ -19,7 +19,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 
 | ID | Priority | Status | Finding |
 |---|---|---|---|
-| [DS-001](DS-001.md) | P1 | Open | Repository hygiene and branch governance |
+| [DS-001](DS-001.md) | P1 | In progress | Repository hygiene and branch governance |
 | [DS-002](DS-002.md) | P0 | Closed | Replace approximate CVSS scoring |
 | [DS-003](DS-003.md) | P0 | Closed | Preserve canonical NuGet names for OSV |
 | [DS-004](DS-004.md) | P0 | Closed | Use standards-compliant PEP 440 ordering |

@@ -28,6 +28,8 @@ jobs:
       RUST_IMAGE: rust:1.97.1-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Install ELF inspection tools
         run: sudo apt-get update && sudo apt-get install --yes binutils file
       - name: Build natively against musl
