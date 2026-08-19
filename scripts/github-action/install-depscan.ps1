@@ -11,8 +11,8 @@ if ($env:RUNNER_OS -ne "Windows" -or $env:RUNNER_ARCH -ne "X64") {
 if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
     throw "RUNNER_TEMP is required"
 }
-if ([string]::IsNullOrWhiteSpace($env:GITHUB_PATH)) {
-    throw "GITHUB_PATH is required"
+if ([string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+    throw "GITHUB_ENV is required"
 }
 
 $target = "x86_64-pc-windows-msvc"
@@ -60,6 +60,7 @@ try {
 
     $installedBinary = Join-Path $installDir "depscan.exe"
     Copy-Item -LiteralPath $sourceBinary -Destination $installedBinary
+    $installedBinary = (Resolve-Path -LiteralPath $installedBinary).Path
 
     $versionOutput = & $installedBinary --version
     if ($LASTEXITCODE -ne 0) {
@@ -69,7 +70,7 @@ try {
     if ($installedVersion -ne "depscan $($version.Substring(1))") {
         throw "Downloaded binary does not match release $version`: $installedVersion"
     }
-    Add-Content -LiteralPath $env:GITHUB_PATH -Value $installDir -Encoding utf8
+    Add-Content -LiteralPath $env:GITHUB_ENV -Value "DEPSCAN_ACTION_INSTALLED_BINARY=$installedBinary" -Encoding utf8
 }
 finally {
     Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue

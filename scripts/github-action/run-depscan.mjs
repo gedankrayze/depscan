@@ -30,11 +30,16 @@ try {
     throw new Error("path must not be empty");
   }
 
-  let binary = process.platform === "win32" ? "depscan.exe" : "depscan";
+  let binary;
   if (binaryInput.length > 0) {
     binary = path.resolve(binaryInput);
-    accessSync(binary, constants.X_OK);
+  } else {
+    binary = setting("DEPSCAN_ACTION_INSTALLED_BINARY");
+    if (binary.length === 0 || !path.isAbsolute(binary)) {
+      throw new Error("installed depscan binary path must be a non-empty absolute path");
+    }
   }
+  accessSync(binary, constants.X_OK);
 
   const ecosystem = oneOf("DEPSCAN_ACTION_ECOSYSTEM", [
     "auto",

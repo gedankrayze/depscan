@@ -31,6 +31,74 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Build CLI
         run: cargo build --release --locked -p depscan-cli
+      - name: Verify Windows action runner ignores a workspace executable decoy
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cache = Join-Path $env:RUNNER_TEMP "depscan-action-decoy-cache"
+          $offline = Join-Path $cache "offline"
+          New-Item -ItemType Directory -Path $offline -Force | Out-Null
+          Set-Content `
+            -LiteralPath (Join-Path $cache ".depscan-cache.json") `
+            -Value '{"schema_version":1,"owner":"depscan"}' `
+            -Encoding utf8
+
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archivePath = Join-Path $offline "crates_io.zip"
+          $archive = [System.IO.Compression.ZipFile]::Open(
+            $archivePath,
+            [System.IO.Compression.ZipArchiveMode]::Create
+          )
+          $archive.Dispose()
+          $stamp = (Get-Date).ToUniversalTime().ToString(
+            "yyyy-MM-ddTHH:mm:ssZ",
+            [Globalization.CultureInfo]::InvariantCulture
+          )
+          Set-Content `
+            -LiteralPath (Join-Path $offline "crates_io.synced-at") `
+            -Value $stamp `
+            -Encoding utf8
+
+          $trustedBinaryPath = Join-Path $env:GITHUB_WORKSPACE "target/release/depscan.exe"
+          $trustedBinary = (Resolve-Path -LiteralPath $trustedBinaryPath).Path
+          $fixturePath = Join-Path $env:GITHUB_WORKSPACE "fixtures/e2e/cargo"
+          $scanPath = (Resolve-Path -LiteralPath $fixturePath).Path
+          $report = Join-Path $env:RUNNER_TEMP "depscan-action-decoy-summary.txt"
+          $decoy = Join-Path $env:GITHUB_WORKSPACE "depscan.exe"
+          if (Test-Path -LiteralPath $decoy) {
+            throw "Workspace decoy path already exists: $decoy"
+          }
+
+          $env:DEPSCAN_CACHE_DIR = $cache
+          $env:DEPSCAN_ACTION_BINARY = ""
+          $env:DEPSCAN_ACTION_INSTALLED_BINARY = $trustedBinary
+          $env:DEPSCAN_ACTION_PATH_INPUT = $scanPath
+          $env:DEPSCAN_ACTION_ECOSYSTEM = "cargo"
+          $env:DEPSCAN_ACTION_FORMAT = "summary"
+          $env:DEPSCAN_ACTION_OUTPUT = $report
+          $env:DEPSCAN_ACTION_FAIL_ON = "never"
+          $env:DEPSCAN_ACTION_FAIL_ON_OUTDATED = "never"
+          $env:DEPSCAN_ACTION_OFFLINE = "true"
+          $env:DEPSCAN_ACTION_NO_CACHE = "false"
+          $env:DEPSCAN_ACTION_NO_DEV = "false"
+          $env:DEPSCAN_ACTION_DIRECT_ONLY = "false"
+          $env:DEPSCAN_ACTION_INCLUDE_WITHDRAWN = "false"
+
+          Set-Content -LiteralPath $decoy -Value "this file must never execute" -Encoding utf8
+          try {
+            node "$env:GITHUB_WORKSPACE/scripts/github-action/run-depscan.mjs"
+            $runnerExit = $LASTEXITCODE
+          }
+          finally {
+            Remove-Item -LiteralPath $decoy -Force -ErrorAction SilentlyContinue
+          }
+          if ($runnerExit -ne 0) {
+            throw "Action runner exited $runnerExit instead of using the exact trusted binary"
+          }
+          if ((Get-Content -LiteralPath $report -Raw) -notmatch '^depscan: [0-9]+ packages') {
+            throw "Action runner did not create the expected report"
+          }
       - name: Verify composite-action metadata and invocation
         if: runner.os == 'Linux'
         shell: bash

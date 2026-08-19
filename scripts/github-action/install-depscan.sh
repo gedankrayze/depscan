@@ -27,7 +27,7 @@ case "${RUNNER_OS:-}/${RUNNER_ARCH:-}" in
 esac
 
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
-: "${GITHUB_PATH:?GITHUB_PATH is required}"
+: "${GITHUB_ENV:?GITHUB_ENV is required}"
 
 asset="depscan-cli-${target}.tar.xz"
 checksum_asset="${asset}.sha256"
@@ -82,10 +82,11 @@ if [[ ! -f "$source_binary" ]]; then
   exit 1
 fi
 install -m 0755 "$source_binary" "$install_dir/depscan"
+installed_binary="$(cd -- "$install_dir" && pwd -P)/depscan"
 
-installed_version=$("$install_dir/depscan" --version)
+installed_version=$("$installed_binary" --version)
 if [[ "$installed_version" != "depscan ${version#v}" ]]; then
   echo "downloaded binary does not match release $version: $installed_version" >&2
   exit 1
 fi
-printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
+printf 'DEPSCAN_ACTION_INSTALLED_BINARY=%s\n' "$installed_binary" >> "$GITHUB_ENV"

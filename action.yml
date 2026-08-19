@@ -8,7 +8,7 @@ inputs:
     required: false
     default: v1.1.0
   binary:
-    description: Optional preinstalled depscan executable path; intended for local action testing
+    description: Optional trusted preinstalled depscan executable path; resolved absolutely for local action testing
     required: false
     default: ""
   path:
