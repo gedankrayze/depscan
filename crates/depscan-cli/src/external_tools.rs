@@ -91,6 +91,16 @@ pub enum ToolError {
     },
 }
 
+impl ToolError {
+    /// A Bun manifest fallback is safe only when the package-manager process never started.
+    pub fn is_pre_execution_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Missing { .. } | Self::Setup { .. } | Self::Spawn { .. }
+        )
+    }
+}
+
 struct ToolRequest {
     tool: &'static str,
     arguments: Vec<OsString>,

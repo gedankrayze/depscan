@@ -89,6 +89,35 @@ impl Fixture {
         .expect("write package manifest");
     }
 
+    fn bun_workspace_project(&self) {
+        fs::write(self.project.join("bun.lockb"), b"binary fixture")
+            .expect("write binary lock placeholder");
+        fs::write(
+            self.project.join("package.json"),
+            r#"{
+                "workspaces":["packages/*"],
+                "dependencies":{"root-production":"^1"},
+                "devDependencies":{"root-development":"^2"}
+            }"#,
+        )
+        .expect("write root package manifest");
+        let workspace = self.project.join("packages/member");
+        fs::create_dir_all(&workspace).expect("create workspace package");
+        fs::write(
+            workspace.join("package.json"),
+            r#"{
+                "dependencies":{"workspace-production":"^3"},
+                "devDependencies":{"workspace-development":"^4"}
+            }"#,
+        )
+        .expect("write workspace package manifest");
+    }
+
+    fn bun_lock_only(&self) {
+        fs::write(self.project.join("bun.lockb"), b"binary fixture")
+            .expect("write binary lock placeholder");
+    }
+
     fn dotnet_project(&self) {
         fs::write(
             self.project.join("Project.csproj"),
@@ -223,6 +252,15 @@ fn report_package_names(output: &Output) -> BTreeSet<String> {
         .iter()
         .map(|result| result["package"]["name"].as_str().unwrap().to_owned())
         .collect()
+}
+
+fn report(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid JSON report: {error}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
 }
 
 fn captured_environment(capture: &str) -> BTreeMap<String, String> {
@@ -467,6 +505,22 @@ fn nonzero_tool_exit_includes_bounded_actionable_stderr() {
 }
 
 #[test]
+fn authorized_nonzero_bun_exit_is_not_hidden_by_manifest_fallback() {
+    let fixture = Fixture::new();
+    fixture.bun_project();
+    fixture.install("bun", FakeBehavior::Failing);
+
+    let output = fixture.run(&["scan", "--allow-tools", fixture.project.to_str().unwrap()]);
+
+    assert_exit(&output, 10);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exited with exit status: 23"), "{stderr}");
+    assert!(stderr.contains("fixture restore failed"), "{stderr}");
+    assert!(!stderr.contains("degraded manifest-only mode"), "{stderr}");
+    assert!(fixture.capture_exists());
+}
+
+#[test]
 fn hanging_tool_is_killed_at_the_timeout() {
     let fixture = Fixture::new();
     fixture.bun_project();
@@ -481,30 +535,78 @@ fn hanging_tool_is_killed_at_the_timeout() {
 }
 
 #[test]
-fn missing_tool_is_an_actionable_parse_failure() {
+fn missing_bun_executable_degrades_to_manifest_constraints() {
     let fixture = Fixture::new();
     fixture.bun_project();
+    fixture.seed_dump("npm");
     let empty_path = env::join_paths([fixture.bin.clone()]).unwrap();
 
     let output = fixture.run_with_path(
-        &["scan", "--allow-tools", fixture.project.to_str().unwrap()],
+        &[
+            "scan",
+            "--offline",
+            "--format",
+            "json",
+            "--allow-tools",
+            fixture.project.to_str().unwrap(),
+        ],
         empty_path,
     );
 
-    assert_exit(&output, 10);
+    assert_exit(&output, 0);
+    assert_eq!(
+        report_package_names(&output),
+        BTreeSet::from(["left-pad".to_owned()])
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("executable was not found"), "{stderr}");
-    assert!(stderr.contains("commit the generated bun.lock"), "{stderr}");
+    assert!(stderr.contains("degraded manifest-only mode"), "{stderr}");
+    assert!(!fixture.capture_exists());
 }
 
 #[test]
 fn tools_are_never_started_without_effective_authorization() {
     let bun = Fixture::new();
-    bun.bun_project();
+    bun.bun_workspace_project();
     bun.install("bun", FakeBehavior::Valid(BUN_OUTPUT));
-    let output = bun.run(&["scan", bun.project.to_str().unwrap()]);
-    assert_exit(&output, 10);
+    bun.seed_dump("npm");
+    let output = bun.run(&[
+        "scan",
+        "--offline",
+        "--format",
+        "json",
+        bun.project.to_str().unwrap(),
+    ]);
+    assert_exit(&output, 0);
     assert!(!bun.capture_exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("external tool execution was not authorized"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("degraded manifest-only mode"), "{stderr}");
+    let report = report(&output);
+    let packages = report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| {
+            let package = &result["package"];
+            (
+                package["name"].as_str().unwrap(),
+                (
+                    package["dev"].as_bool().unwrap(),
+                    package["resolved_from_range"].as_bool().unwrap(),
+                    package["manifest_constraint"]["raw"].as_str().unwrap(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(packages.len(), 4);
+    assert_eq!(packages["root-production"], (false, true, "^1"));
+    assert_eq!(packages["root-development"], (true, true, "^2"));
+    assert_eq!(packages["workspace-production"], (false, true, "^3"));
+    assert_eq!(packages["workspace-development"], (true, true, "^4"));
 
     let dotnet = Fixture::new();
     dotnet.dotnet_project();
@@ -539,4 +641,35 @@ fn tools_are_never_started_without_effective_authorization() {
             .contains("implicit project config cannot enable allow-tools")
     );
     assert!(!implicit.capture_exists());
+}
+
+#[test]
+fn bun_manifest_fallback_fails_closed_without_a_usable_manifest() {
+    let missing = Fixture::new();
+    missing.bun_lock_only();
+    let output = missing.run(&["scan", missing.project.to_str().unwrap()]);
+    assert_exit(&output, 10);
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("manifest-only fallback also failed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("no usable colocated manifest"), "{stderr}");
+    assert!(!missing.capture_exists());
+
+    let malformed = Fixture::new();
+    malformed.bun_lock_only();
+    fs::write(malformed.project.join("package.json"), "not json")
+        .expect("write malformed package manifest");
+    let output = malformed.run(&["scan", malformed.project.to_str().unwrap()]);
+    assert_exit(&output, 10);
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("manifest-only fallback also failed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("failed to parse"), "{stderr}");
+    assert!(!malformed.capture_exists());
 }

@@ -59,7 +59,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | Source/variant | Meaningful tests |
 |---|---|
 | Bun text lock v0/v1/v2, JSONC, scoped names, aliases, workspaces, malformed locators | `bun_lock.rs::{parses_current_bun_lock_locators_without_leaking_locator_prefixes,parses_version_one_bun_lockfiles,parses_version_zero_workspace_tuple_shape,rejects_malformed_bun_locator_arrays_with_context}` |
-| `bun.lockb` authorized fallback | `tool_fallbacks.rs::{explicitly_selected_config_runs_bun_with_exact_sandboxed_invocation,malformed_outputs_are_actionable_for_both_tools,tools_are_never_started_without_effective_authorization}`; parser `tool_outputs.rs` |
+| `bun.lockb` authorized extraction and manifest-only degradation | `tool_fallbacks.rs::{explicitly_selected_config_runs_bun_with_exact_sandboxed_invocation,malformed_outputs_are_actionable_for_both_tools,authorized_nonzero_bun_exit_is_not_hidden_by_manifest_fallback,missing_bun_executable_degrades_to_manifest_constraints,tools_are_never_started_without_effective_authorization,bun_manifest_fallback_fails_closed_without_a_usable_manifest}`; parser `tool_outputs.rs` and `bun_manifest_fallback.rs` |
 | npm package-lock v1/v2/v3, nested/scoped/workspaces | parser `parses_nested_npm_v2_packages_and_workspace_dependencies`, `parses_nested_npm_v3_packages_and_skips_local_descriptors`, `keeps_legacy_npm_v1_nested_packages_best_effort`; npm process E2E |
 | pnpm v6/v9 plus YAML safety | `lock_schema_validation::accepts_supported_numeric_pnpm_v6_schema`; `yaml_lock_safety::{preserves_current_pnpm_schema_and_manifest_provenance,permits_bounded_anchor_reuse_for_compatible_lockfiles,rejects_duplicate_keys_in_pnpm_and_yarn_berry,rejects_merge_keys_excessive_alias_expansion_and_deep_nesting}` |
 | Yarn Classic v1 and Berry v4-v10 | `yarn_lock.rs::{preserves_yarn_classic_parsing_and_manifest_provenance,parses_current_yarn_berry_with_aliases_workspaces_and_protocols,rejects_unsupported_or_malformed_yarn_lockfiles_with_context}` |
@@ -163,6 +163,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-048 | `secure_fs.rs` config/root/parent/final swap, symlink, atomic creation/replacement and permission-preservation tests plus CLI process checks |
 | DS-049 | `verify-github-action.sh`, typed argument-vector probes, and the Linux `uses: ./` CI smoke; real per-runner release download remains recorded in the issue |
 | DS-050 | online cached-registry and offline-dump manifest-to-OSV process tests, including exact/ranged constraints, shared-coordinate mapping, vulnerability exit `1`, and unresolved-cache errors |
+| DS-052 | strict root/workspace manifest fallback fixtures plus unauthorized, missing-executable, provenance, and post-start hard-failure process tests |
 
 ## Platform and external evidence boundary
 

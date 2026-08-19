@@ -9,7 +9,7 @@ use depscan_core::{
     SuppressedFinding, SuppressionMatch, SuppressionSource, SuppressionState, VersionProvider,
     VulnProvider, Vulnerability,
 };
-use depscan_parsers::ParserSet;
+use depscan_parsers::{ParserSet, parse_bun_manifest_fallback};
 use depscan_providers::{
     Cache, CachePolicy, HttpClient, OsvClient, OsvOffline, OsvSyncOptions, RegistryClient,
     RegistryOffline, sync_osv_dumps_with_options,
@@ -263,7 +263,7 @@ struct ScanArgs {
     /// Permit explicitly supported package-manager fallbacks.
     #[arg(
         long,
-        long_help = "Permit Bun binary-lock extraction and .NET transitive JSON enumeration. This may execute bun or dotnet with fixed arguments in an attacker-controlled checkout; commands use a minimized environment, bounded output, and a 10-second timeout. Offline dotnet enumeration disables restore. Leave this disabled unless that execution is acceptable."
+        long_help = "Permit Bun binary-lock extraction and .NET transitive JSON enumeration. Without authorization, a legacy bun.lockb degrades to root/workspace package.json constraints with a warning; --allow-tools attempts to recover its resolved versions. This may execute bun or dotnet with fixed arguments in an attacker-controlled checkout; commands use a minimized environment, bounded output, and a 10-second timeout. Offline dotnet enumeration disables restore. Leave this disabled unless that execution is acceptable."
     )]
     allow_tools: bool,
     /// Reduce diagnostics. Repeatable; conflicts with --verbose. Reports still use stdout or --output.
@@ -506,6 +506,34 @@ fn log_level(quiet: u8, verbose: u8) -> &'static str {
     }
 }
 
+fn bun_manifest_only(path: &Path, reason: &str) -> Result<Vec<Package>, CliError> {
+    let packages = parse_bun_manifest_fallback(path).map_err(|manifest_error| {
+        CliError::usage(format!(
+            "cannot extract dependencies from binary Bun lockfile {} ({reason}); manifest-only fallback also failed: {manifest_error}",
+            path.display()
+        ))
+    })?;
+    warn!(
+        lockfile = %path.display(),
+        reason,
+        "Bun lockfile extraction unavailable; scanning package.json constraints in degraded manifest-only mode"
+    );
+    Ok(packages)
+}
+
+async fn parse_bun_source(path: &Path, allow_tools: bool) -> Result<Vec<Package>, CliError> {
+    if !allow_tools {
+        return bun_manifest_only(path, "external tool execution was not authorized");
+    }
+    match external_tools::parse_bun_binary_lock(path).await {
+        Ok(packages) => Ok(packages),
+        Err(error) if error.is_pre_execution_failure() => {
+            bun_manifest_only(path, &error.to_string())
+        }
+        Err(error) => Err(CliError::usage(error.to_string())),
+    }
+}
+
 async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
     let PreparedScan {
         args,
@@ -559,10 +587,8 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
     let mut packages = Vec::new();
     for source in sources {
         let mut parsed = match &source.kind {
-            depscan_core::SourceKind::BunLockBinary if args.allow_tools => {
-                external_tools::parse_bun_binary_lock(&source.path)
-                    .await
-                    .map_err(|error| CliError::usage(error.to_string()))?
+            depscan_core::SourceKind::BunLockBinary => {
+                parse_bun_source(&source.path, args.allow_tools).await?
             }
             depscan_core::SourceKind::ProjectFile if args.allow_tools => {
                 external_tools::parse_dotnet_project(&source.path, args.offline)

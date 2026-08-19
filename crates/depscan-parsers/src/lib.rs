@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use toml::Value as Toml;
 use walkdir::WalkDir;
@@ -25,6 +25,31 @@ mod requirements;
 mod tool_outputs;
 
 pub use tool_outputs::{parse_bun_lockb_output, parse_dotnet_list_json};
+
+fn nonempty_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Parse the root and declared workspace manifests beside a legacy binary Bun lockfile.
+///
+/// This is the filesystem-only degraded path used when the CLI cannot execute Bun. Every
+/// returned package retains its manifest constraint; no version is invented from `bun.lockb`.
+pub fn parse_bun_manifest_fallback(lock_path: &Path) -> Result<Vec<Package>, ParseError> {
+    let root = nonempty_parent(lock_path);
+    let manifest = root.join("package.json");
+    if !manifest.is_file() {
+        return Err(invalid(
+            lock_path,
+            format!(
+                "binary Bun lockfile has no usable colocated manifest at {}; install Bun and authorize tool execution, commit bun.lock, or add package.json",
+                manifest.display()
+            ),
+        ));
+    }
+    parse_package_json_project(&manifest)
+}
 
 fn io_error(path: &Path, error: impl ToString) -> ParseError {
     ParseError::Io {
@@ -187,7 +212,7 @@ impl EcosystemParser for NodeParser {
             SourceKind::PnpmLock => parse_pnpm_lock(&source.path),
             SourceKind::YarnLock => parse_yarn_lock(&source.path),
             SourceKind::BunLock => parse_bun_lock(&source.path),
-            SourceKind::PackageJson => parse_package_json_manifest(&source.path),
+            SourceKind::PackageJson => parse_package_json_project(&source.path),
             SourceKind::BunLockBinary => Err(invalid(
                 &source.path,
                 "bun.lockb is binary; rerun with --allow-tools and Bun on PATH, or commit bun.lock",
@@ -1517,9 +1542,36 @@ fn yarn_classic_descriptor_source(locator: YarnLocator<'_>) -> Result<(&str, Yar
     Ok((locator.name, source))
 }
 
-fn parse_package_json_manifest(path: &Path) -> Result<Vec<Package>, ParseError> {
-    let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
+fn read_package_json(path: &Path) -> Result<Json, ParseError> {
+    let text = fs::read_to_string(path).map_err(|error| io_error(path, error))?;
+    let value: Json = serde_json::from_str(&text).map_err(|error| invalid(path, error))?;
+    if !value.is_object() {
+        return Err(invalid(
+            path,
+            "package.json must contain a JSON object at the document root",
+        ));
+    }
+    Ok(value)
+}
+
+fn npm_manifest_constraint_is_registry(range: &str) -> bool {
+    let lower = range.to_ascii_lowercase();
+    !lower.starts_with("workspace:")
+        && !lower.starts_with("file:")
+        && !lower.starts_with("link:")
+        && !lower.starts_with("git:")
+        && !lower.starts_with("git+")
+        && !lower.starts_with("github:")
+        && !lower.starts_with("http:")
+        && !lower.starts_with("https:")
+        && !lower.starts_with("ssh:")
+        && !lower.starts_with("npm:")
+        && !range.starts_with('/')
+        && !range.starts_with("./")
+        && !range.starts_with("../")
+}
+
+fn parse_package_json_value(path: &Path, value: &Json) -> Result<Vec<Package>, ParseError> {
     let mut out = Vec::new();
     for key in [
         "dependencies",
@@ -1527,19 +1579,204 @@ fn parse_package_json_manifest(path: &Path) -> Result<Vec<Package>, ParseError> 
         "optionalDependencies",
         "peerDependencies",
     ] {
-        if let Some(obj) = value.get(key).and_then(Json::as_object) {
-            for (name, range) in obj {
-                if let Some(range) = range.as_str() {
-                    let mut p = Package::new(Ecosystem::Npm, name, range, path.to_path_buf());
-                    p.direct = true;
-                    p.dev = key == "devDependencies";
-                    p.set_manifest_constraint(range);
-                    out.push(p);
-                }
+        let Some(section) = value.get(key) else {
+            continue;
+        };
+        let obj = section.as_object().ok_or_else(|| {
+            invalid(
+                path,
+                format!("package.json field {key:?} must be an object"),
+            )
+        })?;
+        for (name, range) in obj {
+            if name.is_empty() {
+                return Err(invalid(
+                    path,
+                    format!("package.json field {key:?} contains an empty dependency name"),
+                ));
             }
+            let range = range.as_str().filter(|range| !range.trim().is_empty()).ok_or_else(|| {
+                invalid(
+                    path,
+                    format!(
+                        "package.json dependency {name:?} in {key:?} must have a non-empty string constraint"
+                    ),
+                )
+            })?;
+            let mut package = Package::new(Ecosystem::Npm, name, range, path.to_path_buf());
+            package.direct = true;
+            package.dev = key == "devDependencies";
+            package.enrichable = npm_manifest_constraint_is_registry(range);
+            package.set_manifest_constraint(range);
+            out.push(package);
         }
     }
     Ok(dedup(out))
+}
+
+fn workspace_patterns(path: &Path, value: &Json) -> Result<Vec<String>, ParseError> {
+    let Some(workspaces) = value.get("workspaces") else {
+        return Ok(Vec::new());
+    };
+    let entries = match workspaces {
+        Json::Array(entries) => entries,
+        Json::Object(object) => {
+            object
+                .get("packages")
+                .and_then(Json::as_array)
+                .ok_or_else(|| {
+                    invalid(
+                        path,
+                        "package.json workspaces object must contain a packages array",
+                    )
+                })?
+        }
+        _ => {
+            return Err(invalid(
+                path,
+                "package.json workspaces must be an array or an object containing a packages array",
+            ));
+        }
+    };
+    if entries.len() > 256 {
+        return Err(invalid(
+            path,
+            "package.json workspaces exceeds the 256-pattern limit",
+        ));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let pattern = entry.as_str().filter(|entry| !entry.is_empty()).ok_or_else(|| {
+                invalid(
+                    path,
+                    format!(
+                        "package.json workspace entry {index} must be a non-empty string"
+                    ),
+                )
+            })?;
+            let relative = Path::new(pattern);
+            if pattern.starts_with('!')
+                || relative.is_absolute()
+                || relative.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "package.json workspace pattern {pattern:?} must be a contained relative path pattern"
+                    ),
+                ));
+            }
+            Ok(pattern.to_owned())
+        })
+        .collect()
+}
+
+fn workspace_manifests(
+    root_manifest: &Path,
+    root_value: &Json,
+) -> Result<Vec<PathBuf>, ParseError> {
+    let root = nonempty_parent(root_manifest);
+    let canonical_root = fs::canonicalize(root).map_err(|error| io_error(root, error))?;
+    let canonical_manifest =
+        fs::canonicalize(root_manifest).map_err(|error| io_error(root_manifest, error))?;
+    if !canonical_manifest.starts_with(&canonical_root) || !canonical_manifest.is_file() {
+        return Err(invalid(
+            root_manifest,
+            "root package.json must resolve to a regular file inside the project root",
+        ));
+    }
+    let mut manifests = BTreeSet::from([root_manifest.to_path_buf()]);
+    for workspace_pattern in workspace_patterns(root_manifest, root_value)? {
+        let relative_pattern = Path::new(&workspace_pattern).join("package.json");
+        let relative_pattern = relative_pattern.to_str().ok_or_else(|| {
+            invalid(
+                root_manifest,
+                format!("workspace pattern {workspace_pattern:?} is not valid UTF-8"),
+            )
+        })?;
+        let root_pattern = root
+            .to_str()
+            .ok_or_else(|| invalid(root_manifest, "package.json root path is not valid UTF-8"))?;
+        let joined = format!(
+            "{}{}{}",
+            glob::Pattern::escape(root_pattern),
+            std::path::MAIN_SEPARATOR,
+            relative_pattern
+        );
+        let mut matched = false;
+        for candidate in glob::glob(&joined).map_err(|error| {
+            invalid(
+                root_manifest,
+                format!("invalid workspace pattern {workspace_pattern:?}: {error}"),
+            )
+        })? {
+            let candidate = candidate.map_err(|error| {
+                invalid(
+                    root_manifest,
+                    format!("reading workspace pattern {workspace_pattern:?}: {error}"),
+                )
+            })?;
+            let canonical_candidate =
+                fs::canonicalize(&candidate).map_err(|error| io_error(&candidate, error))?;
+            if !canonical_candidate.starts_with(&canonical_root) {
+                return Err(invalid(
+                    root_manifest,
+                    format!(
+                        "workspace manifest {} resolves outside the project root",
+                        candidate.display()
+                    ),
+                ));
+            }
+            if !canonical_candidate.is_file() {
+                return Err(invalid(
+                    root_manifest,
+                    format!(
+                        "workspace pattern {workspace_pattern:?} matched a non-file entry {}",
+                        candidate.display()
+                    ),
+                ));
+            }
+            matched = true;
+            manifests.insert(candidate);
+            if manifests.len() > 10_000 {
+                return Err(invalid(
+                    root_manifest,
+                    "package.json workspaces exceeds the 10000-manifest limit",
+                ));
+            }
+        }
+        if !matched {
+            return Err(invalid(
+                root_manifest,
+                format!(
+                    "package.json workspace pattern {workspace_pattern:?} matched no package.json files"
+                ),
+            ));
+        }
+    }
+    Ok(manifests.into_iter().collect())
+}
+
+fn parse_package_json_project(root_manifest: &Path) -> Result<Vec<Package>, ParseError> {
+    let root_value = read_package_json(root_manifest)?;
+    let manifests = workspace_manifests(root_manifest, &root_value)?;
+    let mut packages = Vec::new();
+    for manifest in manifests {
+        let value = if manifest == root_manifest {
+            root_value.clone()
+        } else {
+            read_package_json(&manifest)?
+        };
+        packages.extend(parse_package_json_value(&manifest, &value)?);
+    }
+    Ok(dedup(packages))
 }
 
 pub struct PythonParser;
@@ -3551,7 +3788,7 @@ mod tests {
         )
         .unwrap();
 
-        let packages = parse_package_json_manifest(&manifest).unwrap();
+        let packages = parse_package_json_project(&manifest).unwrap();
 
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].version, "^1.2 || 3.x");

@@ -8,7 +8,7 @@
 
 | Ecosystem | Normal sources | Manifest-only fallback |
 |---|---|---|
-| npm / Bun | `bun.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`; authorized `bun.lockb` extraction | `package.json` |
+| npm / Bun | `bun.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`; authorized `bun.lockb` extraction | root/workspace `package.json`, including the fallback for unavailable binary-lock extraction |
 | Python | `uv.lock`, `poetry.lock`, `Pipfile.lock`, `requirements.txt` | `pyproject.toml` |
 | .NET | `packages.lock.json`, project XML, `packages.config`; authorized SDK transitive enumeration | project XML ranges |
 | Rust | `Cargo.lock` | `Cargo.toml` |
@@ -16,6 +16,8 @@
 Resolved lockfile versions are preferred. Manifest-only records are marked as range-derived, because they are not an installed dependency resolution.
 
 For manifest-only records, the registry provider preserves the exact source constraint and evaluates a separate normalized form using the ecosystem's native rules: npm ranges, Cargo version requirements, PEP 440 specifiers, or NuGet intervals and floating versions. `latest_stable` is always the registry's unconstrained stable release; `latest_matching` is the newest non-yanked release accepted by the manifest. Table reports show both when a range is resolved. Invalid or unsupported constraints are per-package registry warnings and never fall back to the unconstrained release.
+
+A legacy `bun.lockb` is never parsed as binary data. When external tools are disabled, or an explicitly authorized Bun executable cannot be found or started, depscan reads the colocated root `package.json` and every safely contained manifest declared by its workspace patterns. It marks every dependency as range-derived, retains the declaring manifest and exact constraint, and warns that the scan is operating in degraded manifest-only mode. A missing, malformed, escaping, or otherwise unusable manifest fails with exit `10`; it cannot become an empty successful scan. Once an explicitly authorized Bun process starts, non-zero status, timeout, oversized or invalid output, and malformed extracted lock data remain hard parse failures rather than being hidden by the manifest fallback.
 
 Vulnerability checks for a manifest range use that same `latest_matching` release as a temporary OSV coordinate. The report continues to identify the original manifest constraint and marks it as range-derived; only the provider query uses the concrete release. Offline scans require acceptable cached registry metadata for this step. If no concrete matching release can be established, the package carries explicit registry and OSV errors and is not presented as a confirmed clean query result. Non-registry dependencies remain report-only and are never sent to a public registry or OSV as registry coordinates.
 
@@ -181,7 +183,7 @@ The remaining defaults are: all detected ecosystems, development and transitive 
 
 `allow-tools` is a supply-chain boundary. An auto-discovered project config cannot self-authorize it: `allow-tools = true` requires either the CLI `--allow-tools` flag or an explicitly selected trusted `--config` file. Once authorized, supported fallbacks may execute package-manager binaries in the scanned checkout. Inspect the checkout and configuration before enabling this for untrusted input.
 
-The authorized Bun fallback runs `bun bun.lockb` in the lockfile directory and parses its Yarn Classic output. The authorized .NET fallback runs `dotnet list ./<project> package --include-transitive --format json --output-version 1 --verbosity quiet` for each unlocked project; the explicit `./` prevents a project filename from being interpreted as an option, and an offline scan adds `--no-restore` so the SDK cannot restore over the network. Both commands use an absolute executable resolved only from absolute `PATH` entries, a canonical working directory, a temporary home, an allowlisted environment, null standard input, a 10-second timeout, and bounded stdout/stderr capture. No shell is involved. A missing executable, non-zero status, timeout, oversized output, invalid UTF-8, or malformed machine output is a configuration/parse failure (exit `10`), never a clean or partial dependency result.
+The authorized Bun fallback runs `bun bun.lockb` in the lockfile directory and parses its Yarn Classic output. The authorized .NET fallback runs `dotnet list ./<project> package --include-transitive --format json --output-version 1 --verbosity quiet` for each unlocked project; the explicit `./` prevents a project filename from being interpreted as an option, and an offline scan adds `--no-restore` so the SDK cannot restore over the network. Both commands use an absolute executable resolved only from absolute `PATH` entries, a canonical working directory, a temporary home, an allowlisted environment, null standard input, a 10-second timeout, and bounded stdout/stderr capture. No shell is involved. A missing or pre-start Bun executable condition uses the documented manifest-only fallback when its manifests are valid. A missing dotnet executable remains a configuration failure; once either process starts, non-zero status, timeout, oversized/non-UTF-8 output, capture failure, or malformed machine data is a hard parse failure (exit `10`), never a clean or partial resolved dependency result.
 
 Expired suppressions are not applied and are emitted as warnings and report metadata. Active suppressions remain visible in table, JSON, SARIF, and summary output but do not affect failure thresholds. Suppression reasons are intentionally included in reports for auditability, so they should not contain secrets. Repeated `--ignore <ID>` arguments are also supported for ephemeral CI suppression.
 
@@ -233,7 +235,7 @@ The checked-in [verification matrix](docs/test-matrix.md) maps the development s
 
 ## Known v0.1 limitations
 
-The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
+The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` resolved-version extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above; without it, `bun.lockb` scans visibly degrade to manifest constraints. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
 
 ## License
 
