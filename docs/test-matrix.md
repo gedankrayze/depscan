@@ -174,6 +174,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-059 | pending exact Cargo lock-identity graph fixtures plus process `--direct-only` and `--no-dev` coverage |
 | DS-060 | pending capability-relative requirements include swap tests plus CLI no-provider race regression |
 | DS-061 | installer environment-handoff guards, installed/override argument-vector probes, PATH decoy rejection, and a native Windows workspace-executable decoy regression |
+| DS-062 | pending provider path-segment encoding table, endpoint request paths, dependency-tree proof, and registration URL-confinement coverage |
 | DS-063 | pending suffix-aware positive/negative-extglob differential corpus and real npm workspace fixture |
 
 ## Platform and external evidence boundary
