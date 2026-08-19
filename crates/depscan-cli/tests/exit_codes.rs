@@ -97,27 +97,43 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
     }
 
     fn seed_vulnerability(&self) {
+        self.seed_vulnerability_record(false);
+    }
+
+    fn seed_withdrawn_vulnerability(&self) {
+        self.seed_vulnerability_record(true);
+    }
+
+    fn seed_vulnerability_record(&self, withdrawn: bool) {
         self.seed_cache("osv/query", QUERY_DIGEST, r#"["RUSTSEC-TEST"]"#);
+        let withdrawn_field = if withdrawn {
+            r#""withdrawn":"2026-08-19T00:00:00Z","#
+        } else {
+            ""
+        };
         self.seed_cache(
             "osv/vuln",
             VULNERABILITY_DIGEST,
-            r#"{
+            &format!(
+                r#"{{
                 "id":"RUSTSEC-TEST",
+                {withdrawn_field}
                 "summary":"process-test vulnerability",
                 "aliases":[],
-                "severity":[{
+                "severity":[{{
                     "type":"CVSS_V3",
                     "score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
-                }],
-                "affected":[{
-                    "package":{"ecosystem":"crates.io","name":"demo"},
-                    "ranges":[{
+                }}],
+                "affected":[{{
+                    "package":{{"ecosystem":"crates.io","name":"demo"}},
+                    "ranges":[{{
                         "type":"SEMVER",
-                        "events":[{"introduced":"0"},{"fixed":"1.1.0"}]
-                    }]
-                }],
+                        "events":[{{"introduced":"0"}},{{"fixed":"1.1.0"}}]
+                    }}]
+                }}],
                 "references":[]
-            }"#,
+            }}"#
+            ),
         );
     }
 
@@ -281,6 +297,40 @@ fn vulnerability_threshold_exits_one_and_writes_report_to_stdout() {
 
     assert_exit(&output, 1);
     assert_report_only_on_stdout(&output);
+}
+
+#[test]
+fn include_withdrawn_controls_rendering_counts_and_exit_in_every_format() {
+    let project = TestProject::rust("withdrawn-advisory");
+    project.seed_clean("1.0.0");
+    project.seed_withdrawn_vulnerability();
+    let root = project.directory.path().to_str().expect("UTF-8 path");
+    let cases = [
+        ("table", "RUSTSEC-TEST [WITHDRAWN]"),
+        ("json", "\"withdrawn\": true"),
+        ("sarif", "withdrawn advisory"),
+        ("summary", "1 withdrawn"),
+    ];
+
+    for (format, included_marker) in cases {
+        let excluded = project.run(&["scan", "--format", format, root]);
+        assert_exit(&excluded, 0);
+        assert!(excluded.stderr.is_empty());
+        assert!(
+            !String::from_utf8_lossy(&excluded.stdout).contains("RUSTSEC-TEST"),
+            "{format} rendered a withdrawn advisory without --include-withdrawn: {}",
+            String::from_utf8_lossy(&excluded.stdout)
+        );
+
+        let included = project.run(&["scan", "--format", format, "--include-withdrawn", root]);
+        assert_exit(&included, 1);
+        assert!(included.stderr.is_empty());
+        assert!(
+            String::from_utf8_lossy(&included.stdout).contains(included_marker),
+            "{format} did not visibly label the included advisory: {}",
+            String::from_utf8_lossy(&included.stdout)
+        );
+    }
 }
 
 #[test]

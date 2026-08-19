@@ -95,6 +95,8 @@ expires = 2026-12-31
 
 Expired suppressions are not applied and are emitted as warnings. Repeated `--ignore <ID>` arguments are also supported for ephemeral CI suppression.
 
+Withdrawn OSV advisories are excluded by default, so they do not render, contribute to totals, or affect exit thresholds. `--include-withdrawn` retains them in the scan model; table, JSON, SARIF, and summary output then label and count them explicitly, and their severity participates in `--fail-on` like any other retained advisory.
+
 ## Offline scans
 
 Populate offline advisory archives once:
