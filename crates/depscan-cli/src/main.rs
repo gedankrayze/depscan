@@ -19,7 +19,7 @@ use std::{
     process::ExitCode,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,7 +115,11 @@ struct ScanArgs {
     include_withdrawn: bool,
     #[arg(long)]
     ignore: Vec<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Configuration file (must be a readable regular file; symbolic links are rejected)"
+    )]
     config: Option<PathBuf>,
     #[arg(long)]
     allow_tools: bool,
@@ -405,23 +409,51 @@ async fn fetch_latest(
 }
 
 fn load_config(root: &Path, explicit: Option<&Path>) -> Result<Config, CliError> {
-    let path = explicit
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| root.join("depscan.toml"));
-    if !path.exists() {
-        return if explicit.is_some() {
-            Err(CliError::usage(format!(
+    let (path, origin) = explicit.map_or_else(
+        || (root.join("depscan.toml"), "implicit-default"),
+        |path| (path.to_path_buf(), "explicit"),
+    );
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && explicit.is_none() => {
+            debug!(
+                path = %path.display(),
+                origin,
+                "configuration file not found; using defaults"
+            );
+            return Ok(Config::default());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(CliError::usage(format!(
                 "config {} does not exist",
                 path.display()
-            )))
-        } else {
-            Ok(Config::default())
-        };
+            )));
+        }
+        Err(error) => {
+            return Err(CliError::usage(format!(
+                "inspecting config {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::usage(format!(
+            "config {} is a symbolic link; configuration symlinks are not allowed",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(CliError::usage(format!(
+            "config {} is not a regular file",
+            path.display()
+        )));
     }
     let text = fs::read_to_string(&path)
         .map_err(|e| CliError::usage(format!("reading config {}: {e}", path.display())))?;
-    toml::from_str(&text)
-        .map_err(|e| CliError::usage(format!("invalid config {}: {e}", path.display())))
+    let config = toml::from_str(&text)
+        .map_err(|e| CliError::usage(format!("invalid config {}: {e}", path.display())))?;
+    debug!(path = %path.display(), origin, "configuration loaded");
+    Ok(config)
 }
 fn parse_ecosystems(values: &[String]) -> Result<HashSet<Ecosystem>, String> {
     values

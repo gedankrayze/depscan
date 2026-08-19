@@ -6,6 +6,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink as symlink_file;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_file;
+
 const QUERY_DIGEST: &str = "2f422c499305285ab2b6919c9f3a7749a0ae65f244b52b53b78ea8a3d83444c7";
 const REGISTRY_DIGEST: &str = "73a7010ca3d255918cf210add4252cd48f0d933c881b68ea9bcf11cf8a400ac1";
 const VULNERABILITY_DIGEST: &str =
@@ -161,6 +166,21 @@ fn assert_diagnostic_only_on_stderr(output: &Output, expected: &str) {
     );
 }
 
+fn assert_config_preflight_failure(output: &Output, path: &Path, expected: &str) {
+    assert_exit(output, 10);
+    assert_diagnostic_only_on_stderr(output, expected);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.to_string_lossy().into_owned()),
+        "stderr did not name config path {}: {stderr}",
+        path.display()
+    );
+    assert!(
+        !stderr.contains("provider hard failure") && !stderr.contains("missing OSV dump"),
+        "config validation reached provider access: {stderr}"
+    );
+}
+
 #[test]
 fn clean_scan_exits_zero_and_writes_report_to_stdout() {
     let project = TestProject::rust("clean");
@@ -245,6 +265,23 @@ fn unknown_option_exits_ten_and_writes_clap_diagnostic_to_stderr() {
 }
 
 #[test]
+fn scan_help_documents_the_config_symlink_policy() {
+    let directory = TestDirectory::new("config-help");
+
+    let output = command(&directory.path().join("cache"))
+        .args(["scan", "--help"])
+        .output()
+        .expect("run depscan");
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("must be a readable regular file; symbolic links are rejected")
+    );
+}
+
+#[test]
 fn missing_scan_path_exits_ten() {
     let directory = TestDirectory::new("missing-path");
     let missing = directory.path().join("not-there");
@@ -265,13 +302,141 @@ fn missing_explicit_config_exits_ten() {
 
     let output = project.run(&[
         "scan",
+        "--offline",
         "--config",
         missing.to_str().expect("UTF-8 path"),
         project.directory.path().to_str().expect("UTF-8 path"),
     ]);
 
-    assert_exit(&output, 10);
-    assert_diagnostic_only_on_stderr(&output, "config");
+    assert_config_preflight_failure(&output, &missing, "does not exist");
+}
+
+#[test]
+fn absent_implicit_config_is_allowed_and_verbose_origin_is_reported() {
+    let project = TestProject::rust("absent-implicit-config");
+    project.seed_clean("1.0.0");
+    let implicit = project.directory.path().join("depscan.toml");
+
+    let output = project.run(&[
+        "scan",
+        "--verbose",
+        "--format",
+        "json",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 0);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"schema_version\""),
+        "stdout did not contain report: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("configuration file not found; using defaults"));
+    assert!(stderr.contains("origin=\"implicit-default\""));
+    assert!(stderr.contains(&implicit.to_string_lossy().into_owned()));
+}
+
+#[test]
+fn explicit_config_directory_exits_ten_before_provider_access() {
+    let project = TestProject::rust("config-directory");
+    let config = project.directory.path().join("config-directory");
+    fs::create_dir(&config).expect("create config directory");
+
+    let output = project.run(&[
+        "scan",
+        "--offline",
+        "--config",
+        config.to_str().expect("UTF-8 path"),
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_config_preflight_failure(&output, &config, "not a regular file");
+}
+
+#[test]
+fn explicit_config_read_failure_exits_ten_before_provider_access() {
+    let project = TestProject::rust("config-read-failure");
+    let config = project.directory.path().join("unreadable.toml");
+    // Invalid UTF-8 forces read_to_string to fail on every supported platform. Permission bits
+    // are not portable and can be bypassed when a test runner has elevated privileges.
+    fs::write(&config, [0xff, 0xfe, 0xfd]).expect("write non-UTF-8 config");
+
+    let output = project.run(&[
+        "scan",
+        "--offline",
+        "--config",
+        config.to_str().expect("UTF-8 path"),
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_config_preflight_failure(&output, &config, "reading config");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn explicit_config_symlink_is_rejected_before_provider_access() {
+    let project = TestProject::rust("config-symlink");
+    let target = project.directory.path().join("real-config.toml");
+    let config = project.directory.path().join("linked-config.toml");
+    fs::write(&target, "fail-on = \"never\"\n").expect("write symlink target");
+    if let Err(error) = symlink_file(&target, &config) {
+        #[cfg(windows)]
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            // Windows requires either Developer Mode or symlink privilege. The implementation is
+            // platform-independent; skip only when the host cannot construct the fixture.
+            return;
+        }
+        panic!("create config symlink: {error}");
+    }
+
+    let output = project.run(&[
+        "scan",
+        "--offline",
+        "--config",
+        config.to_str().expect("UTF-8 path"),
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_config_preflight_failure(&output, &config, "symbolic link");
+}
+
+#[test]
+fn valid_explicit_config_is_loaded_and_verbose_origin_does_not_leak_contents() {
+    let project = TestProject::rust("valid-explicit-config");
+    project.seed_clean("1.0.0");
+    let config = project.directory.path().join("policy.toml");
+    let secret_reason = "internal-policy-reason-must-not-be-logged";
+    fs::write(
+        &config,
+        format!(
+            "fail-on = \"never\"\n\n[[ignore]]\nid = \"TEST-ID\"\nreason = \"{secret_reason}\"\n"
+        ),
+    )
+    .expect("write valid explicit config");
+
+    let output = project.run(&[
+        "scan",
+        "--verbose",
+        "--format",
+        "json",
+        "--config",
+        config.to_str().expect("UTF-8 path"),
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+
+    assert_exit(&output, 0);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"schema_version\""),
+        "stdout did not contain report: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("configuration loaded"));
+    assert!(stderr.contains("origin=\"explicit\""));
+    assert!(stderr.contains(&config.to_string_lossy().into_owned()));
+    assert!(!stderr.contains(secret_reason));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret_reason));
 }
 
 #[test]
