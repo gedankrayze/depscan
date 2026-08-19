@@ -1,0 +1,245 @@
+[
+  {
+    "name": "schema fixed boundary",
+    "ecosystem": "npm",
+    "package": "schema-fixed",
+    "installed": "1.0.1",
+    "affected": true,
+    "fixed_in": ["1.0.2"],
+    "document": {
+      "id": "TEST-SCHEMA-FIXED",
+      "summary": "OSV fixed range example",
+      "affected": [{
+        "package": {"ecosystem": "npm", "name": "schema-fixed"},
+        "ranges": [{
+          "type": "SEMVER",
+          "events": [{"introduced": "0"}, {"fixed": "1.0.2"}]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "schema unfixed range",
+    "ecosystem": "npm",
+    "package": "schema-unfixed",
+    "installed": "99.0.0",
+    "affected": true,
+    "fixed_in": [],
+    "document": {
+      "id": "TEST-SCHEMA-UNFIXED",
+      "summary": "OSV unfixed range example",
+      "affected": [{
+        "package": {"ecosystem": "npm", "name": "schema-unfixed"},
+        "ranges": [{
+          "type": "SEMVER",
+          "events": [{"introduced": "0"}]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "Django style unsorted disjoint intervals",
+    "ecosystem": "PyPI",
+    "package": "django-series",
+    "installed": "4.2.17",
+    "affected": true,
+    "fixed_in": ["4.2.18"],
+    "document": {
+      "id": "TEST-DJANGO-INTERVALS",
+      "summary": "Multiple supported release series",
+      "affected": [{
+        "package": {"ecosystem": "PyPI", "name": "Django-Series"},
+        "ranges": [{
+          "type": "ECOSYSTEM",
+          "events": [
+            {"fixed": "5.1.4"},
+            {"introduced": "5.1"},
+            {"fixed": "4.2.18"},
+            {"introduced": "4.2"},
+            {"fixed": "5.0.10"},
+            {"introduced": "5.0"}
+          ]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "gap between disjoint intervals",
+    "ecosystem": "PyPI",
+    "package": "django-gap",
+    "installed": "4.3",
+    "affected": false,
+    "fixed_in": [],
+    "document": {
+      "id": "TEST-DJANGO-GAP",
+      "summary": "Gap between supported release series",
+      "affected": [{
+        "package": {"ecosystem": "PyPI", "name": "django-gap"},
+        "ranges": [{
+          "type": "ECOSYSTEM",
+          "events": [
+            {"introduced": "4.2"},
+            {"fixed": "4.2.18"},
+            {"introduced": "5.0"},
+            {"fixed": "5.0.10"}
+          ]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "PEP 440 prerelease ordering",
+    "ecosystem": "PyPI",
+    "package": "pep-prerelease",
+    "installed": "1.0rc1",
+    "affected": true,
+    "fixed_in": ["1.0"],
+    "document": {
+      "id": "TEST-PEP440",
+      "summary": "PEP 440 ordering",
+      "affected": [{
+        "package": {"ecosystem": "PyPI", "name": "pep-prerelease"},
+        "ranges": [{
+          "type": "ECOSYSTEM",
+          "events": [{"introduced": "0"}, {"fixed": "1.0"}]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "NuGet four part ordering",
+    "ecosystem": "NuGet",
+    "package": "Four.Part.Package",
+    "installed": "1.0.0.4",
+    "affected": true,
+    "fixed_in": ["1.0.0.5"],
+    "document": {
+      "id": "TEST-NUGET-FOUR-PART",
+      "summary": "NuGet four-part ordering",
+      "affected": [{
+        "package": {"ecosystem": "NuGet", "name": "four.part.package"},
+        "ranges": [{
+          "type": "ECOSYSTEM",
+          "events": [{"introduced": "0"}, {"fixed": "1.0.0.5"}]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "exclusive limit boundary",
+    "ecosystem": "NuGet",
+    "package": "Limited.Package",
+    "installed": "2.0.0.0",
+    "affected": false,
+    "fixed_in": [],
+    "document": {
+      "id": "TEST-LIMIT",
+      "summary": "Limit is exclusive",
+      "affected": [{
+        "package": {"ecosystem": "NuGet", "name": "limited.package"},
+        "ranges": [{
+          "type": "ECOSYSTEM",
+          "events": [{"introduced": "0"}, {"limit": "2.0.0.0"}]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "explicit affected version",
+    "ecosystem": "crates.io",
+    "package": "explicit-crate",
+    "installed": "1.0.200",
+    "affected": true,
+    "fixed_in": [],
+    "document": {
+      "id": "TEST-EXPLICIT-VERSION",
+      "summary": "Explicit versions are authoritative",
+      "affected": [{
+        "package": {"ecosystem": "crates.io", "name": "explicit-crate"},
+        "versions": ["1.0.199", "1.0.200"]
+      }]
+    }
+  },
+  {
+    "name": "Cargo prerelease ordering",
+    "ecosystem": "crates.io",
+    "package": "cargo-prerelease",
+    "installed": "1.0.0-rc.1",
+    "affected": true,
+    "fixed_in": ["1.0.0"],
+    "document": {
+      "id": "TEST-CARGO-SEMVER",
+      "summary": "Cargo ecosystem comparator",
+      "affected": [{
+        "package": {"ecosystem": "crates.io", "name": "cargo-prerelease"},
+        "ranges": [{
+          "type": "ECOSYSTEM",
+          "events": [{"introduced": "0"}, {"fixed": "1.0.0"}]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "multiple matching ranges have one fix each",
+    "ecosystem": "npm",
+    "package": "multiple-ranges",
+    "installed": "1.2.0",
+    "affected": true,
+    "fixed_in": ["1.5.0", "2.0.0"],
+    "document": {
+      "id": "TEST-MULTIPLE-RANGES",
+      "summary": "Each range contributes its first applicable fix",
+      "affected": [{
+        "package": {"ecosystem": "npm", "name": "multiple-ranges"},
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [{"introduced": "1.0.0"}, {"fixed": "2.0.0"}]
+          },
+          {
+            "type": "SEMVER",
+            "events": [{"introduced": "1.1.0"}, {"fixed": "1.5.0"}]
+          }
+        ]
+      }]
+    }
+  },
+  {
+    "name": "wrong package identity",
+    "ecosystem": "npm",
+    "package": "requested-name",
+    "installed": "1.0.0",
+    "affected": false,
+    "fixed_in": [],
+    "document": {
+      "id": "TEST-WRONG-IDENTITY",
+      "summary": "A similarly-versioned package is unrelated",
+      "affected": [{
+        "package": {"ecosystem": "npm", "name": "different-name"},
+        "ranges": [{
+          "type": "SEMVER",
+          "events": [{"introduced": "0"}]
+        }]
+      }]
+    }
+  },
+  {
+    "name": "ecosystem-wide wildcard package",
+    "ecosystem": "npm",
+    "package": "wildcard-target",
+    "installed": "3.0.0",
+    "affected": true,
+    "fixed_in": ["4.0.0"],
+    "document": {
+      "id": "TEST-WILDCARD-IDENTITY",
+      "summary": "Wildcard name covers every npm package",
+      "affected": [{
+        "package": {"ecosystem": "npm", "name": "*"},
+        "ranges": [{
+          "type": "SEMVER",
+          "events": [{"introduced": "0"}, {"fixed": "4.0.0"}]
+        }]
+      }]
+    }
+  }
+]

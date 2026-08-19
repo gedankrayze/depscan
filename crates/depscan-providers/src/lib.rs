@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration, Utc};
 use cvss::Cvss;
 use depscan_core::{
     Ecosystem, LatestVersions, Package, ProviderError, Severity, VersionProvider, VulnMap,
-    VulnProvider, Vulnerability, classify_staleness, compare_versions, normalize_name,
-    osv_fixed_versions, osv_range_matches, pypi_version_is_prerelease, pypi_version_is_stable,
+    VulnProvider, Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
+    normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
 };
 use directories::ProjectDirs;
 use fs2::FileExt;
@@ -71,10 +71,6 @@ fn osv_query_body(packages: &[Package]) -> Value {
             }))
             .collect::<Vec<_>>()
     })
-}
-
-fn package_name_matches(package: &Package, candidate: &str) -> bool {
-    normalize_name(package.ecosystem, candidate) == package.name
 }
 
 fn nuget_registry_cache_key(package: &Package) -> String {
@@ -462,32 +458,60 @@ impl VulnProvider for OsvClient {
         .into_iter()
         .collect::<Result<HashMap<_, _>, _>>()?;
         for (key, vulns) in &mut map {
-            let package = packages.iter().find(|p| p.key() == *key);
-            for vuln in vulns {
-                if let Some(doc) = hydrated.get(&vuln.id) {
-                    *vuln = vulnerability_from_osv(doc, package);
+            let package = packages.iter().find(|p| p.key() == *key).ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "OSV query result has no source package for key {key:?}"
+                ))
+            })?;
+            let mut evaluated = Vec::with_capacity(vulns.len());
+            for vuln in std::mem::take(vulns) {
+                let doc = hydrated.get(&vuln.id).ok_or_else(|| {
+                    ProviderError::InvalidResponse(format!(
+                        "OSV advisory {} was not hydrated",
+                        vuln.id
+                    ))
+                })?;
+                if let Some(vulnerability) = vulnerability_from_osv(doc, Some(package))? {
+                    evaluated.push(vulnerability);
                 }
             }
+            *vulns = evaluated;
         }
         Ok(map)
     }
 }
 
-fn vulnerability_from_osv(doc: &Value, package: Option<&Package>) -> Vulnerability {
+fn vulnerability_from_osv(
+    doc: &Value,
+    package: Option<&Package>,
+) -> Result<Option<Vulnerability>, ProviderError> {
     let score = osv_cvss_score(doc, package);
-    let fixed_in = package
-        .map(|p| {
-            osv_fixed_versions(
-                p.ecosystem,
-                &p.version,
+    let evaluation = package
+        .map(|package| {
+            evaluate_osv_affected(
+                package,
                 doc.get("affected")
                     .and_then(Value::as_array)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
             )
+            .map_err(|error| {
+                ProviderError::InvalidResponse(format!(
+                    "OSV advisory {} cannot be evaluated for {} {}: {error}",
+                    doc.get("id").and_then(Value::as_str).unwrap_or("UNKNOWN"),
+                    package.display_name,
+                    package.version
+                ))
+            })
         })
+        .transpose()?;
+    if evaluation.as_ref().is_some_and(|result| !result.affected) {
+        return Ok(None);
+    }
+    let fixed_in = evaluation
+        .map(|result| result.fixed_versions)
         .unwrap_or_default();
-    Vulnerability {
+    Ok(Some(Vulnerability {
         id: doc
             .get("id")
             .and_then(Value::as_str)
@@ -522,7 +546,7 @@ fn vulnerability_from_osv(doc: &Value, package: Option<&Package>) -> Vulnerabili
             })
             .unwrap_or_default(),
         withdrawn: doc.get("withdrawn").is_some(),
-    }
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -581,7 +605,7 @@ fn affected_matches_package(affected: &Value, package: &Package) -> bool {
     };
 
     ecosystem == package.ecosystem.osv_name()
-        && normalize_name(package.ecosystem, name) == package.name
+        && (name == "*" || normalize_name(package.ecosystem, name) == package.name)
 }
 
 fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Option<f32> {
@@ -659,46 +683,9 @@ impl OsvOffline {
                 let Ok(document) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
-                let affected = document
-                    .get("affected")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
                 for package in &scoped {
-                    let matches = affected.iter().any(|item| {
-                        let identity_matches = item
-                            .get("package")
-                            .and_then(|x| x.get("name"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|name| package_name_matches(package, name))
-                            && item
-                                .get("package")
-                                .and_then(|x| x.get("ecosystem"))
-                                .and_then(Value::as_str)
-                                == Some(package.ecosystem.osv_name());
-                        let range_matches = item
-                            .get("ranges")
-                            .and_then(Value::as_array)
-                            .is_some_and(|ranges| {
-                                ranges.iter().any(|range| {
-                                    range.get("events").and_then(Value::as_array).is_some_and(
-                                        |events| {
-                                            osv_range_matches(
-                                                package.ecosystem,
-                                                &package.version,
-                                                events,
-                                            )
-                                        },
-                                    )
-                                })
-                            });
-                        identity_matches && range_matches
-                    });
-                    if matches {
-                        output
-                            .entry(package.key())
-                            .or_default()
-                            .push(vulnerability_from_osv(&document, Some(package)));
+                    if let Some(vulnerability) = vulnerability_from_osv(&document, Some(package))? {
+                        output.entry(package.key()).or_default().push(vulnerability);
                     }
                 }
             }
@@ -1077,6 +1064,61 @@ mod tests {
     };
     use zip::write::SimpleFileOptions;
 
+    #[derive(Debug, Deserialize)]
+    struct OsvRangeFixture {
+        name: String,
+        ecosystem: String,
+        package: String,
+        installed: String,
+        affected: bool,
+        fixed_in: Vec<String>,
+        document: Value,
+    }
+
+    fn osv_range_fixtures() -> Vec<OsvRangeFixture> {
+        serde_json::from_str(include_str!("../../../fixtures/osv-range-cases.json")).unwrap()
+    }
+
+    fn fixture_package(fixture: &OsvRangeFixture) -> Package {
+        let ecosystem = Ecosystem::from_cli(&fixture.ecosystem).unwrap();
+        Package::new(
+            ecosystem,
+            &fixture.package,
+            &fixture.installed,
+            PathBuf::from("fixture.lock"),
+        )
+    }
+
+    fn write_fixture_archives(root: &Path, fixtures: &[OsvRangeFixture]) {
+        let offline_dir = root.join("offline");
+        fs::create_dir_all(&offline_dir).unwrap();
+        for ecosystem in [
+            Ecosystem::Npm,
+            Ecosystem::PyPI,
+            Ecosystem::NuGet,
+            Ecosystem::CratesIo,
+        ] {
+            let file = File::create(
+                offline_dir.join(format!("{}.zip", ecosystem.osv_name().replace('.', "_"))),
+            )
+            .unwrap();
+            let mut archive = zip::ZipWriter::new(file);
+            for fixture in fixtures
+                .iter()
+                .filter(|fixture| Ecosystem::from_cli(&fixture.ecosystem) == Some(ecosystem))
+            {
+                let id = fixture.document.get("id").and_then(Value::as_str).unwrap();
+                archive
+                    .start_file(format!("{id}.json"), SimpleFileOptions::default())
+                    .unwrap();
+                archive
+                    .write_all(serde_json::to_string(&fixture.document).unwrap().as_bytes())
+                    .unwrap();
+            }
+            archive.finish().unwrap();
+        }
+    }
+
     fn nuget_package(name: &str) -> Package {
         Package::new(
             Ecosystem::NuGet,
@@ -1143,7 +1185,7 @@ mod tests {
                 "id": "TEST-1",
                 "severity": [{"type": severity_type, "score": vector}]
             });
-            let vulnerability = vulnerability_from_osv(&document, None);
+            let vulnerability = vulnerability_from_osv(&document, None).unwrap().unwrap();
 
             assert_eq!(vulnerability.cvss_score, Some(expected_score), "{vector}");
             assert_eq!(vulnerability.severity, Some(expected_severity), "{vector}");
@@ -1239,6 +1281,7 @@ mod tests {
                 },
                 {
                     "package": {"ecosystem": "crates.io", "name": "quick-xml"},
+                    "versions": ["0.36.2"],
                     "severity": [
                         {
                             "type": "CVSS_V3",
@@ -1253,7 +1296,9 @@ mod tests {
             ]
         });
 
-        let vulnerability = vulnerability_from_osv(&document, Some(&package));
+        let vulnerability = vulnerability_from_osv(&document, Some(&package))
+            .unwrap()
+            .unwrap();
         assert_eq!(vulnerability.cvss_score, Some(7.5));
         assert_eq!(vulnerability.severity, Some(Severity::High));
         assert_eq!(osv_cvss_score(&document, None), None);
@@ -1275,7 +1320,7 @@ mod tests {
         ];
 
         for document in cases {
-            let vulnerability = vulnerability_from_osv(&document, None);
+            let vulnerability = vulnerability_from_osv(&document, None).unwrap().unwrap();
             assert_eq!(vulnerability.cvss_score, None);
             assert_eq!(vulnerability.severity, None);
         }
@@ -1587,6 +1632,137 @@ mod tests {
 
         assert_eq!(result[&package.key()].len(), 1);
         assert_eq!(result[&package.key()][0].id, "GHSA-5crp-9r3c-p9vr");
+    }
+
+    #[tokio::test]
+    async fn hydrated_and_offline_range_fixture_results_are_identical() {
+        let fixtures = osv_range_fixtures();
+        let packages = fixtures.iter().map(fixture_package).collect::<Vec<_>>();
+
+        // Return each fixture ID even for intentionally unaffected cases. This makes the hydrated
+        // document evaluator, rather than the mock batch response, authoritative. Fixtures are
+        // queried independently so the ecosystem-wide wildcard case does not alter other cases.
+        let server = MockServer::start().await;
+        for (fixture, package) in fixtures.iter().zip(&packages) {
+            let id = fixture.document.get("id").and_then(Value::as_str).unwrap();
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_json(osv_query_body(std::slice::from_ref(package))))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{"vulns": [{"id": id}]}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&fixture.document))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let online_cache = tempfile::tempdir().unwrap();
+        let online = OsvClient::with_base_url(
+            HttpClient::new().unwrap(),
+            Cache {
+                root: online_cache.path().to_path_buf(),
+                policy: CachePolicy::default(),
+            },
+            server.uri(),
+        );
+
+        for (fixture, package) in fixtures.iter().zip(&packages) {
+            let hydrated_results = online.query(std::slice::from_ref(package)).await.unwrap();
+            let hydrated = hydrated_results[&package.key()]
+                .iter()
+                .map(|vulnerability| (vulnerability.id.clone(), vulnerability.fixed_in.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                !hydrated.is_empty(),
+                fixture.affected,
+                "fixture {:?} affected mismatch",
+                fixture.name
+            );
+            if let Some((_, fixed_in)) = hydrated.first() {
+                assert_eq!(
+                    fixed_in, &fixture.fixed_in,
+                    "fixture {:?} fixed versions mismatch",
+                    fixture.name
+                );
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            write_fixture_archives(dir.path(), std::slice::from_ref(fixture));
+            let offline_provider = OsvOffline::new(Cache {
+                root: dir.path().to_path_buf(),
+                policy: CachePolicy::default(),
+            });
+            let offline_results = offline_provider
+                .query_blocking(std::slice::from_ref(package))
+                .unwrap();
+            let offline = offline_results[&package.key()]
+                .iter()
+                .map(|vulnerability| (vulnerability.id.clone(), vulnerability.fixed_in.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                offline, hydrated,
+                "hydrated/offline mismatch for fixture {:?}",
+                fixture.name
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_ranges_fail_visibly_online_and_offline() {
+        let document = json!({
+            "id": "TEST-UNSUPPORTED-GIT",
+            "summary": "A package query cannot evaluate a commit graph",
+            "affected": [{
+                "package": {"ecosystem": "npm", "name": "git-only"},
+                "ranges": [{
+                    "type": "GIT",
+                    "repo": "https://example.invalid/repo.git",
+                    "events": [{"introduced": "0000000000000000000000000000000000000000"}]
+                }]
+            }]
+        });
+        let package = Package::new(
+            Ecosystem::Npm,
+            "git-only",
+            "1.0.0",
+            PathBuf::from("package-lock.json"),
+        );
+
+        let online_error = vulnerability_from_osv(&document, Some(&package)).unwrap_err();
+        assert!(
+            online_error
+                .to_string()
+                .contains("unsupported OSV range type")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = OsvRangeFixture {
+            name: "unsupported GIT".to_owned(),
+            ecosystem: "npm".to_owned(),
+            package: "git-only".to_owned(),
+            installed: "1.0.0".to_owned(),
+            affected: false,
+            fixed_in: vec![],
+            document,
+        };
+        write_fixture_archives(dir.path(), std::slice::from_ref(&fixture));
+        let offline = OsvOffline::new(Cache {
+            root: dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        });
+        let offline_error = offline
+            .query_blocking(std::slice::from_ref(&package))
+            .unwrap_err();
+        assert!(
+            offline_error
+                .to_string()
+                .contains("unsupported OSV range type")
+        );
     }
 
     #[test]

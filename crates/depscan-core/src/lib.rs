@@ -1,5 +1,9 @@
 //! Shared domain model and ecosystem-aware version/range logic for depscan.
 
+mod osv;
+
+pub use osv::{OsvAffectedEvaluation, OsvEvaluationError, evaluate_osv_affected};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pep440_rs::Version as Pep440Version;
@@ -408,67 +412,6 @@ fn numeric_release(v: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Match an installed version against a single OSV affected range. Events are evaluated in order;
-/// `introduced: "0"` opens a range and `fixed` or `last_affected` closes it.
-pub fn osv_range_matches(
-    ecosystem: Ecosystem,
-    version: &str,
-    events: &[serde_json::Value],
-) -> bool {
-    let mut active = false;
-    for event in events {
-        if let Some(introduced) = event.get("introduced").and_then(|v| v.as_str()) {
-            active = introduced == "0"
-                || compare_versions(ecosystem, version, introduced) != Ordering::Less;
-        }
-        if active {
-            if let Some(fixed) = event.get("fixed").and_then(|v| v.as_str())
-                && compare_versions(ecosystem, version, fixed) != Ordering::Less
-            {
-                active = false;
-            }
-            if let Some(last) = event.get("last_affected").and_then(|v| v.as_str())
-                && compare_versions(ecosystem, version, last) == Ordering::Greater
-            {
-                active = false;
-            }
-        }
-    }
-    active
-}
-
-pub fn osv_fixed_versions(
-    ecosystem: Ecosystem,
-    installed: &str,
-    affected: &[serde_json::Value],
-) -> Vec<String> {
-    let mut fixed = Vec::new();
-    for item in affected {
-        for range in item
-            .get("ranges")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
-            let events = range
-                .get("events")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if osv_range_matches(ecosystem, installed, &events) {
-                fixed.extend(
-                    events
-                        .into_iter()
-                        .filter_map(|e| e.get("fixed").and_then(|v| v.as_str()).map(str::to_owned)),
-                );
-            }
-        }
-    }
-    fixed.sort_by(|a, b| compare_versions(ecosystem, a, b));
-    fixed.dedup();
-    fixed
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,13 +543,5 @@ mod tests {
                 "unexpected staleness for {installed:?} -> {latest:?}"
             );
         }
-    }
-
-    #[test]
-    fn matches_osv_events() {
-        let events: Vec<serde_json::Value> =
-            serde_json::from_str(r#"[{"introduced":"0"},{"fixed":"2.0.0"}]"#).unwrap();
-        assert!(osv_range_matches(Ecosystem::Npm, "1.5.0", &events));
-        assert!(!osv_range_matches(Ecosystem::Npm, "2.0.0", &events));
     }
 }
