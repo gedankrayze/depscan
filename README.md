@@ -143,7 +143,9 @@ Then run an air-gapped vulnerability scan:
 depscan scan --offline .
 ```
 
-Offline scans use the downloaded per-ecosystem OSV archives. Registry freshness checks are intentionally skipped in offline mode, since they require current registry metadata.
+Offline scans use the downloaded per-ecosystem OSV archives and never construct an HTTP provider. Each archive must have the valid `*.synced-at` marker written by `depscan sync`; a missing, malformed, or future marker fails safely. Without `--max-cache-age`, archives older than seven days remain usable but emit a warning. With `--max-cache-age <duration>`, an older archive is rejected as stale and must be synchronized again.
+
+Version freshness is evaluated from cached registry metadata when a usable entry exists. The normal six-hour registry TTL applies by default; an explicit `--max-cache-age` selects the age that an offline scan is willing to tolerate. Missing, stale, future-dated, corrupt, or `--no-cache` entries produce an `Unknown` freshness result and an explicit per-package reason in the report. No registry request is attempted in any of those cases.
 
 ## Development
 

@@ -48,7 +48,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-027](DS-027.md) | P1 | Closed | Replace unmaintained `serde_yaml` |
 | [DS-028](DS-028.md) | P1 | Open | Build the required fixture, provider, version, and E2E test matrix |
 | [DS-029](DS-029.md) | P1 | Open | Resolve manifest ranges for `latest_matching` |
-| [DS-030](DS-030.md) | P1 | Open | Enforce offline dump age and use cached registry metadata |
+| [DS-030](DS-030.md) | P1 | Closed | Enforce offline dump age and use cached registry metadata |
 | [DS-031](DS-031.md) | P1 | Closed | Implement exact retry and `Retry-After` semantics |
 | [DS-032](DS-032.md) | P1 | Open | Reject malformed offline advisory documents |
 | [DS-033](DS-033.md) | P1 | Closed | Reject malformed crates.io sparse-index lines |

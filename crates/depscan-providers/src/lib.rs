@@ -30,7 +30,7 @@ use std::{
 use tempfile::{Builder as TempFileBuilder, TempPath};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{sync::Semaphore, time::sleep};
-use tracing::debug;
+use tracing::{debug, warn};
 use urlencoding::encode;
 use zip::ZipArchive;
 
@@ -68,6 +68,7 @@ const OSV_DUMP_BACKOFF_BASE: StdDuration = StdDuration::from_millis(200);
 const OSV_DUMP_MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
 const OSV_DUMP_PROGRESS_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
 const OSV_DUMP_TEMP_SUFFIXES: [&str; 3] = [".zip.tmp", ".synced-at.tmp", ".zip.rollback.tmp"];
+const OSV_DUMP_DEFAULT_WARNING_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 
 fn osv_query_name(package: &Package) -> &str {
     match package.ecosystem {
@@ -1769,6 +1770,16 @@ fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Option<f32> {
 pub struct OsvOffline {
     cache: Cache,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsvDumpAge {
+    Current,
+    Warn {
+        synced_at: DateTime<Utc>,
+        age: Duration,
+    },
+}
+
 impl OsvOffline {
     pub fn new(cache: Cache) -> Self {
         Self { cache }
@@ -1779,7 +1790,116 @@ impl OsvOffline {
             .join("offline")
             .join(format!("{}.zip", ecosystem.osv_name().replace('.', "_")))
     }
-    fn query_blocking(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
+    fn validate_offline_read_directory(&self, archive_path: &Path) -> Result<(), ProviderError> {
+        let directory = archive_path
+            .parent()
+            .expect("offline archive path has a parent");
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            ProviderError::Offline(format!(
+                "cannot inspect offline dump directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ProviderError::Offline(format!(
+                "offline dump directory {} is not a real directory",
+                directory.display()
+            )));
+        }
+        let canonical = fs::canonicalize(directory).map_err(|error| {
+            ProviderError::Offline(format!(
+                "cannot resolve offline dump directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let cache_root = fs::canonicalize(self.cache.root()).map_err(|error| {
+            ProviderError::Offline(format!(
+                "cannot resolve depscan cache {}: {error}",
+                self.cache.root().display()
+            ))
+        })?;
+        if canonical.parent() != Some(cache_root.as_path()) {
+            return Err(ProviderError::Offline(format!(
+                "offline dump directory {} resolves outside the depscan cache",
+                directory.display()
+            )));
+        }
+        Ok(())
+    }
+    fn validate_dump_age_at(
+        &self,
+        archive_path: &Path,
+        ecosystem: Ecosystem,
+        now: DateTime<Utc>,
+    ) -> Result<OsvDumpAge, ProviderError> {
+        let marker_path = archive_path.with_extension("synced-at");
+        let metadata = fs::symlink_metadata(&marker_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::Offline(format!(
+                    "missing OSV dump timestamp {}; run `depscan sync --ecosystem {}`",
+                    marker_path.display(),
+                    ecosystem.display_name()
+                ))
+            } else {
+                ProviderError::Offline(format!(
+                    "cannot inspect OSV dump timestamp {}: {error}",
+                    marker_path.display()
+                ))
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ProviderError::Offline(format!(
+                "OSV dump timestamp {} is not a real regular file; run `depscan sync --ecosystem {}`",
+                marker_path.display(),
+                ecosystem.display_name()
+            )));
+        }
+        let raw = fs::read_to_string(&marker_path).map_err(|error| {
+            ProviderError::Offline(format!(
+                "cannot read OSV dump timestamp {}: {error}",
+                marker_path.display()
+            ))
+        })?;
+        let synced_at = DateTime::parse_from_rfc3339(raw.trim())
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .map_err(|error| {
+                ProviderError::Offline(format!(
+                    "invalid OSV dump timestamp {}: {error}; run `depscan sync --ecosystem {}`",
+                    marker_path.display(),
+                    ecosystem.display_name()
+                ))
+            })?;
+        if synced_at > now {
+            return Err(ProviderError::Offline(format!(
+                "OSV dump timestamp {} is in the future ({synced_at} > {now}); run `depscan sync --ecosystem {}`",
+                marker_path.display(),
+                ecosystem.display_name()
+            )));
+        }
+        let age = now - synced_at;
+        if let Some(max_age) = self.cache.policy.max_age {
+            if age > max_age {
+                return Err(ProviderError::Offline(format!(
+                    "OSV dump {} is stale: its age of {} seconds exceeds --max-cache-age ({} seconds); run `depscan sync --ecosystem {}`",
+                    archive_path.display(),
+                    age.num_seconds(),
+                    max_age.num_seconds(),
+                    ecosystem.display_name()
+                )));
+            }
+            return Ok(OsvDumpAge::Current);
+        }
+        if age > Duration::seconds(OSV_DUMP_DEFAULT_WARNING_AGE_SECS) {
+            Ok(OsvDumpAge::Warn { synced_at, age })
+        } else {
+            Ok(OsvDumpAge::Current)
+        }
+    }
+    fn query_blocking_at(
+        &self,
+        packages: &[Package],
+        now: DateTime<Utc>,
+    ) -> Result<VulnMap, ProviderError> {
         let mut output = VulnMap::new();
         for package in packages {
             output.entry(package.key()).or_default();
@@ -1798,6 +1918,7 @@ impl OsvOffline {
                 continue;
             }
             let archive_path = self.archive_path(ecosystem);
+            self.validate_offline_read_directory(&archive_path)?;
             let file = File::open(&archive_path).map_err(|_| {
                 ProviderError::Offline(format!(
                     "missing OSV dump {}; run `depscan sync --ecosystem {}`",
@@ -1805,6 +1926,18 @@ impl OsvOffline {
                     ecosystem.display_name()
                 ))
             })?;
+            if let OsvDumpAge::Warn { synced_at, age } =
+                self.validate_dump_age_at(&archive_path, ecosystem, now)?
+            {
+                warn!(
+                    ecosystem = ecosystem.osv_name(),
+                    path = %archive_path.display(),
+                    %synced_at,
+                    age_seconds = age.num_seconds(),
+                    warning_age_seconds = OSV_DUMP_DEFAULT_WARNING_AGE_SECS,
+                    "OSV dump is older than the default seven-day warning age; run `depscan sync`"
+                );
+            }
             let mut archive =
                 ZipArchive::new(file).map_err(|e| ProviderError::Offline(e.to_string()))?;
             for index in 0..archive.len() {
@@ -1829,6 +1962,10 @@ impl OsvOffline {
             }
         }
         Ok(output)
+    }
+
+    fn query_blocking(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
+        self.query_blocking_at(packages, Utc::now())
     }
 }
 #[async_trait]
@@ -2899,15 +3036,7 @@ impl RegistryClient {
         let data = self
             .metadata(&format!("npm:{}", p.name), &url, headers)
             .await?;
-        let latest = data
-            .get("dist-tags")
-            .and_then(|x| x.get("latest"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!("npm response lacked latest for {}", p.name))
-            })?
-            .to_owned();
-        Ok(version_result(p, latest, false))
+        npm_version_result(p, &data)
     }
     async fn pypi(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
         let _permit = self.limits[&Ecosystem::PyPI]
@@ -2918,17 +3047,7 @@ impl RegistryClient {
         let data = self
             .metadata(&format!("pypi:{}", p.name), &url, HeaderMap::new())
             .await?;
-        let releases = data
-            .get("releases")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse("PyPI response lacked releases".to_owned())
-            })?;
-        let latest = select_pypi_release(releases, &p.version).ok_or_else(|| {
-            ProviderError::InvalidResponse(format!("PyPI has no suitable release for {}", p.name))
-        })?;
-        let yanked = releases.get(&p.version).is_some_and(pypi_release_is_yanked);
-        Ok(version_result(p, latest, yanked))
+        pypi_version_result(p, &data)
     }
     async fn nuget(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
         let _permit = self.limits[&Ecosystem::NuGet]
@@ -2938,17 +3057,7 @@ impl RegistryClient {
         let url = nuget_registry_url(p);
         let cache_key = nuget_registry_cache_key(p);
         let data = self.metadata(&cache_key, &url, HeaderMap::new()).await?;
-        let latest = select_nuget_release(
-            data.get("versions")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str),
-        )
-        .ok_or_else(|| {
-            ProviderError::InvalidResponse(format!("NuGet has no stable version for {}", p.name))
-        })?;
-        Ok(version_result(p, latest, false))
+        nuget_version_result(p, &data)
     }
     async fn crates(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
         let path = crates_io_sparse_path(&p.name)?;
@@ -2961,24 +3070,7 @@ impl RegistryClient {
         let entries = self
             .crates_metadata_for_index(&format!("crates:{}", name), name, &url)
             .await?;
-        let mut all: Vec<String> = Vec::new();
-        let mut yanked = false;
-        for entry in entries {
-            if entry.vers == p.version {
-                yanked = entry.yanked;
-            }
-            if !entry.yanked && !is_prerelease(Ecosystem::CratesIo, &entry.vers) {
-                all.push(entry.vers);
-            }
-        }
-        let latest = maximum_version(Ecosystem::CratesIo, all.iter().map(String::as_str))
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "crates.io has no stable version for {}",
-                    p.name
-                ))
-            })?;
-        Ok(version_result(p, latest, yanked))
+        crates_version_result(p, &entries)
     }
 }
 #[async_trait]
@@ -3005,6 +3097,74 @@ fn version_result(package: &Package, latest: String, yanked: bool) -> LatestVers
         staleness,
         yanked,
     }
+}
+
+fn npm_version_result(package: &Package, data: &Value) -> Result<LatestVersions, ProviderError> {
+    let latest = data
+        .get("dist-tags")
+        .and_then(|value| value.get("latest"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse(format!(
+                "npm response lacked latest for {}",
+                package.name
+            ))
+        })?
+        .to_owned();
+    Ok(version_result(package, latest, false))
+}
+
+fn pypi_version_result(package: &Package, data: &Value) -> Result<LatestVersions, ProviderError> {
+    let releases = data
+        .get("releases")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse("PyPI response lacked releases".to_owned())
+        })?;
+    let latest = select_pypi_release(releases, &package.version).ok_or_else(|| {
+        ProviderError::InvalidResponse(format!("PyPI has no suitable release for {}", package.name))
+    })?;
+    let yanked = releases
+        .get(&package.version)
+        .is_some_and(pypi_release_is_yanked);
+    Ok(version_result(package, latest, yanked))
+}
+
+fn nuget_version_result(package: &Package, data: &Value) -> Result<LatestVersions, ProviderError> {
+    let latest = select_nuget_release(
+        data.get("versions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
+    .ok_or_else(|| {
+        ProviderError::InvalidResponse(format!("NuGet has no stable version for {}", package.name))
+    })?;
+    Ok(version_result(package, latest, false))
+}
+
+fn crates_version_result(
+    package: &Package,
+    entries: &[CratesIndexEntry],
+) -> Result<LatestVersions, ProviderError> {
+    let mut all: Vec<&str> = Vec::new();
+    let mut yanked = false;
+    for entry in entries {
+        if entry.vers == package.version {
+            yanked = entry.yanked;
+        }
+        if !entry.yanked && !is_prerelease(Ecosystem::CratesIo, &entry.vers) {
+            all.push(&entry.vers);
+        }
+    }
+    let latest = maximum_version(Ecosystem::CratesIo, all).ok_or_else(|| {
+        ProviderError::InvalidResponse(format!(
+            "crates.io has no stable version for {}",
+            package.name
+        ))
+    })?;
+    Ok(version_result(package, latest, yanked))
 }
 fn maximum_version<'a>(
     eco: Ecosystem,
@@ -3212,6 +3372,169 @@ fn validated_cached_crates_index(
     .then_some(cached)
 }
 
+#[derive(Clone)]
+pub struct RegistryOffline {
+    cache: Cache,
+    now: DateTime<Utc>,
+}
+
+impl RegistryOffline {
+    pub fn new(cache: Cache) -> Self {
+        Self {
+            cache,
+            now: Utc::now(),
+        }
+    }
+
+    fn cache_key(package: &Package) -> String {
+        match package.ecosystem {
+            Ecosystem::Npm => format!("npm:{}", package.name),
+            Ecosystem::PyPI => format!("pypi:{}", package.name),
+            Ecosystem::NuGet => nuget_registry_cache_key(package),
+            Ecosystem::CratesIo => format!("crates:{}", package.name),
+        }
+    }
+
+    fn cached_value_at(
+        &self,
+        package: &Package,
+        now: DateTime<Utc>,
+    ) -> Result<Value, ProviderError> {
+        let key = Self::cache_key(package);
+        if !self.cache.policy.read {
+            return Err(ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because cache reads are disabled by --no-cache",
+                package.display_name
+            )));
+        }
+        let path = self.cache.filename("registry", &key);
+        let namespace = path.parent().expect("registry cache path has a parent");
+        let namespace_metadata = fs::symlink_metadata(namespace).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::Offline(format!(
+                    "registry metadata for {} is unknown because no cached entry exists",
+                    package.display_name
+                ))
+            } else {
+                ProviderError::Offline(format!(
+                    "registry metadata for {} is unknown because the cache namespace cannot be inspected: {error}",
+                    package.display_name
+                ))
+            }
+        })?;
+        if namespace_metadata.file_type().is_symlink() || !namespace_metadata.is_dir() {
+            return Err(ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because the cache namespace is not a real directory",
+                package.display_name
+            )));
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::Offline(format!(
+                    "registry metadata for {} is unknown because no cached entry exists",
+                    package.display_name
+                ))
+            } else {
+                ProviderError::Offline(format!(
+                    "registry metadata for {} is unknown because the cached entry cannot be inspected: {error}",
+                    package.display_name
+                ))
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because the cached entry is not a real regular file",
+                package.display_name
+            )));
+        }
+        let raw = fs::read_to_string(&path).map_err(|error| {
+            ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because the cached entry cannot be read: {error}",
+                package.display_name
+            ))
+        })?;
+        let entry = serde_json::from_str::<CacheEntry>(&raw).map_err(|error| {
+            ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because the cached entry is corrupt: {error}",
+                package.display_name
+            ))
+        })?;
+        if entry.stored_at > now {
+            return Err(ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because its cache timestamp is in the future ({} > {})",
+                package.display_name, entry.stored_at, now
+            )));
+        }
+        let age = now - entry.stored_at;
+        let max_age = self
+            .cache
+            .policy
+            .max_age
+            .unwrap_or_else(|| Duration::seconds(REGISTRY_TTL_SECS));
+        if age > max_age {
+            return Err(ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because the cached entry is stale ({} seconds old; maximum {} seconds)",
+                package.display_name,
+                age.num_seconds(),
+                max_age.num_seconds()
+            )));
+        }
+        Ok(entry.value)
+    }
+
+    fn latest_at(
+        &self,
+        package: &Package,
+        now: DateTime<Utc>,
+    ) -> Result<LatestVersions, ProviderError> {
+        let value = self.cached_value_at(package, now)?;
+        let result = (|| -> Result<LatestVersions, ProviderError> {
+            match package.ecosystem {
+                Ecosystem::Npm => npm_version_result(package, &value),
+                Ecosystem::PyPI => pypi_version_result(package, &value),
+                Ecosystem::NuGet => nuget_version_result(package, &value),
+                Ecosystem::CratesIo => {
+                    let cached =
+                        serde_json::from_value::<CratesIndexCache>(value).map_err(|error| {
+                            ProviderError::InvalidResponse(format!(
+                                "cached crates.io sparse index has an invalid envelope: {error}"
+                            ))
+                        })?;
+                    if cached.schema_version != CRATES_IO_INDEX_CACHE_SCHEMA_VERSION {
+                        return Err(ProviderError::InvalidResponse(format!(
+                            "cached crates.io schema version {} is unsupported",
+                            cached.schema_version
+                        )));
+                    }
+                    validate_crates_index_entries(
+                        cached
+                            .entries
+                            .iter()
+                            .enumerate()
+                            .map(|(index, entry)| (index + 1, entry)),
+                        &package.name,
+                        "cached crates.io sparse index",
+                    )?;
+                    crates_version_result(package, &cached.entries)
+                }
+            }
+        })();
+        result.map_err(|error| {
+            ProviderError::Offline(format!(
+                "registry metadata for {} is unknown because the cached entry is invalid: {error}",
+                package.display_name
+            ))
+        })
+    }
+}
+
+#[async_trait]
+impl VersionProvider for RegistryOffline {
+    async fn latest(&self, package: &Package) -> Result<LatestVersions, ProviderError> {
+        self.latest_at(package, self.now)
+    }
+}
+
 // crates.io sparse-index entries are newline-delimited JSON. Decode and validate the entire
 // response before writing the versioned cache envelope, so a truncated response cannot be reused.
 impl RegistryClient {
@@ -3364,6 +3687,229 @@ mod tests {
         let mut entry = read_cache_entry(cache, namespace, key);
         entry.stored_at = Utc::now() - age;
         write_cache_entry(cache, namespace, key, &entry);
+    }
+
+    fn test_timestamp(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn offline_dump_age_handles_fresh_stale_missing_malformed_and_future_markers() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache =
+            Cache::from_root(directory.path().join("cache"), CachePolicy::default()).unwrap();
+        let archive = cache.root().join("offline/npm.zip");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::write(&archive, b"archive fixture").unwrap();
+        let marker = archive.with_extension("synced-at");
+        let now = test_timestamp("2026-08-19T12:00:00Z");
+        let provider = OsvOffline::new(cache.clone());
+
+        fs::write(&marker, "2026-08-18T12:00:00Z").unwrap();
+        assert_eq!(
+            provider
+                .validate_dump_age_at(&archive, Ecosystem::Npm, now)
+                .unwrap(),
+            OsvDumpAge::Current
+        );
+
+        fs::write(&marker, "2026-08-11T11:59:59Z").unwrap();
+        assert!(matches!(
+            provider
+                .validate_dump_age_at(&archive, Ecosystem::Npm, now)
+                .unwrap(),
+            OsvDumpAge::Warn { age, .. } if age == Duration::seconds(8 * 24 * 60 * 60 + 1)
+        ));
+
+        let strict = OsvOffline::new(Cache {
+            root: cache.root.clone(),
+            policy: CachePolicy {
+                read: true,
+                max_age: Some(Duration::days(7)),
+            },
+        });
+        let stale = strict
+            .validate_dump_age_at(&archive, Ecosystem::Npm, now)
+            .unwrap_err();
+        assert!(stale.to_string().contains("exceeds --max-cache-age"));
+
+        fs::remove_file(&marker).unwrap();
+        let missing = provider
+            .validate_dump_age_at(&archive, Ecosystem::Npm, now)
+            .unwrap_err();
+        assert!(missing.to_string().contains("missing OSV dump timestamp"));
+
+        fs::write(&marker, "not-a-timestamp").unwrap();
+        let malformed = provider
+            .validate_dump_age_at(&archive, Ecosystem::Npm, now)
+            .unwrap_err();
+        assert!(malformed.to_string().contains("invalid OSV dump timestamp"));
+
+        fs::write(&marker, "2026-08-19T12:00:01Z").unwrap();
+        let future = provider
+            .validate_dump_age_at(&archive, Ecosystem::Npm, now)
+            .unwrap_err();
+        assert!(future.to_string().contains("is in the future"));
+    }
+
+    #[test]
+    fn offline_registry_reuses_valid_cached_metadata_for_every_ecosystem() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache =
+            Cache::from_root(directory.path().join("cache"), CachePolicy::default()).unwrap();
+        let provider = RegistryOffline::new(cache.clone());
+        let now = test_timestamp("2026-08-19T12:00:00Z");
+        let stored_at = now - Duration::hours(1);
+        let fixtures = [
+            (
+                Package::new(
+                    Ecosystem::Npm,
+                    "npm-demo",
+                    "1.0.0",
+                    PathBuf::from("package-lock.json"),
+                ),
+                json!({"dist-tags": {"latest": "2.0.0"}}),
+            ),
+            (
+                Package::new(
+                    Ecosystem::PyPI,
+                    "pypi-demo",
+                    "1.0.0",
+                    PathBuf::from("uv.lock"),
+                ),
+                json!({"releases": {
+                    "1.0.0": [{"yanked": false}],
+                    "2.0.0": [{"yanked": false}]
+                }}),
+            ),
+            (
+                Package::new(
+                    Ecosystem::NuGet,
+                    "NuGet.Demo",
+                    "1.0.0",
+                    PathBuf::from("packages.lock.json"),
+                ),
+                json!({"versions": ["1.0.0", "2.0.0"]}),
+            ),
+            (
+                Package::new(
+                    Ecosystem::CratesIo,
+                    "crate-demo",
+                    "1.0.0",
+                    PathBuf::from("Cargo.lock"),
+                ),
+                json!({
+                    "schema_version": CRATES_IO_INDEX_CACHE_SCHEMA_VERSION,
+                    "entries": [
+                        {"name": "crate-demo", "vers": "1.0.0", "yanked": false},
+                        {"name": "crate-demo", "vers": "2.0.0", "yanked": false}
+                    ]
+                }),
+            ),
+        ];
+
+        for (package, value) in fixtures {
+            write_cache_entry(
+                &cache,
+                "registry",
+                &RegistryOffline::cache_key(&package),
+                &CacheEntry {
+                    stored_at,
+                    etag: None,
+                    value,
+                },
+            );
+            let latest = provider.latest_at(&package, now).unwrap();
+            assert_eq!(latest.latest_stable, "2.0.0");
+            assert_eq!(latest.staleness, depscan_core::Staleness::Major);
+        }
+    }
+
+    #[test]
+    fn offline_registry_reports_cache_age_and_integrity_failures_without_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache =
+            Cache::from_root(directory.path().join("cache"), CachePolicy::default()).unwrap();
+        let now = test_timestamp("2026-08-19T12:00:00Z");
+        let package = Package::new(
+            Ecosystem::Npm,
+            "offline-demo",
+            "1.0.0",
+            PathBuf::from("package-lock.json"),
+        );
+        let key = RegistryOffline::cache_key(&package);
+        let value = json!({"dist-tags": {"latest": "2.0.0"}});
+
+        write_cache_entry(
+            &cache,
+            "registry",
+            &key,
+            &CacheEntry {
+                stored_at: now - Duration::days(2),
+                etag: None,
+                value: value.clone(),
+            },
+        );
+        let default_provider = RegistryOffline::new(cache.clone());
+        let stale = default_provider.latest_at(&package, now).unwrap_err();
+        assert!(stale.to_string().contains("cached entry is stale"));
+
+        let tolerant_provider = RegistryOffline::new(Cache {
+            root: cache.root.clone(),
+            policy: CachePolicy {
+                read: true,
+                max_age: Some(Duration::days(7)),
+            },
+        });
+        assert_eq!(
+            tolerant_provider
+                .latest_at(&package, now)
+                .unwrap()
+                .latest_stable,
+            "2.0.0"
+        );
+
+        let missing_package = Package::new(
+            Ecosystem::Npm,
+            "missing-demo",
+            "1.0.0",
+            PathBuf::from("package-lock.json"),
+        );
+        let missing = default_provider
+            .latest_at(&missing_package, now)
+            .unwrap_err();
+        assert!(missing.to_string().contains("no cached entry exists"));
+
+        let path = cache.filename("registry", &key);
+        fs::write(&path, b"not JSON").unwrap();
+        let corrupt = default_provider.latest_at(&package, now).unwrap_err();
+        assert!(corrupt.to_string().contains("cached entry is corrupt"));
+
+        write_cache_entry(
+            &cache,
+            "registry",
+            &key,
+            &CacheEntry {
+                stored_at: now + Duration::seconds(1),
+                etag: None,
+                value,
+            },
+        );
+        let future = default_provider.latest_at(&package, now).unwrap_err();
+        assert!(future.to_string().contains("timestamp is in the future"));
+
+        let disabled = RegistryOffline::new(Cache {
+            root: cache.root.clone(),
+            policy: CachePolicy {
+                read: false,
+                max_age: None,
+            },
+        })
+        .latest_at(&package, now)
+        .unwrap_err();
+        assert!(disabled.to_string().contains("disabled by --no-cache"));
     }
 
     #[test]
@@ -3591,6 +4137,14 @@ mod tests {
                     .unwrap();
             }
             archive.finish().unwrap();
+            fs::write(
+                offline_dir.join(format!(
+                    "{}.synced-at",
+                    ecosystem.osv_name().replace('.', "_")
+                )),
+                Utc::now().to_rfc3339(),
+            )
+            .unwrap();
         }
     }
 
@@ -7050,7 +7604,7 @@ mod tests {
         let offline_dir = dir.path().join("offline");
         fs::create_dir_all(&offline_dir).unwrap();
         let archive_path = offline_dir.join("NuGet.zip");
-        let file = File::create(archive_path).unwrap();
+        let file = File::create(&archive_path).unwrap();
         let mut archive = zip::ZipWriter::new(file);
         archive
             .start_file("GHSA-5crp-9r3c-p9vr.json", SimpleFileOptions::default())
@@ -7079,6 +7633,11 @@ mod tests {
             )
             .unwrap();
         archive.finish().unwrap();
+        fs::write(
+            archive_path.with_extension("synced-at"),
+            Utc::now().to_rfc3339(),
+        )
+        .unwrap();
 
         let cache = Cache {
             root: dir.path().to_path_buf(),

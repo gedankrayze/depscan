@@ -103,6 +103,19 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
         );
     }
 
+    fn seed_empty_offline_dump(&self) {
+        seed_empty_cargo_dump(&self.cache);
+    }
+
+    fn set_cache_timestamp(&self, namespace: &str, digest: &str, timestamp: chrono::DateTime<Utc>) {
+        let path = self.cache.join(namespace).join(format!("{digest}.json"));
+        let mut entry: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read cache fixture"))
+                .expect("decode cache fixture");
+        entry["stored_at"] = serde_json::Value::String(timestamp.to_rfc3339());
+        fs::write(path, serde_json::to_vec(&entry).unwrap()).expect("update cache timestamp");
+    }
+
     fn seed_vulnerability(&self) {
         self.seed_vulnerability_record(false, &[]);
     }
@@ -304,6 +317,11 @@ fn seed_empty_osv_dump(cache: &Path, ecosystem: &str) {
     )
     .finish()
     .expect("finish empty offline dump");
+    fs::write(
+        offline.join(format!("{ecosystem}.synced-at")),
+        Utc::now().to_rfc3339(),
+    )
+    .expect("write offline dump timestamp");
 }
 
 fn report_packages(report: &serde_json::Value) -> &[serde_json::Value] {
@@ -1687,6 +1705,168 @@ fn provider_hard_failure_exits_thirty() {
 }
 
 #[test]
+fn offline_scan_uses_registry_cache_with_network_explicitly_denied() {
+    let project = TestProject::rust("offline-registry-network-deny");
+    project.seed_clean("2.0.0");
+    project.seed_empty_offline_dump();
+
+    let output = command(&project.cache)
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .args([
+            "scan",
+            "--offline",
+            "--format",
+            "json",
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("run offline depscan with network denied");
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty());
+    let report = json_report(&output);
+    let result = &report_packages(&report)[0];
+    assert_eq!(
+        result
+            .pointer("/latest/latest_stable")
+            .and_then(serde_json::Value::as_str),
+        Some("2.0.0")
+    );
+    assert_eq!(
+        result
+            .pointer("/latest/staleness")
+            .and_then(serde_json::Value::as_str),
+        Some("major")
+    );
+    assert_eq!(
+        result
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+}
+
+#[test]
+fn offline_registry_stale_and_missing_entries_are_unknown_with_reasons() {
+    let stale = TestProject::rust("offline-registry-stale");
+    stale.seed_clean("2.0.0");
+    stale.seed_empty_offline_dump();
+    stale.set_cache_timestamp(
+        "registry",
+        REGISTRY_DIGEST,
+        Utc::now() - chrono::Duration::days(2),
+    );
+
+    let stale_output = stale.run(&[
+        "scan",
+        "--offline",
+        "--format",
+        "json",
+        stale.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&stale_output, 0);
+    let stale_report = json_report(&stale_output);
+    let stale_result = &report_packages(&stale_report)[0];
+    assert_eq!(
+        stale_result
+            .pointer("/latest/staleness")
+            .and_then(serde_json::Value::as_str),
+        Some("unknown")
+    );
+    assert!(
+        stale_result
+            .pointer("/errors/0/message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("cached entry is stale"))
+    );
+
+    let tolerated = stale.run(&[
+        "scan",
+        "--offline",
+        "--max-cache-age",
+        "7d",
+        "--format",
+        "json",
+        stale.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&tolerated, 0);
+    let tolerated_report = json_report(&tolerated);
+    assert_eq!(
+        report_packages(&tolerated_report)[0]
+            .pointer("/latest/latest_stable")
+            .and_then(serde_json::Value::as_str),
+        Some("2.0.0")
+    );
+
+    let missing = TestProject::rust("offline-registry-missing");
+    missing.seed_empty_offline_dump();
+    let missing_output = missing.run(&[
+        "scan",
+        "--offline",
+        "--format",
+        "json",
+        missing.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&missing_output, 0);
+    let missing_report = json_report(&missing_output);
+    let missing_result = &report_packages(&missing_report)[0];
+    assert_eq!(
+        missing_result
+            .pointer("/latest/staleness")
+            .and_then(serde_json::Value::as_str),
+        Some("unknown")
+    );
+    assert!(
+        missing_result
+            .pointer("/errors/0/message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("no cached entry exists"))
+    );
+}
+
+#[test]
+fn offline_dump_warns_after_seven_days_and_max_age_rejects_it() {
+    let project = TestProject::rust("offline-dump-age");
+    project.seed_clean("1.0.0");
+    project.seed_empty_offline_dump();
+    let marker = project.cache.join("offline/crates_io.synced-at");
+    fs::write(
+        &marker,
+        (Utc::now() - chrono::Duration::days(8)).to_rfc3339(),
+    )
+    .expect("age offline marker");
+
+    let warning = project.run(&[
+        "scan",
+        "--offline",
+        "--format",
+        "json",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&warning, 0);
+    assert!(
+        String::from_utf8_lossy(&warning.stderr)
+            .contains("older than the default seven-day warning age")
+    );
+
+    let rejected = project.run(&[
+        "scan",
+        "--offline",
+        "--max-cache-age",
+        "7d",
+        project.directory.path().to_str().expect("UTF-8 path"),
+    ]);
+    assert_exit(&rejected, 30);
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("exceeds --max-cache-age"));
+    assert!(stderr.contains("depscan sync"));
+}
+
+#[test]
 fn cache_clear_preserves_the_owned_root_and_unrelated_files() {
     let project = TestProject::rust("safe-cache-clear");
     project.seed_clean("1.0.0");
@@ -1914,11 +2094,11 @@ fn help_and_subcommand_contracts_match_byte_snapshots() {
     let cases = [
         (
             &["--help"][..],
-            "079cac0ca6d98ca5ea6836b3bf810ac95014e4a742c5697e0a96b8fa7ec3837d",
+            "baa7f6c44933106a0a3ec64f014dee0a272aae48fd0971dde3492712526b1dda",
         ),
         (
             &["scan", "--help"][..],
-            "81b27ef05de0f48c2b8d88ab2ce9f90888fad608f09b1b91bfd5c4c3fe415d5c",
+            "fa6d266aaa1eb37ce609b639f854ca5744c12d964c2a5cfdf933185e450f7c27",
         ),
         (
             &["sync", "--help"][..],
@@ -1952,7 +2132,7 @@ fn generated_completions_match_byte_snapshots_and_advertise_typed_values() {
         ),
         (
             "fish",
-            "67e4452c02e51ef351895c346dc217733f0bb09af794559d93017afbe6fdf4f5",
+            "317f193fba80acbbd95765f23ca7f82c4647605b494b874b6c33474a92fc5756",
         ),
     ] {
         let output = command(&directory.path().join("cache"))

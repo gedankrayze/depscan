@@ -2,14 +2,14 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::{generate, shells};
 use depscan_core::{
-    Ecosystem, EnrichError, Package, ScanDocument, ScanResult, Severity, Staleness,
+    Ecosystem, EnrichError, LatestVersions, Package, ScanDocument, ScanResult, Severity, Staleness,
     SuppressedFinding, SuppressionMatch, SuppressionSource, SuppressionState, VersionProvider,
     VulnProvider, Vulnerability,
 };
 use depscan_parsers::ParserSet;
 use depscan_providers::{
     Cache, CachePolicy, HttpClient, OsvClient, OsvOffline, OsvSyncOptions, RegistryClient,
-    sync_osv_dumps_with_options,
+    RegistryOffline, sync_osv_dumps_with_options,
 };
 use depscan_report::{OutputFormat, render};
 use futures::{StreamExt, stream};
@@ -230,7 +230,7 @@ struct ScanArgs {
     /// Exit 2 for this degree of staleness or a yanked release. CLI overrides config; default: never.
     #[arg(long, value_name = "CLASS", value_enum)]
     fail_on_outdated: Option<OutdatedThreshold>,
-    /// Disable network access; require locally synced OSV dumps and skip registry freshness lookups.
+    /// Disable network access; require synced OSV dumps and use only acceptable cached registry data.
     #[arg(long)]
     offline: bool,
     /// Bypass reusable JSON cache reads but continue writing fresh responses. Synced offline dumps remain inputs.
@@ -571,23 +571,23 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         max_age: max_cache_age,
     })
     .map_err(CliError::provider)?;
-    let http = HttpClient::new().map_err(CliError::provider)?;
-    let vulnerabilities = if args.offline {
-        OsvOffline::new(cache.clone())
+    let (vulnerabilities, freshness) = if args.offline {
+        let vulnerabilities = OsvOffline::new(cache.clone())
             .query(&packages)
             .await
-            .map_err(CliError::provider)?
+            .map_err(CliError::provider)?;
+        let registry = RegistryOffline::new(cache);
+        let freshness = fetch_latest(&registry, &packages, true).await;
+        (vulnerabilities, freshness)
     } else {
-        OsvClient::new(http.clone(), cache.clone())
+        let http = HttpClient::new().map_err(CliError::provider)?;
+        let vulnerabilities = OsvClient::new(http.clone(), cache.clone())
             .query(&packages)
             .await
-            .map_err(CliError::provider)?
-    };
-    let registry = RegistryClient::new(http, cache);
-    let freshness = if args.offline {
-        std::collections::HashMap::new()
-    } else {
-        fetch_latest(&registry, &packages).await
+            .map_err(CliError::provider)?;
+        let registry = RegistryClient::new(http, cache);
+        let freshness = fetch_latest(&registry, &packages, false).await;
+        (vulnerabilities, freshness)
     };
     let mut results = Vec::new();
     for package in packages {
@@ -698,10 +698,14 @@ fn scan_timestamp() -> Result<DateTime<Utc>, CliError> {
     Ok(timestamp)
 }
 
-async fn fetch_latest(
-    registry: &RegistryClient,
+async fn fetch_latest<P>(
+    registry: &P,
     packages: &[Package],
-) -> std::collections::HashMap<String, (Option<depscan_core::LatestVersions>, Vec<EnrichError>)> {
+    unknown_on_error: bool,
+) -> std::collections::HashMap<String, (Option<LatestVersions>, Vec<EnrichError>)>
+where
+    P: VersionProvider + Clone,
+{
     let sem = std::sync::Arc::new(Semaphore::new(64));
     stream::iter(
         packages
@@ -709,7 +713,7 @@ async fn fetch_latest(
             .filter(|p| p.enrichable)
             .cloned()
             .map(|package| {
-                let registry = registry.clone();
+                let registry = (*registry).clone();
                 let sem = sem.clone();
                 async move {
                     let _permit = sem.acquire().await.expect("semaphore closes only on drop");
@@ -719,7 +723,7 @@ async fn fetch_latest(
                         Err(error) => (
                             key,
                             (
-                                None,
+                                unknown_on_error.then(LatestVersions::unknown),
                                 vec![EnrichError {
                                     provider: "registry".to_owned(),
                                     message: error.to_string(),
