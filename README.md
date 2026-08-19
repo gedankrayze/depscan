@@ -68,6 +68,8 @@ SOURCE_DATE_EPOCH=1700000000 depscan scan . --format json --output depscan.json
 
 In that mode, equivalent scan results have canonical package, vulnerability, alias, fix, reference, suppression, and error ordering. An invalid or out-of-range epoch is a configuration error and exits with code `10`.
 
+The current JSON report schema is version `2`. Version `1` represented `results[].suppressed` as advisory-ID strings; version `2` intentionally replaces those strings with audit objects containing the complete vulnerability, whether the suppression was active, and every matching rule's ID/alias, CLI/config source, reason, expiry, and active/expired state. Consumers must branch on `schema_version`. Only matching suppression fields are emitted—other configuration values are never copied into a report.
+
 | Exit code | Meaning |
 |---:|---|
 | 0 | Completed without a finding at the configured failure thresholds. |
@@ -93,7 +95,7 @@ reason = "Documented exploitability assessment"
 expires = 2026-12-31
 ```
 
-Expired suppressions are not applied and are emitted as warnings. Repeated `--ignore <ID>` arguments are also supported for ephemeral CI suppression.
+Expired suppressions are not applied and are emitted as warnings and report metadata. Active suppressions remain visible in table, JSON, SARIF, and summary output but do not affect failure thresholds. Suppression reasons are intentionally included in reports for auditability, so they should not contain secrets. Repeated `--ignore <ID>` arguments are also supported for ephemeral CI suppression.
 
 Withdrawn OSV advisories are excluded by default, so they do not render, contribute to totals, or affect exit thresholds. `--include-withdrawn` retains them in the scan model; table, JSON, SARIF, and summary output then label and count them explicitly, and their severity participates in `--fail-on` like any other retained advisory.
 

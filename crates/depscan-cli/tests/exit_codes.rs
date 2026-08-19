@@ -97,20 +97,25 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
     }
 
     fn seed_vulnerability(&self) {
-        self.seed_vulnerability_record(false);
+        self.seed_vulnerability_record(false, &[]);
+    }
+
+    fn seed_vulnerability_with_aliases(&self, aliases: &[&str]) {
+        self.seed_vulnerability_record(false, aliases);
     }
 
     fn seed_withdrawn_vulnerability(&self) {
-        self.seed_vulnerability_record(true);
+        self.seed_vulnerability_record(true, &[]);
     }
 
-    fn seed_vulnerability_record(&self, withdrawn: bool) {
+    fn seed_vulnerability_record(&self, withdrawn: bool, aliases: &[&str]) {
         self.seed_cache("osv/query", QUERY_DIGEST, r#"["RUSTSEC-TEST"]"#);
         let withdrawn_field = if withdrawn {
             r#""withdrawn":"2026-08-19T00:00:00Z","#
         } else {
             ""
         };
+        let aliases = serde_json::to_string(aliases).expect("serialize aliases");
         self.seed_cache(
             "osv/vuln",
             VULNERABILITY_DIGEST,
@@ -119,7 +124,7 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
                 "id":"RUSTSEC-TEST",
                 {withdrawn_field}
                 "summary":"process-test vulnerability",
-                "aliases":[],
+                "aliases":{aliases},
                 "severity":[{{
                     "type":"CVSS_V3",
                     "score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
@@ -194,6 +199,15 @@ fn assert_report_only_on_stdout(output: &Output) {
         "unexpected stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn json_report(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout was not a JSON report: {error}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
 }
 
 fn assert_diagnostic_only_on_stderr(output: &Output, expected: &str) {
@@ -297,6 +311,152 @@ fn vulnerability_threshold_exits_one_and_writes_report_to_stdout() {
 
     assert_exit(&output, 1);
     assert_report_only_on_stdout(&output);
+}
+
+#[test]
+fn active_cli_and_config_suppressions_preserve_full_audit_metadata() {
+    let project = TestProject::rust("active-suppression-audit");
+    project.seed_clean("1.0.0");
+    project.seed_vulnerability_with_aliases(&["CVE-2099-0001"]);
+    let config = project.directory.path().join("policy.toml");
+    fs::write(
+        &config,
+        r#"[[ignore]]
+id = "CVE-2099-0001"
+reason = "accepted until the next release"
+expires = 2099-01-01
+"#,
+    )
+    .expect("write suppression policy");
+
+    let output = project.run_reproducible(
+        "1700000000",
+        &[
+            "scan",
+            "--format",
+            "json",
+            "--ignore",
+            "RUSTSEC-TEST",
+            "--ignore",
+            "RUSTSEC-TEST",
+            "--config",
+            config.to_str().expect("UTF-8 path"),
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty());
+    let report = json_report(&output);
+    assert_eq!(
+        report.pointer("/schema_version").and_then(|v| v.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        report
+            .pointer("/results/0/vulns")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        report
+            .pointer("/results/0/suppressed/0/vulnerability/id")
+            .and_then(|value| value.as_str()),
+        Some("RUSTSEC-TEST")
+    );
+    assert_eq!(
+        report
+            .pointer("/results/0/suppressed/0/active")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let matches = report
+        .pointer("/results/0/suppressed/0/matches")
+        .and_then(|value| value.as_array())
+        .expect("suppression matches");
+    assert_eq!(
+        matches.len(),
+        2,
+        "duplicate CLI rules must be canonicalized"
+    );
+    assert!(matches.iter().any(|matched| {
+        matched
+            .pointer("/matched_id")
+            .and_then(|value| value.as_str())
+            == Some("RUSTSEC-TEST")
+            && matched.pointer("/source").and_then(|value| value.as_str()) == Some("cli")
+    }));
+    assert!(matches.iter().any(|matched| {
+        matched
+            .pointer("/matched_id")
+            .and_then(|value| value.as_str())
+            == Some("CVE-2099-0001")
+            && matched.pointer("/source").and_then(|value| value.as_str()) == Some("config")
+            && matched.pointer("/reason").and_then(|value| value.as_str())
+                == Some("accepted until the next release")
+            && matched.pointer("/expires").and_then(|value| value.as_str()) == Some("2099-01-01")
+    }));
+}
+
+#[test]
+fn expired_suppression_is_loud_and_does_not_change_failure_status() {
+    let project = TestProject::rust("expired-suppression-audit");
+    project.seed_clean("1.0.0");
+    project.seed_vulnerability();
+    let config = project.directory.path().join("expired-policy.toml");
+    fs::write(
+        &config,
+        r#"[[ignore]]
+id = "RUSTSEC-TEST"
+reason = "temporary migration window"
+expires = 2020-01-01
+"#,
+    )
+    .expect("write expired suppression policy");
+
+    let output = project.run_reproducible(
+        "1700000000",
+        &[
+            "scan",
+            "--format",
+            "json",
+            "--config",
+            config.to_str().expect("UTF-8 path"),
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ],
+    );
+
+    assert_exit(&output, 1);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("ignore has expired and will not be applied")
+    );
+    let report = json_report(&output);
+    assert_eq!(
+        report
+            .pointer("/results/0/vulns/0/id")
+            .and_then(|value| value.as_str()),
+        Some("RUSTSEC-TEST")
+    );
+    assert_eq!(
+        report
+            .pointer("/results/0/suppressed/0/active")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        report
+            .pointer("/results/0/suppressed/0/matches/0/state")
+            .and_then(|value| value.as_str()),
+        Some("expired")
+    );
+    assert_eq!(
+        report
+            .pointer("/results/0/suppressed/0/matches/0/reason")
+            .and_then(|value| value.as_str()),
+        Some("temporary migration window")
+    );
 }
 
 #[test]

@@ -39,7 +39,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-018](DS-018.md) | P1 | Closed | Prevent sparse-index path panics on invalid crate names |
 | [DS-019](DS-019.md) | P1 | Closed | Implement the specified exit-code taxonomy |
 | [DS-020](DS-020.md) | P1 | Closed | Render included withdrawn advisories consistently |
-| [DS-021](DS-021.md) | P1 | Open | Preserve auditable suppression details |
+| [DS-021](DS-021.md) | P1 | Closed | Preserve auditable suppression details |
 | [DS-022](DS-022.md) | P1 | Open | Support the full CLI surface in configuration |
 | [DS-023](DS-023.md) | P1 | Open | Implement explicitly allowed Bun and dotnet tool fallbacks |
 | [DS-024](DS-024.md) | P1 | Open | Make workspace crates publishable |

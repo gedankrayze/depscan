@@ -1,6 +1,9 @@
 //! Stable report renderers for human terminals and CI integrations.
 
-use depscan_core::{LatestVersions, ScanDocument, ScanResult, Severity, Staleness};
+use depscan_core::{
+    LatestVersions, ScanDocument, ScanResult, Severity, Staleness, SuppressionMatch,
+    SuppressionSource, SuppressionState, Vulnerability,
+};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 
@@ -47,13 +50,14 @@ pub fn render(
 pub fn render_table(document: &ScanDocument, color: bool) -> String {
     let totals = Totals::from_document(document);
     let mut text = format!(
-        "depscan: {} packages scanned | {} vulnerable | {} withdrawn | {} outdated | {} yanked | {} suppressed | {} soft failures\n",
+        "depscan: {} packages scanned | {} vulnerable | {} withdrawn | {} outdated | {} yanked | {} suppressed | {} expired ignores | {} soft failures\n",
         totals.packages,
         totals.vulnerable,
         totals.withdrawn,
         totals.outdated,
         totals.yanked,
         totals.suppressed,
+        totals.expired_ignores,
         totals.errors
     );
     let mut grouped: BTreeMap<_, Vec<&ScanResult>> = BTreeMap::new();
@@ -105,6 +109,27 @@ pub fn render_table(document: &ScanDocument, color: bool) -> String {
                     "            {}\n",
                     vuln.summary.lines().next().unwrap_or("No summary supplied")
                 ));
+            }
+            for finding in &result.suppressed {
+                for matched in &finding.matches {
+                    let (raw_label, color_code, suffix) = match matched.state {
+                        SuppressionState::Active => ("SUPPRESS", 36, ""),
+                        SuppressionState::Expired => (
+                            "EXPIRED",
+                            31,
+                            "; expired rule did not suppress this finding",
+                        ),
+                    };
+                    let label = paint(raw_label, color_code, color);
+                    text.push_str(&format!(
+                        "  {label:>8}  {} {} → {} matched {} ({}){suffix}\n",
+                        result.package.display_name,
+                        result.package.version,
+                        finding.vulnerability.id,
+                        matched.matched_id,
+                        suppression_match_details(matched)
+                    ));
+                }
             }
             if let Some(latest) = &result.latest {
                 if latest.yanked {
@@ -200,6 +225,27 @@ fn paint(input: &str, code: u8, enabled: bool) -> String {
     }
 }
 
+fn suppression_source_label(source: SuppressionSource) -> &'static str {
+    match source {
+        SuppressionSource::Cli => "cli",
+        SuppressionSource::Config => "config",
+    }
+}
+
+fn suppression_match_details(matched: &SuppressionMatch) -> String {
+    let mut details = vec![format!(
+        "source: {}",
+        suppression_source_label(matched.source)
+    )];
+    if let Some(reason) = &matched.reason {
+        details.push(format!("reason: {reason}"));
+    }
+    if let Some(expires) = matched.expires {
+        details.push(format!("expires: {expires}"));
+    }
+    details.join(", ")
+}
+
 pub fn render_summary(document: &ScanDocument) -> String {
     let t = Totals::from_document(document);
     let mut severities = BTreeMap::<Severity, usize>::new();
@@ -234,7 +280,7 @@ pub fn render_summary(document: &ScanDocument) -> String {
         })
         .count();
     format!(
-        "depscan: {} packages | {} vulns{} | {} withdrawn | {} outdated ({} major, {} yanked) | {} suppressed\n",
+        "depscan: {} packages | {} vulns{} | {} withdrawn | {} outdated ({} major, {} yanked) | {} suppressed | {} expired ignores\n",
         t.packages,
         t.vulns,
         if detail.is_empty() {
@@ -246,7 +292,8 @@ pub fn render_summary(document: &ScanDocument) -> String {
         t.outdated,
         major,
         t.yanked,
-        t.suppressed
+        t.suppressed,
+        t.expired_ignores
     )
 }
 
@@ -255,13 +302,80 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
     let mut results = Vec::new();
     for result in &document.results {
         for vuln in &result.vulns {
-            rules.entry(vuln.id.clone()).or_insert_with(|| json!({"id": vuln.id, "shortDescription": {"text": vuln.summary}, "helpUri": vuln.references.first()}));
-            let withdrawn = if vuln.withdrawn {
-                " (withdrawn advisory)"
-            } else {
-                ""
-            };
-            results.push(json!({"ruleId": vuln.id, "level": vuln.severity.unwrap_or(Severity::Unknown).sarif_level(), "message": {"text": format!("{} {} is affected by {}{withdrawn}: {}", result.package.display_name, result.package.version, vuln.id, vuln.summary)}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": result.package.source_file.to_string_lossy()}}}], "properties": {"ecosystem": result.package.ecosystem.osv_name(), "package": result.package.name, "version": result.package.version, "fixed_in": vuln.fixed_in, "withdrawn": vuln.withdrawn}}));
+            insert_vulnerability_rule(&mut rules, vuln);
+            results.push(sarif_vulnerability_result(result, vuln));
+        }
+        for finding in &result.suppressed {
+            if finding.active {
+                insert_vulnerability_rule(&mut rules, &finding.vulnerability);
+                let mut sarif_result = sarif_vulnerability_result(result, &finding.vulnerability);
+                let active_matches = finding
+                    .matches
+                    .iter()
+                    .filter(|matched| matched.state == SuppressionState::Active)
+                    .collect::<Vec<_>>();
+                sarif_result
+                    .as_object_mut()
+                    .expect("result is an object")
+                    .insert(
+                        "suppressions".to_owned(),
+                        json!([{
+                            "kind": "external",
+                            "status": "accepted",
+                            "justification": active_matches
+                                .iter()
+                                .map(|matched| suppression_match_details(matched))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        }]),
+                    );
+                sarif_result
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                    .expect("result properties are an object")
+                    .extend([
+                        ("suppressed".to_owned(), json!(true)),
+                        ("suppression_matches".to_owned(), json!(finding.matches)),
+                    ]);
+                results.push(sarif_result);
+            }
+            for matched in finding
+                .matches
+                .iter()
+                .filter(|matched| matched.state == SuppressionState::Expired)
+            {
+                let rule_id = "DEPSCAN-EXPIRED-SUPPRESSION";
+                rules.entry(rule_id.to_owned()).or_insert_with(|| {
+                    json!({
+                        "id": rule_id,
+                        "shortDescription": {
+                            "text": "Expired dependency suppression no longer applies"
+                        }
+                    })
+                });
+                results.push(json!({
+                    "ruleId": rule_id,
+                    "level": "warning",
+                    "message": {"text": format!(
+                        "Expired suppression {} did not suppress {} {} affected by {} ({})",
+                        matched.matched_id,
+                        result.package.display_name,
+                        result.package.version,
+                        finding.vulnerability.id,
+                        suppression_match_details(matched)
+                    )},
+                    "locations": [{"physicalLocation": {"artifactLocation": {
+                        "uri": result.package.source_file.to_string_lossy()
+                    }}}],
+                    "properties": {
+                        "ecosystem": result.package.ecosystem.osv_name(),
+                        "package": result.package.name,
+                        "version": result.package.version,
+                        "vulnerability": finding.vulnerability.id,
+                        "suppression_match": matched
+                    }
+                }));
+            }
         }
         if let Some(latest) = &result.latest
             && latest.yanked
@@ -297,6 +411,45 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
     json!({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [{"tool": {"driver": {"name": "depscan", "informationUri": "https://github.com/gedankrayze/depscan", "rules": rules.into_values().collect::<Vec<_>>() }}, "results": results}]})
 }
 
+fn insert_vulnerability_rule(rules: &mut BTreeMap<String, Value>, vulnerability: &Vulnerability) {
+    rules.entry(vulnerability.id.clone()).or_insert_with(|| {
+        json!({
+            "id": vulnerability.id,
+            "shortDescription": {"text": vulnerability.summary},
+            "helpUri": vulnerability.references.first()
+        })
+    });
+}
+
+fn sarif_vulnerability_result(result: &ScanResult, vulnerability: &Vulnerability) -> Value {
+    let withdrawn = if vulnerability.withdrawn {
+        " (withdrawn advisory)"
+    } else {
+        ""
+    };
+    json!({
+        "ruleId": vulnerability.id,
+        "level": vulnerability.severity.unwrap_or(Severity::Unknown).sarif_level(),
+        "message": {"text": format!(
+            "{} {} is affected by {}{withdrawn}: {}",
+            result.package.display_name,
+            result.package.version,
+            vulnerability.id,
+            vulnerability.summary
+        )},
+        "locations": [{"physicalLocation": {"artifactLocation": {
+            "uri": result.package.source_file.to_string_lossy()
+        }}}],
+        "properties": {
+            "ecosystem": result.package.ecosystem.osv_name(),
+            "package": result.package.name,
+            "version": result.package.version,
+            "fixed_in": vulnerability.fixed_in,
+            "withdrawn": vulnerability.withdrawn
+        }
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct Totals {
     pub packages: usize,
@@ -306,6 +459,7 @@ pub struct Totals {
     pub outdated: usize,
     pub yanked: usize,
     pub suppressed: usize,
+    pub expired_ignores: usize,
     pub errors: usize,
 }
 impl Totals {
@@ -333,7 +487,19 @@ impl Totals {
             .iter()
             .filter(|result| result.latest.as_ref().is_some_and(|latest| latest.yanked))
             .count();
-        let suppressed = document.results.iter().map(|r| r.suppressed.len()).sum();
+        let suppressed = document
+            .results
+            .iter()
+            .flat_map(|result| result.suppressed.iter())
+            .filter(|finding| finding.active)
+            .count();
+        let expired_ignores = document
+            .results
+            .iter()
+            .flat_map(|result| result.suppressed.iter())
+            .flat_map(|finding| finding.matches.iter())
+            .filter(|matched| matched.state == SuppressionState::Expired)
+            .count();
         let errors = document.results.iter().map(|r| r.errors.len()).sum();
         Self {
             packages,
@@ -343,6 +509,7 @@ impl Totals {
             outdated,
             yanked,
             suppressed,
+            expired_ignores,
             errors,
         }
     }
@@ -351,7 +518,11 @@ impl Totals {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use depscan_core::{Ecosystem, LatestVersions, Package, ScanResult, Vulnerability};
+    use chrono::NaiveDate;
+    use depscan_core::{
+        Ecosystem, LatestVersions, Package, ScanResult, SuppressedFinding, SuppressionMatch,
+        SuppressionSource, SuppressionState, Vulnerability,
+    };
     use std::path::PathBuf;
 
     fn freshness_document(staleness: Staleness, yanked: bool) -> ScanDocument {
@@ -402,6 +573,59 @@ mod tests {
         }])
     }
 
+    fn suppression_document(active: bool) -> ScanDocument {
+        let vulnerability = Vulnerability {
+            id: "GHSA-SUPPRESSED".to_owned(),
+            aliases: vec!["CVE-2099-0001".to_owned()],
+            summary: "suppression fixture".to_owned(),
+            severity: Some(Severity::High),
+            cvss_score: Some(8.0),
+            fixed_in: vec!["1.1.0".to_owned()],
+            references: vec!["https://example.test/advisory".to_owned()],
+            withdrawn: false,
+        };
+        let mut matches = vec![SuppressionMatch {
+            matched_id: "CVE-2099-0001".to_owned(),
+            source: SuppressionSource::Config,
+            reason: Some("accepted until the next release".to_owned()),
+            expires: NaiveDate::from_ymd_opt(2099, 1, 1),
+            state: if active {
+                SuppressionState::Active
+            } else {
+                SuppressionState::Expired
+            },
+        }];
+        if active {
+            matches.push(SuppressionMatch {
+                matched_id: "GHSA-SUPPRESSED".to_owned(),
+                source: SuppressionSource::Config,
+                reason: Some("old exception".to_owned()),
+                expires: NaiveDate::from_ymd_opt(2020, 1, 1),
+                state: SuppressionState::Expired,
+            });
+        }
+        ScanDocument::new(vec![ScanResult {
+            package: Package::new(
+                Ecosystem::Npm,
+                "example",
+                "1.0.0",
+                PathBuf::from("package-lock.json"),
+            ),
+            vulns: if active {
+                vec![]
+            } else {
+                vec![vulnerability.clone()]
+            },
+            latest: None,
+            errors: vec![],
+            suppressed: vec![SuppressedFinding {
+                vulnerability,
+                active,
+                matches,
+            }],
+        }])
+    }
+
     #[test]
     fn emits_schema_version_json() {
         let doc = ScanDocument::new(vec![ScanResult {
@@ -419,7 +643,7 @@ mod tests {
         assert!(
             render(&doc, OutputFormat::Json, false)
                 .unwrap()
-                .contains("schema_version")
+                .contains("\"schema_version\": 2")
         );
     }
 
@@ -510,5 +734,58 @@ mod tests {
                 .contains("withdrawn advisory")
         );
         assert_eq!(Totals::from_document(&document).withdrawn, 0);
+    }
+
+    #[test]
+    fn active_suppression_is_auditable_in_every_format() {
+        let document = suppression_document(true);
+        let table = render(&document, OutputFormat::Table, false).unwrap();
+        let json = render(&document, OutputFormat::Json, false).unwrap();
+        let sarif = render(&document, OutputFormat::Sarif, false).unwrap();
+        let summary = render(&document, OutputFormat::Summary, false).unwrap();
+
+        assert!(table.contains("SUPPRESS"));
+        assert!(table.contains("EXPIRED"));
+        assert!(table.contains("accepted until the next release"));
+        assert!(table.contains("expired rule did not suppress this finding"));
+        assert!(json.contains("\"active\": true"));
+        assert!(json.contains("\"vulnerability\""));
+        assert!(json.contains("\"reason\": \"accepted until the next release\""));
+        assert!(json.contains("\"state\": \"expired\""));
+        assert!(sarif.contains("\"suppressions\""));
+        assert!(sarif.contains("\"status\": \"accepted\""));
+        assert!(sarif.contains("DEPSCAN-EXPIRED-SUPPRESSION"));
+        assert!(summary.contains("1 suppressed | 1 expired ignores"));
+
+        let totals = Totals::from_document(&document);
+        assert_eq!(totals.vulns, 0);
+        assert_eq!(totals.suppressed, 1);
+        assert_eq!(totals.expired_ignores, 1);
+    }
+
+    #[test]
+    fn expired_only_suppression_keeps_the_vulnerability_actionable() {
+        let document = suppression_document(false);
+        let table = render(&document, OutputFormat::Table, false).unwrap();
+        let sarif = render(&document, OutputFormat::Sarif, false).unwrap();
+        let summary = render(&document, OutputFormat::Summary, false).unwrap();
+
+        assert!(table.contains("HIGH"));
+        assert!(table.contains("EXPIRED"));
+        assert!(!table.contains("\n  SUPPRESS"));
+        assert_eq!(sarif.matches("\"ruleId\": \"GHSA-SUPPRESSED\"").count(), 1);
+        assert_eq!(
+            sarif
+                .matches("\"ruleId\": \"DEPSCAN-EXPIRED-SUPPRESSION\"")
+                .count(),
+            1
+        );
+        assert!(summary.contains("1 vulns (1 high)"));
+        assert!(summary.contains("0 suppressed | 1 expired ignores"));
+
+        let totals = Totals::from_document(&document);
+        assert_eq!(totals.vulns, 1);
+        assert_eq!(totals.suppressed, 0);
+        assert_eq!(totals.expired_ignores, 1);
     }
 }

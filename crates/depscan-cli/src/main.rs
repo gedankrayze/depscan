@@ -3,7 +3,8 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind
 use clap_complete::{generate, shells};
 use depscan_core::{
     Ecosystem, EnrichError, Package, ScanDocument, ScanResult, Severity, Staleness,
-    VersionProvider, VulnProvider,
+    SuppressedFinding, SuppressionMatch, SuppressionSource, SuppressionState, VersionProvider,
+    VulnProvider, Vulnerability,
 };
 use depscan_parsers::ParserSet;
 use depscan_providers::{
@@ -168,7 +169,39 @@ struct Config {
 struct IgnoreConfig {
     id: String,
     reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_date")]
     expires: Option<NaiveDate>,
+}
+
+fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<toml::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let raw = match value {
+        toml::Value::String(value) => value,
+        toml::Value::Datetime(value) => value.to_string(),
+        other => {
+            return Err(serde::de::Error::custom(format!(
+                "expected a TOML date or YYYY-MM-DD string, found {other}"
+            )));
+        }
+    };
+    NaiveDate::parse_from_str(&raw, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom(format!("invalid suppression expiry date {raw:?}")))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SuppressionRule {
+    id: String,
+    source: SuppressionSource,
+    reason: Option<String>,
+    expires: Option<NaiveDate>,
+    state: SuppressionState,
 }
 
 #[tokio::main]
@@ -254,18 +287,37 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
         .map_err(CliError::usage)?;
     let format = determine_format(&args).map_err(CliError::usage)?;
     validate_output_path(args.output.as_deref())?;
-    let cli_ignores: HashSet<String> = args.ignore.iter().cloned().collect();
-    let mut configured_ignores = HashSet::new();
+    let mut suppression_rules = args
+        .ignore
+        .iter()
+        .map(|id| SuppressionRule {
+            id: id.clone(),
+            source: SuppressionSource::Cli,
+            reason: None,
+            expires: None,
+            state: SuppressionState::Active,
+        })
+        .collect::<Vec<_>>();
     for ignored in config.ignores {
-        if ignored
+        let state = if ignored
             .expires
-            .is_some_and(|date| date < Utc::now().date_naive())
+            .is_some_and(|date| date < generated_at.date_naive())
         {
             warn!(id = %ignored.id, reason = ?ignored.reason, "ignore has expired and will not be applied");
+            SuppressionState::Expired
         } else {
-            configured_ignores.insert(ignored.id);
-        }
+            SuppressionState::Active
+        };
+        suppression_rules.push(SuppressionRule {
+            id: ignored.id,
+            source: SuppressionSource::Config,
+            reason: ignored.reason,
+            expires: ignored.expires,
+            state,
+        });
     }
+    suppression_rules.sort();
+    suppression_rules.dedup();
     let allowed = parse_ecosystems(&args.ecosystems).map_err(CliError::usage)?;
     let parsers = ParserSet::default();
     let sources = parsers.detect(&args.path, &allowed);
@@ -327,17 +379,19 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
         }
         let mut suppressed = Vec::new();
         vulns.retain(|v| {
-            let ignored = cli_ignores.contains(&v.id)
-                || configured_ignores.contains(&v.id)
-                || v.aliases
-                    .iter()
-                    .any(|id| cli_ignores.contains(id) || configured_ignores.contains(id));
-            if ignored {
-                suppressed.push(v.id.clone());
-                false
-            } else {
-                true
+            let matches = suppression_matches(v, &suppression_rules);
+            if matches.is_empty() {
+                return true;
             }
+            let active = matches
+                .iter()
+                .any(|matched| matched.state == SuppressionState::Active);
+            suppressed.push(SuppressedFinding {
+                vulnerability: v.clone(),
+                active,
+                matches,
+            });
+            !active
         });
         let (latest, errors) = freshness
             .get(&package.key())
@@ -370,6 +424,35 @@ async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
     } else {
         Ok(AppExit::Clean)
     }
+}
+
+fn suppression_matches(
+    vulnerability: &Vulnerability,
+    rules: &[SuppressionRule],
+) -> Vec<SuppressionMatch> {
+    let mut matches = rules
+        .iter()
+        .filter_map(|rule| {
+            let matched_id = if rule.id == vulnerability.id {
+                vulnerability.id.as_str()
+            } else {
+                vulnerability
+                    .aliases
+                    .iter()
+                    .find(|alias| alias.as_str() == rule.id)?
+            };
+            Some(SuppressionMatch {
+                matched_id: matched_id.to_owned(),
+                source: rule.source,
+                reason: rule.reason.clone(),
+                expires: rule.expires,
+                state: rule.state,
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    matches
 }
 
 fn scan_timestamp() -> Result<DateTime<Utc>, CliError> {

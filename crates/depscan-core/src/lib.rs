@@ -5,7 +5,7 @@ mod osv;
 pub use osv::{OsvAffectedEvaluation, OsvEvaluationError, evaluate_osv_affected};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use pep440_rs::Version as Pep440Version;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 #[serde(rename_all = "lowercase")]
@@ -203,6 +203,40 @@ pub struct Vulnerability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 #[serde(rename_all = "lowercase")]
+pub enum SuppressionSource {
+    Cli,
+    Config,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+pub enum SuppressionState {
+    Active,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
+pub struct SuppressionMatch {
+    /// The advisory ID or alias that matched the suppression rule.
+    pub matched_id: String,
+    pub source: SuppressionSource,
+    pub reason: Option<String>,
+    pub expires: Option<NaiveDate>,
+    pub state: SuppressionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SuppressedFinding {
+    /// The complete finding remains available for audit and machine-readable reports.
+    pub vulnerability: Vulnerability,
+    /// `true` when at least one active match removed this vulnerability from failure thresholds.
+    pub active: bool,
+    /// Every distinct matching rule, including expired and cross-source duplicates.
+    pub matches: Vec<SuppressionMatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
+#[serde(rename_all = "lowercase")]
 pub enum Staleness {
     Unknown,
     Current,
@@ -245,7 +279,7 @@ pub struct ScanResult {
     #[serde(default)]
     pub errors: Vec<EnrichError>,
     #[serde(default)]
-    pub suppressed: Vec<String>,
+    pub suppressed: Vec<SuppressedFinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,38 +300,24 @@ impl ScanDocument {
     pub fn at(mut results: Vec<ScanResult>, generated_at: DateTime<Utc>) -> Self {
         for result in &mut results {
             for vulnerability in &mut result.vulns {
-                vulnerability.aliases.sort();
-                vulnerability.aliases.dedup();
-                vulnerability.fixed_in.sort_by(|left, right| {
-                    compare_versions(result.package.ecosystem, left, right)
-                        .then_with(|| left.cmp(right))
-                });
-                vulnerability.fixed_in.dedup();
-                vulnerability.references.sort();
-                vulnerability.references.dedup();
+                canonicalize_vulnerability(vulnerability, result.package.ecosystem);
             }
-            result.vulns.sort_by(|left, right| {
-                left.id
-                    .cmp(&right.id)
-                    .then_with(|| left.withdrawn.cmp(&right.withdrawn))
-                    .then_with(|| left.severity.cmp(&right.severity))
-                    .then_with(|| match (left.cvss_score, right.cvss_score) {
-                        (Some(left), Some(right)) => left.total_cmp(&right),
-                        (None, Some(_)) => Ordering::Less,
-                        (Some(_), None) => Ordering::Greater,
-                        (None, None) => Ordering::Equal,
-                    })
-                    .then_with(|| left.summary.cmp(&right.summary))
-                    .then_with(|| left.aliases.cmp(&right.aliases))
-                    .then_with(|| left.fixed_in.cmp(&right.fixed_in))
-                    .then_with(|| left.references.cmp(&right.references))
-            });
+            result.vulns.sort_by(compare_vulnerabilities);
             result.errors.sort_by(|left, right| {
                 left.provider
                     .cmp(&right.provider)
                     .then_with(|| left.message.cmp(&right.message))
             });
-            result.suppressed.sort();
+            for finding in &mut result.suppressed {
+                canonicalize_vulnerability(&mut finding.vulnerability, result.package.ecosystem);
+                finding.matches.sort();
+                finding.matches.dedup();
+            }
+            result.suppressed.sort_by(|left, right| {
+                compare_vulnerabilities(&left.vulnerability, &right.vulnerability)
+                    .then_with(|| left.active.cmp(&right.active))
+                    .then_with(|| left.matches.cmp(&right.matches))
+            });
             result.suppressed.dedup();
         }
         results.sort_by(|left, right| {
@@ -324,6 +344,34 @@ impl ScanDocument {
             results,
         }
     }
+}
+
+fn canonicalize_vulnerability(vulnerability: &mut Vulnerability, ecosystem: Ecosystem) {
+    vulnerability.aliases.sort();
+    vulnerability.aliases.dedup();
+    vulnerability.fixed_in.sort_by(|left, right| {
+        compare_versions(ecosystem, left, right).then_with(|| left.cmp(right))
+    });
+    vulnerability.fixed_in.dedup();
+    vulnerability.references.sort();
+    vulnerability.references.dedup();
+}
+
+fn compare_vulnerabilities(left: &Vulnerability, right: &Vulnerability) -> Ordering {
+    left.id
+        .cmp(&right.id)
+        .then_with(|| left.withdrawn.cmp(&right.withdrawn))
+        .then_with(|| left.severity.cmp(&right.severity))
+        .then_with(|| match (left.cvss_score, right.cvss_score) {
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        })
+        .then_with(|| left.summary.cmp(&right.summary))
+        .then_with(|| left.aliases.cmp(&right.aliases))
+        .then_with(|| left.fixed_in.cmp(&right.fixed_in))
+        .then_with(|| left.references.cmp(&right.references))
 }
 
 #[derive(Debug, Error)]
@@ -609,6 +657,19 @@ mod tests {
     #[test]
     fn scan_document_uses_an_injected_clock_and_canonical_collection_order() {
         fn result(name: &str, aliases: &[&str]) -> ScanResult {
+            let vulnerability = Vulnerability {
+                id: format!("OSV-{name}"),
+                aliases: aliases.iter().map(|value| (*value).to_owned()).collect(),
+                summary: "fixture".to_owned(),
+                severity: Some(Severity::High),
+                cvss_score: Some(8.0),
+                fixed_in: vec!["1.2.0".to_owned(), "1.1.0".to_owned()],
+                references: vec![
+                    "https://b.example".to_owned(),
+                    "https://a.example".to_owned(),
+                ],
+                withdrawn: false,
+            };
             ScanResult {
                 package: Package::new(
                     Ecosystem::Npm,
@@ -616,19 +677,7 @@ mod tests {
                     "1.0.0",
                     PathBuf::from("package-lock.json"),
                 ),
-                vulns: vec![Vulnerability {
-                    id: format!("OSV-{name}"),
-                    aliases: aliases.iter().map(|value| (*value).to_owned()).collect(),
-                    summary: "fixture".to_owned(),
-                    severity: Some(Severity::High),
-                    cvss_score: Some(8.0),
-                    fixed_in: vec!["1.2.0".to_owned(), "1.1.0".to_owned()],
-                    references: vec![
-                        "https://b.example".to_owned(),
-                        "https://a.example".to_owned(),
-                    ],
-                    withdrawn: false,
-                }],
+                vulns: vec![vulnerability.clone()],
                 latest: None,
                 errors: vec![
                     EnrichError {
@@ -640,7 +689,26 @@ mod tests {
                         message: "first".to_owned(),
                     },
                 ],
-                suppressed: vec!["Z-SUPPRESSED".to_owned(), "A-SUPPRESSED".to_owned()],
+                suppressed: vec![SuppressedFinding {
+                    vulnerability,
+                    active: true,
+                    matches: vec![
+                        SuppressionMatch {
+                            matched_id: "Z-SUPPRESSED".to_owned(),
+                            source: SuppressionSource::Config,
+                            reason: Some("temporary exception".to_owned()),
+                            expires: NaiveDate::from_ymd_opt(2030, 1, 1),
+                            state: SuppressionState::Active,
+                        },
+                        SuppressionMatch {
+                            matched_id: "A-SUPPRESSED".to_owned(),
+                            source: SuppressionSource::Cli,
+                            reason: None,
+                            expires: None,
+                            state: SuppressionState::Active,
+                        },
+                    ],
+                }],
             }
         }
 
@@ -670,7 +738,11 @@ mod tests {
         assert_eq!(first.results[0].vulns[0].fixed_in, ["1.1.0", "1.2.0"]);
         assert_eq!(first.results[0].errors[0].provider, "a-provider");
         assert_eq!(
-            first.results[0].suppressed,
+            first.results[0].suppressed[0]
+                .matches
+                .iter()
+                .map(|matched| matched.matched_id.as_str())
+                .collect::<Vec<_>>(),
             ["A-SUPPRESSED", "Z-SUPPRESSED"]
         );
     }
