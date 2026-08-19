@@ -65,6 +65,7 @@ The supported report formats are `table`, `json`, `sarif`, and `summary`. When n
 | 0 | Completed without a finding at the configured failure thresholds. |
 | 1 | A vulnerability met `--fail-on`. |
 | 2 | An update met `--fail-on-outdated`, and no vulnerability exit was required. |
+| 10 | Command usage or configuration is invalid. |
 | 20 | No supported dependency source was detected. |
 | 30 | A provider or scan operation failed. |
 

@@ -1,5 +1,5 @@
 use chrono::{NaiveDate, Utc};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::{generate, shells};
 use depscan_core::{
     Ecosystem, EnrichError, Package, ScanDocument, ScanResult, Severity, Staleness,
@@ -21,6 +21,48 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum AppExit {
+    Clean = 0,
+    Vulnerabilities = 1,
+    Outdated = 2,
+}
+
+impl From<AppExit> for ExitCode {
+    fn from(value: AppExit) -> Self {
+        ExitCode::from(value as u8)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    #[error("usage/config error: {0}")]
+    Usage(String),
+    #[error("no supported project detected at {0}")]
+    NoSupportedProject(PathBuf),
+    #[error("provider hard failure: {0}")]
+    Provider(String),
+}
+
+impl CliError {
+    fn usage(message: impl Into<String>) -> Self {
+        Self::Usage(message.into())
+    }
+
+    fn provider(error: impl ToString) -> Self {
+        Self::Provider(error.to_string())
+    }
+
+    fn exit_code(&self) -> ExitCode {
+        ExitCode::from(match self {
+            Self::Usage(_) => 10,
+            Self::NoSupportedProject(_) => 20,
+            Self::Provider(_) => 30,
+        })
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -127,7 +169,21 @@ struct IgnoreConfig {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(parse_error) => {
+            let informational = matches!(
+                parse_error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            );
+            let _ = parse_error.print();
+            return if informational {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(10)
+            };
+        }
+    };
     let level = match &cli.command {
         Some(Command::Scan(args)) => log_level(args),
         None => log_level(&cli.default_scan),
@@ -143,16 +199,15 @@ async fn main() -> ExitCode {
         Some(Command::Cache(args)) => cache_command(args),
         Some(Command::Completions { shell }) => {
             completions(shell);
-            Ok(0)
+            Ok(AppExit::Clean)
         }
         None => scan(cli.default_scan).await,
     };
     match code {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(value) => ExitCode::from(value as u8),
+        Ok(exit) => exit.into(),
         Err(error) => {
             error!("{error}");
-            ExitCode::from(30)
+            error.exit_code()
         }
     }
 }
@@ -166,9 +221,12 @@ fn log_level(args: &ScanArgs) -> &'static str {
     }
 }
 
-async fn scan(args: ScanArgs) -> Result<i32, String> {
+async fn scan(args: ScanArgs) -> Result<AppExit, CliError> {
     if !args.path.is_dir() {
-        return Err(format!("{} is not a directory", args.path.display()));
+        return Err(CliError::usage(format!(
+            "{} is not a directory",
+            args.path.display()
+        )));
     }
     let config = load_config(&args.path, args.config.as_deref())?;
     let fail_on = args
@@ -181,8 +239,16 @@ async fn scan(args: ScanArgs) -> Result<i32, String> {
         .as_deref()
         .or(config.fail_on_outdated.as_deref())
         .unwrap_or("never");
-    validate_threshold(fail_on, true)?;
-    validate_threshold(fail_outdated, false)?;
+    validate_threshold(fail_on, true).map_err(CliError::usage)?;
+    validate_threshold(fail_outdated, false).map_err(CliError::usage)?;
+    let max_cache_age = args
+        .max_cache_age
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(CliError::usage)?;
+    let format = determine_format(&args).map_err(CliError::usage)?;
+    validate_output_path(args.output.as_deref())?;
     let cli_ignores: HashSet<String> = args.ignore.iter().cloned().collect();
     let mut configured_ignores = HashSet::new();
     for ignored in config.ignores {
@@ -195,11 +261,11 @@ async fn scan(args: ScanArgs) -> Result<i32, String> {
             configured_ignores.insert(ignored.id);
         }
     }
-    let allowed = parse_ecosystems(&args.ecosystems)?;
+    let allowed = parse_ecosystems(&args.ecosystems).map_err(CliError::usage)?;
     let parsers = ParserSet::default();
     let sources = parsers.detect(&args.path, &allowed);
     if sources.is_empty() {
-        return Ok(20);
+        return Err(CliError::NoSupportedProject(args.path));
     }
     let mut packages = Vec::new();
     for source in sources {
@@ -214,34 +280,30 @@ async fn scan(args: ScanArgs) -> Result<i32, String> {
                     error
                 );
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(CliError::usage(error.to_string())),
         }
     }
     packages.retain(|p| (!args.no_dev || !p.dev) && (!args.direct_only || p.direct));
     packages = dedup_packages(packages);
     if packages.is_empty() {
-        return Ok(20);
+        return Err(CliError::NoSupportedProject(args.path));
     }
     let cache = Cache::new(CachePolicy {
         read: !args.no_cache,
-        max_age: args
-            .max_cache_age
-            .as_deref()
-            .map(parse_duration)
-            .transpose()?,
+        max_age: max_cache_age,
     })
-    .map_err(|e| e.to_string())?;
-    let http = HttpClient::new().map_err(|e| e.to_string())?;
+    .map_err(CliError::provider)?;
+    let http = HttpClient::new().map_err(CliError::provider)?;
     let vulnerabilities = if args.offline {
         OsvOffline::new(cache.clone())
             .query(&packages)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(CliError::provider)?
     } else {
         OsvClient::new(http.clone(), cache.clone())
             .query(&packages)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(CliError::provider)?
     };
     let registry = RegistryClient::new(http, cache);
     let freshness = if args.offline {
@@ -285,22 +347,23 @@ async fn scan(args: ScanArgs) -> Result<i32, String> {
         });
     }
     let document = ScanDocument::new(results);
-    let format = determine_format(&args)?;
     let use_color = matches!(format, OutputFormat::Table)
         && std::env::var_os("NO_COLOR").is_none()
         && args.output.is_none();
-    let content = render(&document, format, use_color).map_err(|e| e.to_string())?;
+    let content = render(&document, format, use_color)
+        .map_err(|e| CliError::usage(format!("rendering report: {e}")))?;
     if let Some(path) = args.output {
-        fs::write(&path, content).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        fs::write(&path, content)
+            .map_err(|e| CliError::usage(format!("writing {}: {e}", path.display())))?;
     } else {
         print!("{content}");
     }
     if has_vulnerability_failure(&document, fail_on) {
-        Ok(1)
+        Ok(AppExit::Vulnerabilities)
     } else if has_outdated_failure(&document, fail_outdated) {
-        Ok(2)
+        Ok(AppExit::Outdated)
     } else {
-        Ok(0)
+        Ok(AppExit::Clean)
     }
 }
 
@@ -341,16 +404,24 @@ async fn fetch_latest(
     .await
 }
 
-fn load_config(root: &Path, explicit: Option<&Path>) -> Result<Config, String> {
+fn load_config(root: &Path, explicit: Option<&Path>) -> Result<Config, CliError> {
     let path = explicit
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.join("depscan.toml"));
     if !path.exists() {
-        return Ok(Config::default());
+        return if explicit.is_some() {
+            Err(CliError::usage(format!(
+                "config {} does not exist",
+                path.display()
+            )))
+        } else {
+            Ok(Config::default())
+        };
     }
-    let text =
-        fs::read_to_string(&path).map_err(|e| format!("reading config {}: {e}", path.display()))?;
-    toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", path.display()))
+    let text = fs::read_to_string(&path)
+        .map_err(|e| CliError::usage(format!("reading config {}: {e}", path.display())))?;
+    toml::from_str(&text)
+        .map_err(|e| CliError::usage(format!("invalid config {}: {e}", path.display())))
 }
 fn parse_ecosystems(values: &[String]) -> Result<HashSet<Ecosystem>, String> {
     values
@@ -401,6 +472,28 @@ fn determine_format(args: &ScanArgs) -> Result<OutputFormat, String> {
         })
         .ok_or_else(|| "could not infer output format".to_owned())
 }
+fn validate_output_path(path: Option<&Path>) -> Result<(), CliError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if path.is_dir() {
+        return Err(CliError::usage(format!(
+            "output {} is a directory",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.is_dir()
+    {
+        return Err(CliError::usage(format!(
+            "output directory {} does not exist or is not a directory",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
 fn has_vulnerability_failure(document: &ScanDocument, threshold: &str) -> bool {
     let min = match threshold {
         "never" => return false,
@@ -437,31 +530,31 @@ fn dedup_packages(mut packages: Vec<Package>) -> Vec<Package> {
     packages
 }
 
-async fn sync(args: SyncArgs) -> Result<i32, String> {
-    let ecosystems = parse_ecosystems(&args.ecosystems)?;
+async fn sync(args: SyncArgs) -> Result<AppExit, CliError> {
+    let ecosystems = parse_ecosystems(&args.ecosystems).map_err(CliError::usage)?;
     let cache = Cache::new(CachePolicy {
         read: !args.no_cache,
         max_age: None,
     })
-    .map_err(|e| e.to_string())?;
-    let http = HttpClient::new().map_err(|e| e.to_string())?;
+    .map_err(CliError::provider)?;
+    let http = HttpClient::new().map_err(CliError::provider)?;
     let paths = sync_osv_dumps(&http, &cache, &ecosystems.into_iter().collect::<Vec<_>>())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(CliError::provider)?;
     for path in paths {
         println!("synced {}", path.display());
     }
-    Ok(0)
+    Ok(AppExit::Clean)
 }
-fn cache_command(args: CacheArgs) -> Result<i32, String> {
-    let cache = Cache::new(CachePolicy::default()).map_err(|e| e.to_string())?;
+fn cache_command(args: CacheArgs) -> Result<AppExit, CliError> {
+    let cache = Cache::new(CachePolicy::default()).map_err(CliError::provider)?;
     match args.command {
         CacheCommand::Clear => {
-            cache.clear().map_err(|e| e.to_string())?;
+            cache.clear().map_err(CliError::provider)?;
             println!("cache cleared: {}", cache.root().display());
         }
         CacheCommand::Stats => {
-            let stats = cache.stats().map_err(|e| e.to_string())?;
+            let stats = cache.stats().map_err(CliError::provider)?;
             println!(
                 "cache: {} files, {} bytes ({})",
                 stats.files,
@@ -471,7 +564,7 @@ fn cache_command(args: CacheArgs) -> Result<i32, String> {
         }
         CacheCommand::Path => println!("{}", cache.root().display()),
     }
-    Ok(0)
+    Ok(AppExit::Clean)
 }
 fn completions(shell: CompletionShell) {
     let mut command = Cli::command();
