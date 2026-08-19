@@ -40,6 +40,52 @@ const USER_AGENT_VALUE: &str = concat!(
 const OSV_QUERY_TTL_SECS: i64 = 60 * 60;
 const REGISTRY_TTL_SECS: i64 = 6 * 60 * 60;
 
+fn osv_query_name(package: &Package) -> &str {
+    match package.ecosystem {
+        Ecosystem::NuGet => &package.display_name,
+        _ => &package.name,
+    }
+}
+
+fn osv_query_cache_key(package: &Package) -> String {
+    format!(
+        "{}:{}:{}",
+        package.ecosystem.osv_name(),
+        osv_query_name(package),
+        package.version
+    )
+}
+
+fn osv_query_body(packages: &[Package]) -> Value {
+    json!({
+        "queries": packages
+            .iter()
+            .map(|package| json!({
+                "package": {
+                    "name": osv_query_name(package),
+                    "ecosystem": package.ecosystem.osv_name()
+                },
+                "version": package.version
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn package_name_matches(package: &Package, candidate: &str) -> bool {
+    normalize_name(package.ecosystem, candidate) == package.name
+}
+
+fn nuget_registry_cache_key(package: &Package) -> String {
+    format!("nuget:{}", package.name)
+}
+
+fn nuget_registry_url(package: &Package) -> String {
+    format!(
+        "https://api.nuget.org/v3-flatcontainer/{}/index.json",
+        encode(&package.name)
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CachePolicy {
     pub read: bool,
@@ -275,21 +321,25 @@ pub struct OsvClient {
     http: HttpClient,
     cache: Cache,
     concurrency: Arc<Semaphore>,
+    base_url: String,
 }
 impl OsvClient {
     pub fn new(http: HttpClient, cache: Cache) -> Self {
+        Self::with_base_url(http, cache, "https://api.osv.dev")
+    }
+
+    fn with_base_url(http: HttpClient, cache: Cache, base_url: impl Into<String>) -> Self {
         Self {
             http,
             cache,
             concurrency: Arc::new(Semaphore::new(16)),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
         }
     }
     async fn query_batch(&self, batch: &[Package]) -> Result<Vec<Vec<String>>, ProviderError> {
-        let body = json!({"queries": batch.iter().map(|p| json!({"package":{"name":p.name,"ecosystem":p.ecosystem.osv_name()},"version":p.version})).collect::<Vec<_>>()});
-        let response = self
-            .http
-            .post_json("https://api.osv.dev/v1/querybatch", body)
-            .await?;
+        let body = osv_query_body(batch);
+        let url = format!("{}/v1/querybatch", self.base_url);
+        let response = self.http.post_json(&url, body).await?;
         Ok(response
             .get("results")
             .and_then(Value::as_array)
@@ -321,7 +371,7 @@ impl OsvClient {
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = format!("https://api.osv.dev/v1/vulns/{id}");
+        let url = format!("{}/v1/vulns/{id}", self.base_url);
         let (value, etag) = self.http.get_json(&url, HeaderMap::new()).await?;
         self.cache.put("osv/vuln", id, &value, etag)?;
         Ok(value)
@@ -336,9 +386,10 @@ impl VulnProvider for OsvClient {
             .iter()
             .filter(|p| p.enrichable && !p.resolved_from_range)
         {
+            let query_cache_key = osv_query_cache_key(package);
             if let Some((cached, _)) = self.cache.get(
                 "osv/query",
-                &package.key(),
+                &query_cache_key,
                 Duration::seconds(OSV_QUERY_TTL_SECS),
             ) {
                 let ids: Vec<String> = cached
@@ -372,8 +423,12 @@ impl VulnProvider for OsvClient {
         for chunk in missing.chunks(1000) {
             let lists = self.query_batch(chunk).await?;
             for (package, ids) in chunk.iter().cloned().zip(lists) {
-                self.cache
-                    .put("osv/query", &package.key(), &json!(ids), None)?;
+                self.cache.put(
+                    "osv/query",
+                    &osv_query_cache_key(&package),
+                    &json!(ids),
+                    None,
+                )?;
                 map.insert(
                     package.key(),
                     ids.into_iter()
@@ -613,7 +668,7 @@ impl OsvOffline {
                             .get("package")
                             .and_then(|x| x.get("name"))
                             .and_then(Value::as_str)
-                            == Some(package.name.as_str())
+                            .is_some_and(|name| package_name_matches(package, name))
                             && item
                                 .get("package")
                                 .and_then(|x| x.get("ecosystem"))
@@ -807,13 +862,9 @@ impl RegistryClient {
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = format!(
-            "https://api.nuget.org/v3-flatcontainer/{}/index.json",
-            encode(&p.name)
-        );
-        let data = self
-            .metadata(&format!("nuget:{}", p.name), &url, HeaderMap::new())
-            .await?;
+        let url = nuget_registry_url(p);
+        let cache_key = nuget_registry_cache_key(p);
+        let data = self.metadata(&cache_key, &url, HeaderMap::new()).await?;
         let latest = maximum_version(
             Ecosystem::NuGet,
             data.get("versions")
@@ -948,6 +999,21 @@ impl RegistryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use wiremock::{
+        matchers::{body_json, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    use zip::write::SimpleFileOptions;
+
+    fn nuget_package(name: &str) -> Package {
+        Package::new(
+            Ecosystem::NuGet,
+            name,
+            "12.0.1",
+            PathBuf::from("packages.lock.json"),
+        )
+    }
 
     #[test]
     fn scores_supported_cvss_versions_with_standard_formulas() {
@@ -1124,5 +1190,149 @@ mod tests {
             _ => format!("{}/{}/{}", &"serde"[0..2], &"serde"[2..4], "serde"),
         };
         assert_eq!(path, "se/rd/serde");
+    }
+
+    #[test]
+    fn osv_query_preserves_nuget_display_case() {
+        let package = nuget_package("Newtonsoft.Json");
+
+        let body = osv_query_body(&[package]);
+
+        assert_eq!(
+            body.pointer("/queries/0/package/name")
+                .and_then(Value::as_str),
+            Some("Newtonsoft.Json")
+        );
+        assert_eq!(
+            body.pointer("/queries/0/package/ecosystem")
+                .and_then(Value::as_str),
+            Some("NuGet")
+        );
+    }
+
+    #[tokio::test]
+    async fn online_osv_query_uses_canonical_nuget_case() {
+        let server = MockServer::start().await;
+        let package = nuget_package("Newtonsoft.Json");
+        let expected_body = json!({
+            "queries": [{
+                "package": {
+                    "name": "Newtonsoft.Json",
+                    "ecosystem": "NuGet"
+                },
+                "version": "12.0.1"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [{"id": "GHSA-5crp-9r3c-p9vr"}]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache, server.uri());
+
+        let results = client.query_batch(&[package]).await.unwrap();
+
+        assert_eq!(results, vec![vec!["GHSA-5crp-9r3c-p9vr".to_owned()]]);
+    }
+
+    #[test]
+    fn osv_cache_key_tracks_case_sensitive_request_not_package_identity() {
+        let canonical = nuget_package("Newtonsoft.Json");
+        let lowercase = nuget_package("newtonsoft.json");
+
+        assert_eq!(canonical.key(), lowercase.key());
+        assert_eq!(
+            osv_query_cache_key(&canonical),
+            "NuGet:Newtonsoft.Json:12.0.1"
+        );
+        assert_ne!(
+            osv_query_cache_key(&canonical),
+            osv_query_cache_key(&lowercase)
+        );
+    }
+
+    #[test]
+    fn nuget_registry_coordinates_stay_lowercase() {
+        let canonical = nuget_package("Newtonsoft.Json");
+        let uppercase = nuget_package("NEWTONSOFT.JSON");
+
+        assert_eq!(
+            nuget_registry_url(&canonical),
+            "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json"
+        );
+        assert_eq!(
+            nuget_registry_url(&canonical),
+            nuget_registry_url(&uppercase)
+        );
+        assert_eq!(
+            nuget_registry_cache_key(&canonical),
+            "nuget:newtonsoft.json"
+        );
+        assert_eq!(
+            nuget_registry_cache_key(&canonical),
+            nuget_registry_cache_key(&uppercase)
+        );
+    }
+
+    #[test]
+    fn offline_nuget_matching_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let offline_dir = dir.path().join("offline");
+        fs::create_dir_all(&offline_dir).unwrap();
+        let archive_path = offline_dir.join("NuGet.zip");
+        let file = File::create(archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file("GHSA-5crp-9r3c-p9vr.json", SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(
+                serde_json::to_string(&json!({
+                    "id": "GHSA-5crp-9r3c-p9vr",
+                    "summary": "test advisory",
+                    "affected": [{
+                        "package": {
+                            "ecosystem": "NuGet",
+                            "name": "Newtonsoft.Json"
+                        },
+                        "ranges": [{
+                            "type": "ECOSYSTEM",
+                            "events": [
+                                {"introduced": "0"},
+                                {"fixed": "13.0.1"}
+                            ]
+                        }]
+                    }]
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+        archive.finish().unwrap();
+
+        let cache = Cache {
+            root: dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let provider = OsvOffline::new(cache);
+        let package = nuget_package("newtonsoft.json");
+
+        let result = provider
+            .query_blocking(std::slice::from_ref(&package))
+            .unwrap();
+
+        assert_eq!(result[&package.key()].len(), 1);
+        assert_eq!(result[&package.key()][0].id, "GHSA-5crp-9r3c-p9vr");
     }
 }

@@ -15,6 +15,19 @@
 
 Resolved lockfile versions are preferred. Manifest-only records are marked as range-derived, because they are not an installed dependency resolution.
 
+## Package identity and provider names
+
+Package identity and provider request spelling are related but not always identical:
+
+| Ecosystem | Internal identity | OSV query name | Registry request name |
+|---|---|---|---|
+| npm | Source spelling | Source spelling | Source spelling |
+| PyPI | PEP 503 normalized | PEP 503 normalized | PEP 503 normalized |
+| NuGet | Lowercase, case-insensitive | Source-preserved casing | Lowercase flat-container ID |
+| crates.io | Source spelling | Source spelling | Validated crate name |
+
+NuGet's split is intentional: its package identity and flat-container endpoint are case-insensitive, while OSV currently requires the advisory's canonical/source casing for some records. Human output retains the spelling read from the project file.
+
 ## Installation
 
 A current stable Rust toolchain is sufficient during development:

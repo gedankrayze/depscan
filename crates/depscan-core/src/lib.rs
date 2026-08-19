@@ -80,9 +80,9 @@ pub struct DetectedSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
     pub ecosystem: Ecosystem,
-    /// Canonical name used for API lookups.
+    /// Normalized package identity, also suitable for registry lookups.
     pub name: String,
-    /// Original casing, retained for human output when applicable.
+    /// Source-preserved spelling used for display and case-sensitive provider lookups.
     pub display_name: String,
     /// A resolved version, or a range in manifest-only mode.
     pub version: String,
@@ -507,6 +507,7 @@ pub fn osv_fixed_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn normalizes_pypi_names() {
         assert_eq!(
@@ -514,6 +515,28 @@ mod tests {
             "my-package-name"
         );
     }
+
+    #[test]
+    fn nuget_identity_is_case_insensitive_but_display_case_is_preserved() {
+        let canonical = Package::new(
+            Ecosystem::NuGet,
+            "Newtonsoft.Json",
+            "12.0.1",
+            PathBuf::from("packages.lock.json"),
+        );
+        let lowercase = Package::new(
+            Ecosystem::NuGet,
+            "newtonsoft.json",
+            "12.0.1",
+            PathBuf::from("packages.lock.json"),
+        );
+
+        assert_eq!(canonical.name, "newtonsoft.json");
+        assert_eq!(canonical.display_name, "Newtonsoft.Json");
+        assert_eq!(canonical.key(), lowercase.key());
+        assert_eq!(canonical.key(), "NuGet:newtonsoft.json:12.0.1");
+    }
+
     #[test]
     fn classifies_semver() {
         assert_eq!(

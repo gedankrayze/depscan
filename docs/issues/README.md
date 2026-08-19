@@ -21,7 +21,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 |---|---|---|---|
 | [DS-001](DS-001.md) | P1 | Open | Repository hygiene and branch governance |
 | [DS-002](DS-002.md) | P0 | Closed | Replace approximate CVSS scoring |
-| [DS-003](DS-003.md) | P0 | Open | Preserve canonical NuGet names for OSV |
+| [DS-003](DS-003.md) | P0 | Closed | Preserve canonical NuGet names for OSV |
 | [DS-004](DS-004.md) | P0 | Open | Use standards-compliant PEP 440 ordering |
 | [DS-005](DS-005.md) | P0 | Open | Correct shared OSV range evaluation and fix extraction |
 | [DS-006](DS-006.md) | P0 | Open | Remove vulnerable `quick-xml` release |
