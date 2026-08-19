@@ -25,7 +25,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, SystemTime},
 };
 use tempfile::{Builder as TempFileBuilder, TempPath};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -53,13 +53,17 @@ const CACHE_SENTINEL_SCHEMA_VERSION: u32 = 1;
 const CACHE_SENTINEL_OWNER: &str = "depscan";
 const CACHE_CONTENT_DIRECTORIES: [&str; 3] = ["offline", "osv", "registry"];
 const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const HTTP_MAX_RETRIES: usize = 3;
+const HTTP_ATTEMPTS: usize = HTTP_MAX_RETRIES + 1;
+const HTTP_BACKOFF_BASE: StdDuration = StdDuration::from_millis(200);
+const HTTP_MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
 const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
 const OSV_DUMP_TRANSFER_TIMEOUT: StdDuration = StdDuration::from_secs(15 * 60);
 const OSV_DUMP_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const OSV_DUMP_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const OSV_DUMP_MAX_UNCOMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const OSV_DUMP_MAX_ENTRIES: usize = 2_000_000;
-const OSV_DUMP_ATTEMPTS: usize = 3;
+const OSV_DUMP_ATTEMPTS: usize = HTTP_ATTEMPTS;
 const OSV_DUMP_BACKOFF_BASE: StdDuration = StdDuration::from_millis(200);
 const OSV_DUMP_MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
 const OSV_DUMP_PROGRESS_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -843,6 +847,7 @@ pub struct CacheStats {
     pub bytes: u64,
 }
 
+#[derive(Debug)]
 enum Revalidated<T> {
     Modified { value: T, etag: Option<String> },
     NotModified { etag: Option<String> },
@@ -853,10 +858,140 @@ struct PublishedHydration {
     reusable: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RetrySettings {
+    attempts: usize,
+    backoff_base: StdDuration,
+    max_delay: StdDuration,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            attempts: HTTP_ATTEMPTS,
+            backoff_base: HTTP_BACKOFF_BASE,
+            max_delay: HTTP_MAX_RETRY_DELAY,
+        }
+    }
+}
+
+#[async_trait]
+trait RetryRuntime: Send + Sync {
+    fn now(&self) -> SystemTime;
+    fn jitter(&self, upper_bound: StdDuration) -> StdDuration;
+    async fn sleep(&self, duration: StdDuration);
+}
+
+struct SystemRetryRuntime;
+
+#[async_trait]
+impl RetryRuntime for SystemRetryRuntime {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn jitter(&self, upper_bound: StdDuration) -> StdDuration {
+        let upper_millis = u64::try_from(upper_bound.as_millis()).unwrap_or(u64::MAX);
+        StdDuration::from_millis(rand::rng().random_range(0..=upper_millis))
+    }
+
+    async fn sleep(&self, duration: StdDuration) {
+        sleep(duration).await;
+    }
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn retryable_transport(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+fn request_context(method: &reqwest::Method, url: &str) -> String {
+    let Ok(mut sanitized) = reqwest::Url::parse(url) else {
+        return format!("{method} <invalid URL>");
+    };
+    let _ = sanitized.set_username("");
+    let _ = sanitized.set_password(None);
+    sanitized.set_query(None);
+    sanitized.set_fragment(None);
+    format!("{method} {sanitized}")
+}
+
+fn network_attempt_error(
+    context: &str,
+    detail: &str,
+    attempt: usize,
+    attempts: usize,
+) -> ProviderError {
+    ProviderError::Network(format!(
+        "{context}: {detail} (attempt {attempt}/{attempts})"
+    ))
+}
+
+fn transport_attempt_error(
+    context: &str,
+    error: &reqwest::Error,
+    attempt: usize,
+    attempts: usize,
+) -> ProviderError {
+    let detail = if error.is_timeout() {
+        "request timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_builder() {
+        "request could not be built"
+    } else {
+        "request failed"
+    };
+    network_attempt_error(context, detail, attempt, attempts)
+}
+
+fn retry_after_delay(
+    headers: &HeaderMap,
+    now: SystemTime,
+    cap: StdDuration,
+) -> Option<StdDuration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let delay = if let Ok(seconds) = value.parse::<u64>() {
+        StdDuration::from_secs(seconds)
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(now)
+            .unwrap_or(StdDuration::ZERO)
+    };
+    Some(std::cmp::min(delay, cap))
+}
+
+fn retry_backoff(
+    settings: RetrySettings,
+    retry_index: usize,
+    runtime: &dyn RetryRuntime,
+) -> StdDuration {
+    let multiplier = 1u32
+        .checked_shl(retry_index.min(31) as u32)
+        .unwrap_or(u32::MAX);
+    let base = std::cmp::min(
+        settings.backoff_base.saturating_mul(multiplier),
+        settings.max_delay,
+    );
+    let jitter_bound_millis = u64::try_from(base.as_millis() / 4).unwrap_or(u64::MAX);
+    let jitter_bound = std::cmp::min(
+        StdDuration::from_millis(jitter_bound_millis),
+        settings.max_delay.saturating_sub(base),
+    );
+    let jitter = std::cmp::min(runtime.jitter(jitter_bound), jitter_bound);
+    base.saturating_add(jitter)
+}
+
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Client,
     request_timeout: StdDuration,
+    retry_runtime: Arc<dyn RetryRuntime>,
+    retry_settings: RetrySettings,
 }
 impl HttpClient {
     pub fn new() -> Result<Self, ProviderError> {
@@ -866,6 +1001,20 @@ impl HttpClient {
     fn with_timeouts(
         request_timeout: StdDuration,
         network_idle_timeout: StdDuration,
+    ) -> Result<Self, ProviderError> {
+        Self::with_retry_runtime(
+            request_timeout,
+            network_idle_timeout,
+            RetrySettings::default(),
+            Arc::new(SystemRetryRuntime),
+        )
+    }
+
+    fn with_retry_runtime(
+        request_timeout: StdDuration,
+        network_idle_timeout: StdDuration,
+        retry_settings: RetrySettings,
+        retry_runtime: Arc<dyn RetryRuntime>,
     ) -> Result<Self, ProviderError> {
         let client = Client::builder()
             .user_agent(USER_AGENT_VALUE)
@@ -878,8 +1027,22 @@ impl HttpClient {
         Ok(Self {
             inner: client,
             request_timeout,
+            retry_runtime,
+            retry_settings,
         })
     }
+
+    async fn wait_before_retry(
+        &self,
+        retry_after: Option<StdDuration>,
+        retry_index: usize,
+        settings: RetrySettings,
+    ) {
+        let delay = retry_after
+            .unwrap_or_else(|| retry_backoff(settings, retry_index, self.retry_runtime.as_ref()));
+        self.retry_runtime.sleep(delay).await;
+    }
+
     async fn request_json(
         &self,
         method: reqwest::Method,
@@ -887,8 +1050,10 @@ impl HttpClient {
         body: Option<Value>,
         headers: HeaderMap,
     ) -> Result<Revalidated<Value>, ProviderError> {
-        let mut last_error = String::new();
-        for attempt in 0..3 {
+        let settings = self.retry_settings;
+        let context = request_context(&method, url);
+        for attempt_index in 0..settings.attempts {
+            let attempt = attempt_index + 1;
             let mut request = self
                 .inner
                 .request(method.clone(), url)
@@ -912,37 +1077,59 @@ impl HttpClient {
                         .get(ETAG)
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_owned);
-                    let value = response
-                        .json::<Value>()
-                        .await
-                        .map_err(|e| ProviderError::InvalidResponse(format!("{url}: {e}")))?;
-                    return Ok(Revalidated::Modified { value, etag });
+                    match response.json::<Value>().await {
+                        Ok(value) => return Ok(Revalidated::Modified { value, etag }),
+                        Err(error) if retryable_transport(&error) => {
+                            let final_error = transport_attempt_error(
+                                &context,
+                                &error,
+                                attempt,
+                                settings.attempts,
+                            );
+                            if attempt == settings.attempts {
+                                return Err(final_error);
+                            }
+                            self.wait_before_retry(None, attempt_index, settings).await;
+                        }
+                        Err(_) => {
+                            return Err(ProviderError::InvalidResponse(format!(
+                                "{context}: invalid JSON response"
+                            )));
+                        }
+                    }
                 }
                 Ok(response) => {
                     let status = response.status();
-                    last_error = format!("{url}: HTTP {status}");
-                    if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
-                        return Err(ProviderError::Network(last_error));
+                    let final_error = network_attempt_error(
+                        &context,
+                        &format!("HTTP {status}"),
+                        attempt,
+                        settings.attempts,
+                    );
+                    if !retryable_status(status) || attempt == settings.attempts {
+                        return Err(final_error);
                     }
-                    let retry_after = response
-                        .headers()
-                        .get(RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
-                    let delay = retry_after
-                        .unwrap_or_else(|| (1u64 << attempt) + rand::rng().random_range(0..=1));
-                    sleep(StdDuration::from_secs(delay)).await;
+                    let retry_after = retry_after_delay(
+                        response.headers(),
+                        self.retry_runtime.now(),
+                        settings.max_delay,
+                    );
+                    self.wait_before_retry(retry_after, attempt_index, settings)
+                        .await;
                 }
                 Err(error) => {
-                    last_error = format!("{url}: {error}");
-                    if attempt < 2 {
-                        let jitter = rand::rng().random_range(0..100);
-                        sleep(StdDuration::from_millis((200 * (1u64 << attempt)) + jitter)).await;
+                    let final_error =
+                        transport_attempt_error(&context, &error, attempt, settings.attempts);
+                    if !retryable_transport(&error) || attempt == settings.attempts {
+                        return Err(final_error);
                     }
+                    self.wait_before_retry(None, attempt_index, settings).await;
                 }
             }
         }
-        Err(ProviderError::Network(last_error))
+        Err(ProviderError::Network(format!(
+            "{context}: retry policy allowed no attempts"
+        )))
     }
     pub async fn get_json(
         &self,
@@ -984,55 +1171,104 @@ impl HttpClient {
         max_bytes: usize,
         headers: HeaderMap,
     ) -> Result<Revalidated<Vec<u8>>, ProviderError> {
-        let response = self
-            .inner
-            .get(url)
-            .headers(headers)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        if response.status() == StatusCode::NOT_MODIFIED {
-            return Ok(Revalidated::NotModified { etag });
-        }
-        let mut response = response
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
-        let content_length = response.content_length();
-        if content_length.is_some_and(|length| length > max_bytes as u64) {
-            return Err(ProviderError::InvalidResponse(format!(
-                "{url}: response exceeds the {max_bytes}-byte limit"
-            )));
-        }
-
-        let initial_capacity = content_length
-            .and_then(|length| usize::try_from(length).ok())
-            .unwrap_or_default()
-            .min(max_bytes);
-        let mut bytes = Vec::with_capacity(initial_capacity);
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?
-        {
-            let Some(new_len) = bytes.len().checked_add(chunk.len()) else {
-                return Err(ProviderError::InvalidResponse(format!(
-                    "{url}: response size overflowed"
-                )));
+        let settings = self.retry_settings;
+        let method = reqwest::Method::GET;
+        let context = request_context(&method, url);
+        'request: for attempt_index in 0..settings.attempts {
+            let attempt = attempt_index + 1;
+            let response = match self
+                .inner
+                .get(url)
+                .headers(headers.clone())
+                .timeout(self.request_timeout)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let final_error =
+                        transport_attempt_error(&context, &error, attempt, settings.attempts);
+                    if !retryable_transport(&error) || attempt == settings.attempts {
+                        return Err(final_error);
+                    }
+                    self.wait_before_retry(None, attempt_index, settings).await;
+                    continue;
+                }
             };
-            if new_len > max_bytes {
+            let etag = response
+                .headers()
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if response.status() == StatusCode::NOT_MODIFIED {
+                return Ok(Revalidated::NotModified { etag });
+            }
+            let status = response.status();
+            if !status.is_success() {
+                let final_error = network_attempt_error(
+                    &context,
+                    &format!("HTTP {status}"),
+                    attempt,
+                    settings.attempts,
+                );
+                if !retryable_status(status) || attempt == settings.attempts {
+                    return Err(final_error);
+                }
+                let retry_after = retry_after_delay(
+                    response.headers(),
+                    self.retry_runtime.now(),
+                    settings.max_delay,
+                );
+                self.wait_before_retry(retry_after, attempt_index, settings)
+                    .await;
+                continue;
+            }
+            let mut response = response;
+            let content_length = response.content_length();
+            if content_length.is_some_and(|length| length > max_bytes as u64) {
                 return Err(ProviderError::InvalidResponse(format!(
-                    "{url}: response exceeds the {max_bytes}-byte limit"
+                    "{context}: response exceeds the {max_bytes}-byte limit"
                 )));
             }
-            bytes.extend_from_slice(&chunk);
+
+            let initial_capacity = content_length
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(max_bytes);
+            let mut bytes = Vec::with_capacity(initial_capacity);
+            loop {
+                let chunk = match response.chunk().await {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let final_error =
+                            transport_attempt_error(&context, &error, attempt, settings.attempts);
+                        if !retryable_transport(&error) || attempt == settings.attempts {
+                            return Err(final_error);
+                        }
+                        self.wait_before_retry(None, attempt_index, settings).await;
+                        continue 'request;
+                    }
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let Some(new_len) = bytes.len().checked_add(chunk.len()) else {
+                    return Err(ProviderError::InvalidResponse(format!(
+                        "{context}: response size overflowed"
+                    )));
+                };
+                if new_len > max_bytes {
+                    return Err(ProviderError::InvalidResponse(format!(
+                        "{context}: response exceeds the {max_bytes}-byte limit"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok(Revalidated::Modified { value: bytes, etag });
         }
-        Ok(Revalidated::Modified { value: bytes, etag })
+        Err(ProviderError::Network(format!(
+            "{context}: retry policy allowed no attempts"
+        )))
     }
 }
 
@@ -1663,6 +1899,14 @@ impl OsvSyncConfig {
             observed_max_chunk_bytes: None,
         })
     }
+
+    fn retry_settings(&self) -> RetrySettings {
+        RetrySettings {
+            attempts: self.attempts,
+            backoff_base: self.backoff_base,
+            max_delay: self.max_retry_delay,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1672,31 +1916,6 @@ enum OsvDownloadFailure {
         retry_after: Option<StdDuration>,
     },
     Fatal(ProviderError),
-}
-
-fn retry_after_delay(headers: &HeaderMap, cap: StdDuration) -> Option<StdDuration> {
-    headers
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(StdDuration::from_secs)
-        .map(|delay| std::cmp::min(delay, cap))
-}
-
-fn osv_dump_backoff(config: &OsvSyncConfig, retry_index: usize) -> StdDuration {
-    let multiplier = 1u32
-        .checked_shl(retry_index.min(31) as u32)
-        .unwrap_or(u32::MAX);
-    let base = std::cmp::min(
-        config.backoff_base.saturating_mul(multiplier),
-        config.max_retry_delay,
-    );
-    let jitter_bound = u64::try_from(base.as_millis() / 4).unwrap_or(u64::MAX);
-    let jitter = rand::rng().random_range(0..=jitter_bound);
-    std::cmp::min(
-        base.saturating_add(StdDuration::from_millis(jitter)),
-        config.max_retry_delay,
-    )
 }
 
 async fn stream_osv_dump_body<S, C, E, W>(
@@ -1759,26 +1978,45 @@ impl HttpClient {
         destination: &File,
         config: &OsvSyncConfig,
     ) -> Result<u64, OsvDownloadFailure> {
-        let response = self
+        let method = reqwest::Method::GET;
+        let context = request_context(&method, url);
+        let response = match self
             .inner
             .get(url)
             .timeout(config.transfer_timeout)
             .send()
             .await
-            .map_err(|error| OsvDownloadFailure::Retryable {
-                message: format!("{url}: {error}"),
-                retry_after: None,
-            })?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let message = match (error.is_timeout(), error.is_connect()) {
+                    (true, _) => format!("{context}: request timed out"),
+                    (_, true) => format!("{context}: connection failed"),
+                    _ => format!("{context}: request failed"),
+                };
+                if retryable_transport(&error) {
+                    return Err(OsvDownloadFailure::Retryable {
+                        message,
+                        retry_after: None,
+                    });
+                }
+                return Err(OsvDownloadFailure::Fatal(ProviderError::Network(message)));
+            }
+        };
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        if retryable_status(status) {
             return Err(OsvDownloadFailure::Retryable {
-                message: format!("{url}: HTTP {status}"),
-                retry_after: retry_after_delay(response.headers(), config.max_retry_delay),
+                message: format!("{context}: HTTP {status}"),
+                retry_after: retry_after_delay(
+                    response.headers(),
+                    self.retry_runtime.now(),
+                    config.max_retry_delay,
+                ),
             });
         }
         if !status.is_success() {
             return Err(OsvDownloadFailure::Fatal(ProviderError::Network(format!(
-                "{url}: HTTP {status}"
+                "{context}: HTTP {status}"
             ))));
         }
         if response
@@ -1787,7 +2025,7 @@ impl HttpClient {
         {
             return Err(OsvDownloadFailure::Fatal(ProviderError::InvalidResponse(
                 format!(
-                    "{url}: OSV dump exceeds the {}-byte compressed-size limit",
+                    "{context}: OSV dump exceeds the {}-byte compressed-size limit",
                     config.max_download_bytes
                 ),
             )));
@@ -1803,7 +2041,8 @@ impl HttpClient {
             .map(tokio::fs::File::from_std)
             .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
         let downloaded =
-            stream_osv_dump_body(response.bytes_stream(), &mut destination, url, config).await?;
+            stream_osv_dump_body(response.bytes_stream(), &mut destination, &context, config)
+                .await?;
         destination
             .sync_all()
             .await
@@ -1818,8 +2057,8 @@ impl HttpClient {
         destination: &File,
         config: &OsvSyncConfig,
     ) -> Result<u64, ProviderError> {
-        let mut last_error = None;
-        for attempt in 0..config.attempts {
+        let settings = config.retry_settings();
+        for attempt_index in 0..settings.attempts {
             match self
                 .download_osv_dump_attempt(url, destination, config)
                 .await
@@ -1830,18 +2069,23 @@ impl HttpClient {
                     message,
                     retry_after,
                 }) => {
-                    last_error = Some(message);
-                    if attempt + 1 < config.attempts {
-                        let delay =
-                            retry_after.unwrap_or_else(|| osv_dump_backoff(config, attempt));
-                        sleep(delay).await;
+                    if attempt_index + 1 < settings.attempts {
+                        self.wait_before_retry(retry_after, attempt_index, settings)
+                            .await;
+                    } else {
+                        return Err(ProviderError::Network(format!(
+                            "{message} (attempt {}/{})",
+                            attempt_index + 1,
+                            settings.attempts
+                        )));
                     }
                 }
             }
         }
-        Err(ProviderError::Network(last_error.unwrap_or_else(|| {
-            format!("{url}: OSV dump transfer had no attempts")
-        })))
+        Err(ProviderError::Network(format!(
+            "{}: OSV dump transfer had no attempts",
+            request_context(&reqwest::Method::GET, url)
+        )))
     }
 }
 
@@ -3076,7 +3320,10 @@ mod tests {
     use super::*;
     use std::{
         io::{Cursor, Write},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt},
@@ -3506,6 +3753,284 @@ mod tests {
         (format!("http://{address}"), requests, handle)
     }
 
+    struct RecordingRetryRuntime {
+        now: SystemTime,
+        sleeps: Mutex<Vec<StdDuration>>,
+        jitter_bounds: Mutex<Vec<StdDuration>>,
+    }
+
+    impl RecordingRetryRuntime {
+        fn new(now: SystemTime) -> Self {
+            Self {
+                now,
+                sleeps: Mutex::new(Vec::new()),
+                jitter_bounds: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sleeps(&self) -> Vec<StdDuration> {
+            self.sleeps.lock().unwrap().clone()
+        }
+
+        fn jitter_bounds(&self) -> Vec<StdDuration> {
+            self.jitter_bounds.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RetryRuntime for RecordingRetryRuntime {
+        fn now(&self) -> SystemTime {
+            self.now
+        }
+
+        fn jitter(&self, upper_bound: StdDuration) -> StdDuration {
+            self.jitter_bounds.lock().unwrap().push(upper_bound);
+            StdDuration::ZERO
+        }
+
+        async fn sleep(&self, duration: StdDuration) {
+            self.sleeps.lock().unwrap().push(duration);
+        }
+    }
+
+    fn test_http_client(
+        runtime: Arc<RecordingRetryRuntime>,
+        request_timeout: StdDuration,
+    ) -> HttpClient {
+        HttpClient::with_retry_runtime(
+            request_timeout,
+            request_timeout,
+            RetrySettings::default(),
+            runtime,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retry_status_classification_is_exact() {
+        for code in 100..=599 {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                retryable_status(status),
+                code == 429 || (500..=599).contains(&code),
+                "unexpected retry classification for HTTP {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_supports_delta_seconds_and_all_http_date_forms() {
+        let now = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_800_000_000);
+        let cap = StdDuration::from_secs(30);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("999999"));
+        assert_eq!(retry_after_delay(&headers, now, cap), Some(cap));
+
+        for date in [
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+        ] {
+            let parsed = httpdate::parse_http_date(date).unwrap();
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(date).unwrap());
+            assert_eq!(
+                retry_after_delay(&headers, parsed - StdDuration::from_secs(7), cap),
+                Some(StdDuration::from_secs(7))
+            );
+        }
+
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(now - StdDuration::from_secs(1)))
+                .unwrap(),
+        );
+        assert_eq!(
+            retry_after_delay(&headers, now, cap),
+            Some(StdDuration::ZERO)
+        );
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("not-a-date"));
+        assert_eq!(retry_after_delay(&headers, now, cap), None);
+    }
+
+    #[tokio::test]
+    async fn json_uses_one_attempt_plus_three_retries_without_a_final_sleep() {
+        let responses = (0..HTTP_ATTEMPTS)
+            .map(|_| RawResponse::fixed(500, Vec::new()))
+            .collect();
+        let (base_url, requests, server) = spawn_raw_server(responses).await;
+        let runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
+        let client = test_http_client(runtime.clone(), StdDuration::from_secs(1));
+
+        let error = client
+            .get_json(&format!("{base_url}/metadata"), HeaderMap::new())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), HTTP_ATTEMPTS);
+        assert_eq!(
+            runtime.sleeps(),
+            vec![
+                StdDuration::from_millis(200),
+                StdDuration::from_millis(400),
+                StdDuration::from_millis(800),
+            ]
+        );
+        assert_eq!(
+            runtime.jitter_bounds(),
+            vec![
+                StdDuration::from_millis(50),
+                StdDuration::from_millis(100),
+                StdDuration::from_millis(200),
+            ]
+        );
+        assert!(error.to_string().contains("HTTP 500"));
+        assert!(error.to_string().contains("attempt 4/4"));
+    }
+
+    #[tokio::test]
+    async fn bounded_byte_stream_uses_one_attempt_plus_three_retries() {
+        let responses = (0..HTTP_ATTEMPTS)
+            .map(|_| RawResponse {
+                status: 429,
+                retry_after: Some("0".to_owned()),
+                body: RawResponseBody::Fixed(Vec::new()),
+            })
+            .collect();
+        let (base_url, requests, server) = spawn_raw_server(responses).await;
+        let runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
+        let client = test_http_client(runtime.clone(), StdDuration::from_secs(1));
+
+        let error = client
+            .get_bytes_limited_revalidated(&format!("{base_url}/bytes"), 1024, HeaderMap::new())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), HTTP_ATTEMPTS);
+        assert_eq!(runtime.sleeps(), vec![StdDuration::ZERO; HTTP_MAX_RETRIES]);
+        assert!(runtime.jitter_bounds().is_empty());
+        assert!(error.to_string().contains("HTTP 429"));
+        assert!(error.to_string().contains("attempt 4/4"));
+    }
+
+    #[tokio::test]
+    async fn retry_after_delta_and_http_date_use_the_injected_clock_and_sleeper() {
+        let now = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_800_000_000);
+        let responses = vec![
+            RawResponse {
+                status: 429,
+                retry_after: Some("999999".to_owned()),
+                body: RawResponseBody::Fixed(Vec::new()),
+            },
+            RawResponse {
+                status: 503,
+                retry_after: Some(httpdate::fmt_http_date(now + StdDuration::from_secs(7))),
+                body: RawResponseBody::Fixed(Vec::new()),
+            },
+            RawResponse::fixed(200, br#"{"ok":true}"#.to_vec()),
+        ];
+        let (base_url, requests, server) = spawn_raw_server(responses).await;
+        let runtime = Arc::new(RecordingRetryRuntime::new(now));
+        let client = test_http_client(runtime.clone(), StdDuration::from_secs(1));
+
+        let (value, _) = client
+            .get_json(&format!("{base_url}/metadata"), HeaderMap::new())
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(value, json!({"ok": true}));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            runtime.sleeps(),
+            vec![StdDuration::from_secs(30), StdDuration::from_secs(7)]
+        );
+        assert!(runtime.jitter_bounds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_retryable_status_is_immediate_and_redacts_request_secrets() {
+        let secret_body = b"super-secret-response".to_vec();
+        let (base_url, requests, server) =
+            spawn_raw_server(vec![RawResponse::fixed(400, secret_body)]).await;
+        let authenticated_url = base_url.replacen("http://", "http://alice:password@", 1);
+        let runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
+        let client = test_http_client(runtime.clone(), StdDuration::from_secs(1));
+
+        let error = client
+            .get_json(
+                &format!("{authenticated_url}/metadata?token=query-secret"),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        let message = error.to_string();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(runtime.sleeps().is_empty());
+        assert!(message.contains("HTTP 400"));
+        for secret in ["alice", "password", "query-secret", "super-secret-response"] {
+            assert!(
+                !message.contains(secret),
+                "error leaked {secret:?}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_and_timeout_failures_retry_but_builder_failures_do_not() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let connect_runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
+        let connect_client =
+            test_http_client(connect_runtime.clone(), StdDuration::from_millis(50));
+
+        let connect_error = connect_client
+            .get_json(&format!("http://{unavailable}/metadata"), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(connect_runtime.sleeps().len(), HTTP_MAX_RETRIES);
+        assert!(connect_error.to_string().contains("connection failed"));
+        assert!(connect_error.to_string().contains("attempt 4/4"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(StdDuration::from_millis(100))
+                    .set_body_json(json!({"ok": true})),
+            )
+            .expect(HTTP_ATTEMPTS as u64)
+            .mount(&server)
+            .await;
+        let timeout_runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
+        let timeout_client =
+            test_http_client(timeout_runtime.clone(), StdDuration::from_millis(10));
+        let timeout_error = timeout_client
+            .get_json(&format!("{}/slow", server.uri()), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(timeout_runtime.sleeps().len(), HTTP_MAX_RETRIES);
+        assert!(timeout_error.to_string().contains("timed out"));
+        assert!(timeout_error.to_string().contains("attempt 4/4"));
+        server.verify().await;
+
+        let builder_runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
+        let builder_client = test_http_client(builder_runtime.clone(), StdDuration::from_secs(1));
+        let builder_error = builder_client
+            .get_json("://builder-secret", HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert!(builder_runtime.sleeps().is_empty());
+        assert!(builder_error.to_string().contains("attempt 1/4"));
+        assert!(!builder_error.to_string().contains("builder-secret"));
+    }
+
     fn dump_archive_bytes(payload_bytes: usize) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
         let mut archive = zip::ZipWriter::new(cursor);
@@ -3875,8 +4400,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_retries_429_and_5xx_and_caps_delta_retry_after() {
+    async fn sync_retries_429_and_5xx_with_both_retry_after_forms() {
         let replacement = dump_archive_bytes(1024);
+        let now = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_800_000_000);
         let responses = vec![
             RawResponse {
                 status: 429,
@@ -3884,26 +4410,34 @@ mod tests {
                 body: RawResponseBody::Fixed(Vec::new()),
             },
             RawResponse::fixed(500, Vec::new()),
+            RawResponse {
+                status: 503,
+                retry_after: Some(httpdate::fmt_http_date(now + StdDuration::from_secs(20))),
+                body: RawResponseBody::Fixed(Vec::new()),
+            },
             RawResponse::fixed(200, replacement.clone()),
         ];
         let (base_url, requests, server) = spawn_raw_server(responses).await;
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = cache_for_sync(cache_dir.path());
-        let client =
-            HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1))
-                .unwrap();
+        let runtime = Arc::new(RecordingRetryRuntime::new(now));
+        let client = test_http_client(runtime.clone(), StdDuration::from_secs(1));
         let config = test_sync_config(base_url);
 
-        tokio::time::timeout(
-            StdDuration::from_secs(1),
-            sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config),
-        )
-        .await
-        .expect("Retry-After was not capped")
-        .unwrap();
+        sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
+            .await
+            .unwrap();
         server.await.unwrap();
 
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(requests.load(Ordering::SeqCst), HTTP_ATTEMPTS);
+        assert_eq!(
+            runtime.sleeps(),
+            vec![
+                StdDuration::from_millis(5),
+                StdDuration::from_millis(2),
+                StdDuration::from_millis(5),
+            ]
+        );
         assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), replacement);
         assert_no_sync_temps(&cache);
     }

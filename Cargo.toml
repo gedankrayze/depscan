@@ -27,6 +27,7 @@ directories = "6.0.0"
 fs2 = "0.4.3"
 futures = "0.3.34"
 glob = "0.3.4"
+httpdate = "1.0.3"
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "gzip", "json", "http2", "stream"] }
 semver = { version = "1.0.28", features = ["serde"] }

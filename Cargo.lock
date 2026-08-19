@@ -474,6 +474,7 @@ dependencies = [
  "directories",
  "fs2",
  "futures",
+ "httpdate",
  "rand",
  "reqwest",
  "semver",
