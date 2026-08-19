@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration, Utc};
 use cvss::Cvss;
 use depscan_core::{
     classify_staleness, compare_versions, normalize_name, osv_fixed_versions, osv_range_matches,
-    Ecosystem, LatestVersions, Package, ProviderError, Severity, VersionProvider, VulnMap,
-    VulnProvider, Vulnerability,
+    pypi_version_is_prerelease, pypi_version_is_stable, Ecosystem, LatestVersions, Package,
+    ProviderError, Severity, VersionProvider, VulnMap, VulnProvider, Vulnerability,
 };
 use directories::ProjectDirs;
 use fs2::FileExt;
@@ -826,35 +826,10 @@ impl RegistryClient {
             .ok_or_else(|| {
                 ProviderError::InvalidResponse("PyPI response lacked releases".to_owned())
             })?;
-        let installed_prerelease = is_prerelease(Ecosystem::PyPI, &p.version);
-        let mut candidates: Vec<String> = releases
-            .iter()
-            .filter(|(version, files)| {
-                let prerelease_allowed =
-                    installed_prerelease || !is_prerelease(Ecosystem::PyPI, version);
-                let all_yanked = files.as_array().is_some_and(|files| {
-                    !files.is_empty()
-                        && files.iter().all(|file| {
-                            file.get("yanked").and_then(Value::as_bool).unwrap_or(false)
-                        })
-                });
-                prerelease_allowed && !all_yanked
-            })
-            .map(|(version, _)| version.to_owned())
-            .collect();
-        candidates.sort_by(|a, b| compare_versions(Ecosystem::PyPI, a, b));
-        let latest = candidates.pop().ok_or_else(|| {
+        let latest = select_pypi_release(releases, &p.version).ok_or_else(|| {
             ProviderError::InvalidResponse(format!("PyPI has no suitable release for {}", p.name))
         })?;
-        let yanked = releases
-            .get(&p.version)
-            .and_then(Value::as_array)
-            .is_some_and(|files| {
-                !files.is_empty()
-                    && files
-                        .iter()
-                        .all(|file| file.get("yanked").and_then(Value::as_bool).unwrap_or(false))
-            });
+        let yanked = releases.get(&p.version).is_some_and(pypi_release_is_yanked);
         Ok(version_result(p, latest, yanked))
     }
     async fn nuget(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
@@ -958,16 +933,37 @@ fn maximum_version<'a>(
         .max_by(|a, b| compare_versions(eco, a, b))
         .map(str::to_owned)
 }
+
+fn select_pypi_release(
+    releases: &serde_json::Map<String, Value>,
+    installed: &str,
+) -> Option<String> {
+    let allow_prerelease = pypi_version_is_prerelease(installed);
+    releases
+        .iter()
+        .filter(|(version, files)| {
+            let valid_candidate = pypi_version_is_stable(version)
+                || (allow_prerelease && pypi_version_is_prerelease(version));
+            valid_candidate && !pypi_release_is_yanked(files)
+        })
+        .map(|(version, _)| version.as_str())
+        .max_by(|a, b| compare_versions(Ecosystem::PyPI, a, b))
+        .map(str::to_owned)
+}
+
+fn pypi_release_is_yanked(files: &Value) -> bool {
+    files.as_array().is_some_and(|files| {
+        !files.is_empty()
+            && files
+                .iter()
+                .all(|file| file.get("yanked").and_then(Value::as_bool).unwrap_or(false))
+    })
+}
+
 fn is_prerelease(eco: Ecosystem, version: &str) -> bool {
     match eco {
         Ecosystem::Npm | Ecosystem::CratesIo | Ecosystem::NuGet => version.contains('-'),
-        Ecosystem::PyPI => {
-            let lower = version.to_ascii_lowercase();
-            lower.contains("a")
-                || lower.contains("b")
-                || lower.contains("rc")
-                || lower.contains("dev")
-        }
+        Ecosystem::PyPI => pypi_version_is_prerelease(version),
     }
 }
 
@@ -1334,5 +1330,53 @@ mod tests {
 
         assert_eq!(result[&package.key()].len(), 1);
         assert_eq!(result[&package.key()][0].id, "GHSA-5crp-9r3c-p9vr");
+    }
+
+    #[test]
+    fn selects_latest_pypi_release_regardless_of_response_order() {
+        let data = json!({
+            "2.34.2": [{"yanked": false}],
+            "2.9.2": [{"yanked": false}],
+            "2.32.5": [{"yanked": false}]
+        });
+
+        assert_eq!(
+            select_pypi_release(data.as_object().unwrap(), "2.32.5"),
+            Some("2.34.2".to_owned())
+        );
+    }
+
+    #[test]
+    fn excludes_fully_yanked_pypi_releases() {
+        let data = json!({
+            "2.34.2": [{"yanked": true}, {"yanked": true}],
+            "2.33.0": [{"yanked": false}]
+        });
+
+        assert_eq!(
+            select_pypi_release(data.as_object().unwrap(), "2.32.5"),
+            Some("2.33.0".to_owned())
+        );
+        assert!(pypi_release_is_yanked(&data["2.34.2"]));
+        assert!(!pypi_release_is_yanked(&data["2.33.0"]));
+    }
+
+    #[test]
+    fn follows_installed_pypi_prerelease_policy() {
+        let data = json!({
+            "3.0rc1": [{"yanked": false}],
+            "2.34.2": [{"yanked": false}],
+            "not a version": [{"yanked": false}]
+        });
+        let releases = data.as_object().unwrap();
+
+        assert_eq!(
+            select_pypi_release(releases, "2.32.5"),
+            Some("2.34.2".to_owned())
+        );
+        assert_eq!(
+            select_pypi_release(releases, "3.0b1"),
+            Some("3.0rc1".to_owned())
+        );
     }
 }

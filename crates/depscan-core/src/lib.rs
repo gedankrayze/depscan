@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use pep440_rs::Version as Pep440Version;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -301,7 +302,7 @@ pub fn compare_versions(ecosystem: Ecosystem, a: &str, b: &str) -> Ordering {
     match ecosystem {
         Ecosystem::Npm | Ecosystem::CratesIo => Version::parse(a).ok().cmp(&Version::parse(b).ok()),
         Ecosystem::NuGet => compare_nuget(a, b),
-        Ecosystem::PyPI => compare_pep440ish(a, b),
+        Ecosystem::PyPI => compare_pep440(a, b),
     }
 }
 
@@ -328,85 +329,34 @@ fn compare_nuget(a: &str, b: &str) -> Ordering {
     }
 }
 
-// A deliberately conservative PEP 440 ordering fallback. It recognizes epochs, release
-// segments, common pre-release labels, and post/dev releases without treating text as a panic.
-fn compare_pep440ish(a: &str, b: &str) -> Ordering {
-    fn parts(s: &str) -> (u64, Vec<u64>, i8, u64, i64, i64) {
-        let s = s.trim().to_ascii_lowercase();
-        let (epoch, rest) = s
-            .split_once('!')
-            .map_or((0, s.as_str()), |(e, r)| (e.parse().unwrap_or(0), r));
-        let mut release = Vec::new();
-        let mut token = String::new();
-        let mut phase = 0i8;
-        let mut phase_no = 0u64;
-        let mut post = -1i64;
-        let mut dev = -1i64;
-        let mut chars = rest.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch.is_ascii_digit() {
-                token.push(ch);
-                continue;
-            }
-            if !token.is_empty() {
-                release.push(token.parse().unwrap_or(0));
-                token.clear();
-            }
-            let remainder: String = chars.collect();
-            let text = format!("{}{}", ch, remainder);
-            let parse_tail = |x: &str| {
-                x.trim_start_matches(|c: char| !c.is_ascii_digit())
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            };
-            if text.starts_with("a") || text.starts_with("alpha") {
-                phase = -3;
-                phase_no = parse_tail(&text);
-            } else if text.starts_with("b") || text.starts_with("beta") {
-                phase = -2;
-                phase_no = parse_tail(&text);
-            } else if text.starts_with("rc") || text.starts_with("c") || text.starts_with("pre") {
-                phase = -1;
-                phase_no = parse_tail(&text);
-            } else if text.starts_with("post") || text.starts_with("rev") || text.starts_with("r") {
-                post = parse_tail(&text) as i64;
-            } else if text.starts_with("dev") {
-                dev = parse_tail(&text) as i64;
-                phase = -4;
-            }
-            break;
-        }
-        if !token.is_empty() {
-            release.push(token.parse().unwrap_or(0));
-        }
-        while release.last() == Some(&0) {
-            release.pop();
-        }
-        (epoch, release, phase, phase_no, post, dev)
+fn parse_pep440(version: &str) -> Option<Pep440Version> {
+    version.trim().parse().ok()
+}
+
+fn compare_pep440(a: &str, b: &str) -> Ordering {
+    match (parse_pep440(a), parse_pep440(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        // A malformed registry version must never displace a valid PEP 440 version.
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => a
+            .trim()
+            .to_ascii_lowercase()
+            .cmp(&b.trim().to_ascii_lowercase())
+            .then_with(|| a.cmp(b)),
     }
-    let (ae, ar, aph, apn, apo, adv) = parts(a);
-    let (be, br, bph, bpn, bpo, bdv) = parts(b);
-    ae.cmp(&be)
-        .then_with(|| {
-            for i in 0..ar.len().max(br.len()) {
-                let c = ar
-                    .get(i)
-                    .copied()
-                    .unwrap_or(0)
-                    .cmp(&br.get(i).copied().unwrap_or(0));
-                if c != Ordering::Equal {
-                    return c;
-                }
-            }
-            Ordering::Equal
-        })
-        .then(aph.cmp(&bph))
-        .then(apn.cmp(&bpn))
-        .then(apo.cmp(&bpo))
-        .then(adv.cmp(&bdv))
+}
+
+/// Returns whether a PyPI version is a valid PEP 440 pre-release or development release.
+/// Invalid versions return `false`.
+pub fn pypi_version_is_prerelease(version: &str) -> bool {
+    parse_pep440(version).is_some_and(|version| version.any_prerelease())
+}
+
+/// Returns whether a PyPI version is valid PEP 440 and stable.
+/// Invalid versions return `false` so they cannot be selected as registry candidates.
+pub fn pypi_version_is_stable(version: &str) -> bool {
+    parse_pep440(version).is_some_and(|version| version.is_stable())
 }
 
 pub fn classify_staleness(ecosystem: Ecosystem, installed: &str, latest: &str) -> Staleness {
@@ -422,17 +372,26 @@ pub fn classify_staleness(ecosystem: Ecosystem, installed: &str, latest: &str) -
                 _ => Staleness::Unknown,
             }
         }
-        Ecosystem::NuGet | Ecosystem::PyPI => {
+        Ecosystem::NuGet => {
             let a = numeric_release(installed);
             let b = numeric_release(latest);
-            if a.first() != b.first() {
-                Staleness::Major
-            } else if a.get(1) != b.get(1) {
-                Staleness::Minor
-            } else {
-                Staleness::Patch
-            }
+            classify_release_segments(&a, &b)
         }
+        Ecosystem::PyPI => match (parse_pep440(installed), parse_pep440(latest)) {
+            (Some(a), Some(b)) if a.epoch() != b.epoch() => Staleness::Major,
+            (Some(a), Some(b)) => classify_release_segments(a.release(), b.release()),
+            _ => Staleness::Unknown,
+        },
+    }
+}
+
+fn classify_release_segments(installed: &[u64], latest: &[u64]) -> Staleness {
+    if installed.first() != latest.first() {
+        Staleness::Major
+    } else if installed.get(1) != latest.get(1) {
+        Staleness::Minor
+    } else {
+        Staleness::Patch
     }
 }
 
@@ -548,6 +507,95 @@ mod tests {
             Staleness::Patch
         );
     }
+
+    #[test]
+    fn orders_pypi_versions_with_pep440() {
+        let cases = [
+            ("2.9.2", "2.32.5", Ordering::Less),
+            ("2.32.5", "2.34.2", Ordering::Less),
+            ("2.0", "1!1.0", Ordering::Less),
+            ("1.0.dev1", "1.0a1", Ordering::Less),
+            ("1.0a1", "1.0rc1", Ordering::Less),
+            ("1.0rc1", "1.0", Ordering::Less),
+            ("1.0", "1.0.post1", Ordering::Less),
+            ("1.0", "1.0+local.1", Ordering::Less),
+            ("1.0-alpha1", "1.0a1", Ordering::Equal),
+            ("1.0_rc1", "1.0rc1", Ordering::Equal),
+            ("1.0-post1", "1.0.post1", Ordering::Equal),
+            ("1.0+ubuntu-1", "1.0+ubuntu.1", Ordering::Equal),
+        ];
+
+        for (left, right, expected) in cases {
+            assert_eq!(
+                compare_versions(Ecosystem::PyPI, left, right),
+                expected,
+                "unexpected ordering for {left:?} and {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn handles_invalid_pypi_versions_deterministically() {
+        assert_eq!(
+            compare_versions(Ecosystem::PyPI, "not a version", "1.0"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions(Ecosystem::PyPI, "invalid-b", "invalid-a"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions(Ecosystem::PyPI, " INVALID ", "invalid"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn detects_stable_pypi_versions_with_pep440() {
+        let cases = [
+            ("1.0", true, false),
+            ("1.0.post1", true, false),
+            ("1.0+local.1", true, false),
+            ("1.0a1", false, true),
+            ("1.0rc1", false, true),
+            ("1.0.dev1", false, true),
+            ("not a version", false, false),
+        ];
+
+        for (version, stable, prerelease) in cases {
+            assert_eq!(
+                pypi_version_is_stable(version),
+                stable,
+                "unexpected stable classification for {version:?}"
+            );
+            assert_eq!(
+                pypi_version_is_prerelease(version),
+                prerelease,
+                "unexpected pre-release classification for {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_pypi_staleness_from_parsed_release_segments() {
+        let cases = [
+            ("2.32.5", "2.34.2", Staleness::Minor),
+            ("2.34.1", "2.34.2", Staleness::Patch),
+            ("1.9", "2.0", Staleness::Major),
+            ("1!2.0", "2!1.0", Staleness::Major),
+            ("1.0rc1", "1.0", Staleness::Patch),
+            ("not a version", "1.0", Staleness::Unknown),
+        ];
+
+        for (installed, latest, expected) in cases {
+            assert_eq!(
+                classify_staleness(Ecosystem::PyPI, installed, latest),
+                expected,
+                "unexpected staleness for {installed:?} -> {latest:?}"
+            );
+        }
+    }
+
     #[test]
     fn matches_osv_events() {
         let events: Vec<serde_json::Value> =
