@@ -12,6 +12,8 @@ use std::{
 use toml::Value as Toml;
 use walkdir::WalkDir;
 
+mod requirements;
+
 fn io_error(path: &Path, error: impl ToString) -> ParseError {
     ParseError::Io {
         path: path.to_path_buf(),
@@ -880,7 +882,7 @@ impl EcosystemParser for PythonParser {
         match source.kind {
             SourceKind::UvLock | SourceKind::PoetryLock => parse_python_lock(&source.path),
             SourceKind::PipfileLock => parse_pipfile_lock(&source.path),
-            SourceKind::RequirementsTxt => parse_requirements(&source.path, &mut HashSet::new()),
+            SourceKind::RequirementsTxt => requirements::parse(&source.path),
             SourceKind::PyProject => parse_pyproject(&source.path),
             _ => Err(invalid(&source.path, "unexpected source kind")),
         }
@@ -933,51 +935,6 @@ fn parse_pipfile_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                     out.push(p);
                 }
             }
-        }
-    }
-    Ok(dedup(out))
-}
-fn parse_requirements(
-    path: &Path,
-    seen: &mut HashSet<PathBuf>,
-) -> Result<Vec<Package>, ParseError> {
-    let canonical = path.to_path_buf();
-    if !seen.insert(canonical) {
-        return Ok(Vec::new());
-    }
-    let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    let mut out = Vec::new();
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("--hash") || line.starts_with("--") {
-            continue;
-        }
-        if let Some(include) = line
-            .strip_prefix("-r ")
-            .or_else(|| line.strip_prefix("--requirement "))
-        {
-            out.extend(parse_requirements(
-                &path.parent().unwrap_or(Path::new(".")).join(include.trim()),
-                seen,
-            )?);
-            continue;
-        }
-        if let Some((name, version)) = line.split_once("==") {
-            let mut p = Package::new(
-                Ecosystem::PyPI,
-                name.trim(),
-                version.split(';').next().unwrap_or(version).trim(),
-                path.to_path_buf(),
-            );
-            p.direct = true;
-            out.push(p);
-        } else if let Some(name) = line.split(['<', '>', '~', '!', '=', ';']).next()
-            && !name.trim().is_empty()
-        {
-            let mut p = Package::new(Ecosystem::PyPI, name.trim(), line, path.to_path_buf());
-            p.direct = true;
-            p.resolved_from_range = true;
-            out.push(p);
         }
     }
     Ok(dedup(out))

@@ -15,6 +15,8 @@
 
 Resolved lockfile versions are preferred. Manifest-only records are marked as range-derived, because they are not an installed dependency resolution.
 
+`requirements.txt` follows separated `-r` and `--requirement` includes relative to the file containing the directive. The root file and every include must be regular, non-symlink files within the canonical scan root. Expansion is limited to 32 levels, 256 file reads, and 8 MiB of cumulative input.
+
 ## Package identity and provider names
 
 Package identity and provider request spelling are related but not always identical:

@@ -239,6 +239,39 @@ fn assert_config_preflight_failure(output: &Output, path: &Path, expected: &str)
 }
 
 #[test]
+fn requirements_escape_exits_ten_before_provider_access() {
+    let directory = TestDirectory::new("requirements-escape");
+    let project = directory.path().join("project");
+    let cache = directory.path().join("cache");
+    let outside = directory.path().join("outside.txt");
+    let secret = "outside-requirements-secret==9.9.9";
+    fs::create_dir(&project).expect("create Python project");
+    fs::write(project.join("requirements.txt"), "-r ../outside.txt\n")
+        .expect("write root requirements");
+    fs::write(&outside, secret).expect("write outside requirements");
+
+    let output = command(&cache)
+        .args([
+            "scan",
+            "--offline",
+            project.to_str().expect("UTF-8 project path"),
+        ])
+        .output()
+        .expect("run depscan");
+
+    assert_exit(&output, 10);
+    assert_diagnostic_only_on_stderr(&output, "outside scan root");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requirements include chain"));
+    assert!(stderr.contains("outside.txt"));
+    assert!(!stderr.contains(secret));
+    assert!(
+        !stderr.contains("missing OSV dump") && !stderr.contains("provider"),
+        "requirements validation reached provider access: {stderr}"
+    );
+}
+
+#[test]
 fn clean_scan_exits_zero_and_writes_report_to_stdout() {
     let project = TestProject::rust("clean");
     project.seed_clean("1.0.0");
