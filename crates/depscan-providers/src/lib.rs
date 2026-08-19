@@ -38,6 +38,7 @@ const USER_AGENT_VALUE: &str = concat!(
     " (+https://github.com/gedankrayze/depscan)"
 );
 const OSV_QUERY_TTL_SECS: i64 = 60 * 60;
+const OSV_MAX_QUERY_PAGES: usize = 1_000;
 const REGISTRY_TTL_SECS: i64 = 6 * 60 * 60;
 const CRATES_IO_INDEX_BASE_URL: &str = "https://index.crates.io";
 const CRATES_IO_MAX_NAME_LEN: usize = 64;
@@ -61,19 +62,37 @@ fn osv_query_cache_key(package: &Package) -> String {
     )
 }
 
-fn osv_query_body(packages: &[Package]) -> Value {
+fn osv_query_body_with_tokens(queries: &[(&Package, Option<&str>)]) -> Value {
     json!({
-        "queries": packages
+        "queries": queries
             .iter()
-            .map(|package| json!({
-                "package": {
-                    "name": osv_query_name(package),
-                    "ecosystem": package.ecosystem.osv_name()
-                },
-                "version": package.version
-            }))
+            .map(|(package, page_token)| {
+                let mut query = json!({
+                    "package": {
+                        "name": osv_query_name(package),
+                        "ecosystem": package.ecosystem.osv_name()
+                    },
+                    "version": package.version
+                });
+                if let Some(page_token) = page_token {
+                    query
+                        .as_object_mut()
+                        .expect("OSV query is an object")
+                        .insert("page_token".to_owned(), json!(page_token));
+                }
+                query
+            })
             .collect::<Vec<_>>()
     })
+}
+
+#[cfg(test)]
+fn osv_query_body(packages: &[Package]) -> Value {
+    let queries = packages
+        .iter()
+        .map(|package| (package, None))
+        .collect::<Vec<_>>();
+    osv_query_body_with_tokens(&queries)
 }
 
 fn invalid_osv_batch_response(message: impl Into<String>) -> ProviderError {
@@ -99,10 +118,16 @@ fn valid_osv_id(id: &str) -> bool {
         && entry.bytes().all(valid_component)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct OsvQueryBatchPage {
+    ids: Vec<String>,
+    next_page_token: Option<String>,
+}
+
 fn parse_osv_query_batch_response(
     response: &Value,
     expected_results: usize,
-) -> Result<Vec<Vec<String>>, ProviderError> {
+) -> Result<Vec<OsvQueryBatchPage>, ProviderError> {
     let object = response
         .as_object()
         .ok_or_else(|| invalid_osv_batch_response("the top-level value is not an object"))?;
@@ -126,10 +151,29 @@ fn parse_osv_query_batch_response(
             let result = result.as_object().ok_or_else(|| {
                 invalid_osv_batch_response(format!("result {result_index} is not an object"))
             })?;
+            let next_page_token = result
+                .get("next_page_token")
+                .map(|token| {
+                    let token = token.as_str().ok_or_else(|| {
+                        invalid_osv_batch_response(format!(
+                            "result {result_index} has a non-string next_page_token field"
+                        ))
+                    })?;
+                    if token.is_empty() {
+                        return Err(invalid_osv_batch_response(format!(
+                            "result {result_index} has an empty next_page_token field"
+                        )));
+                    }
+                    Ok(token.to_owned())
+                })
+                .transpose()?;
             let Some(vulns) = result.get("vulns") else {
                 // OSV's protobuf JSON encoding represents a legitimate empty result as `{}`.
-                return if result.is_empty() {
-                    Ok(Vec::new())
+                return if result.is_empty() || (result.len() == 1 && next_page_token.is_some()) {
+                    Ok(OsvQueryBatchPage {
+                        ids: Vec::new(),
+                        next_page_token,
+                    })
                 } else {
                     Err(invalid_osv_batch_response(format!(
                         "result {result_index} is non-empty but has no vulns field"
@@ -142,7 +186,7 @@ fn parse_osv_query_batch_response(
                 ))
             })?;
 
-            vulns
+            let ids = vulns
                 .iter()
                 .enumerate()
                 .map(|(vuln_index, vulnerability)| {
@@ -166,7 +210,11 @@ fn parse_osv_query_batch_response(
                     }
                     Ok(id.to_owned())
                 })
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(OsvQueryBatchPage {
+                ids,
+                next_page_token,
+            })
         })
         .collect()
 }
@@ -484,10 +532,53 @@ impl OsvClient {
         }
     }
     async fn query_batch(&self, batch: &[Package]) -> Result<Vec<Vec<String>>, ProviderError> {
-        let body = osv_query_body(batch);
         let url = format!("{}/v1/querybatch", self.base_url);
-        let response = self.http.post_json(&url, body).await?;
-        parse_osv_query_batch_response(&response, batch.len())
+        let mut ids = vec![BTreeSet::new(); batch.len()];
+        let mut seen_tokens = vec![BTreeSet::new(); batch.len()];
+        let mut pages_seen = vec![0usize; batch.len()];
+        let mut pending = (0..batch.len())
+            .map(|index| (index, None::<String>))
+            .collect::<Vec<_>>();
+
+        while !pending.is_empty() {
+            let queries = pending
+                .iter()
+                .map(|(index, page_token)| (&batch[*index], page_token.as_deref()))
+                .collect::<Vec<_>>();
+            let body = osv_query_body_with_tokens(&queries);
+            let _permit = self
+                .concurrency
+                .acquire()
+                .await
+                .map_err(|error| ProviderError::Network(error.to_string()))?;
+            let response = self.http.post_json(&url, body).await?;
+            drop(_permit);
+            let pages = parse_osv_query_batch_response(&response, pending.len())?;
+            let mut next = Vec::new();
+            for ((index, _), page) in pending.into_iter().zip(pages) {
+                pages_seen[index] += 1;
+                ids[index].extend(page.ids);
+                if let Some(token) = page.next_page_token {
+                    if !seen_tokens[index].insert(token.clone()) {
+                        return Err(invalid_osv_batch_response(format!(
+                            "result for query {index} repeated a next_page_token"
+                        )));
+                    }
+                    if pages_seen[index] >= OSV_MAX_QUERY_PAGES {
+                        return Err(invalid_osv_batch_response(format!(
+                            "result for query {index} exceeded the {OSV_MAX_QUERY_PAGES}-page limit"
+                        )));
+                    }
+                    next.push((index, Some(token)));
+                }
+            }
+            pending = next;
+        }
+
+        Ok(ids
+            .into_iter()
+            .map(|ids| ids.into_iter().collect())
+            .collect())
     }
     async fn hydrate(&self, id: &str) -> Result<Value, ProviderError> {
         if let Some((value, _)) = self.cache.get("osv/vuln", id, Duration::hours(24 * 3650)) {
@@ -1419,6 +1510,27 @@ mod tests {
         )
     }
 
+    fn cache_osv_document(cache: &Cache, package: &Package, id: &str) {
+        cache
+            .put(
+                "osv/vuln",
+                id,
+                &json!({
+                    "id": id,
+                    "summary": "pagination fixture",
+                    "affected": [{
+                        "package": {
+                            "ecosystem": package.ecosystem.osv_name(),
+                            "name": osv_query_name(package)
+                        },
+                        "versions": [package.version]
+                    }]
+                }),
+                None,
+            )
+            .unwrap();
+    }
+
     fn crates_package(name: &str) -> Package {
         Package::new(
             Ecosystem::CratesIo,
@@ -2055,6 +2167,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paginates_queries_independently_and_caches_complete_deduplicated_ids() {
+        let server = MockServer::start().await;
+        let packages = vec![npm_package("alpha"), npm_package("beta")];
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(&packages)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {
+                        "vulns": [
+                            {"id": "TEST-ALPHA-1"},
+                            {"id": "TEST-ALPHA-DUP"}
+                        ],
+                        "next_page_token": "alpha-page-2"
+                    },
+                    {
+                        "vulns": [{"id": "TEST-BETA-1"}],
+                        "next_page_token": "beta-page-2"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body_with_tokens(&[
+                (&packages[0], Some("alpha-page-2")),
+                (&packages[1], Some("beta-page-2")),
+            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {
+                        "vulns": [
+                            {"id": "TEST-ALPHA-DUP"},
+                            {"id": "TEST-ALPHA-2"}
+                        ]
+                    },
+                    {
+                        "vulns": [
+                            {"id": "TEST-BETA-1"},
+                            {"id": "TEST-BETA-2"}
+                        ],
+                        "next_page_token": "beta-page-3"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body_with_tokens(&[(
+                &packages[1],
+                Some("beta-page-3"),
+            )])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [{"id": "TEST-BETA-3"}]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        for id in ["TEST-ALPHA-1", "TEST-ALPHA-2", "TEST-ALPHA-DUP"] {
+            cache_osv_document(&cache, &packages[0], id);
+        }
+        for id in ["TEST-BETA-1", "TEST-BETA-2", "TEST-BETA-3"] {
+            cache_osv_document(&cache, &packages[1], id);
+        }
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let results = client.query(&packages).await.unwrap();
+
+        assert_eq!(
+            results[&packages[0].key()]
+                .iter()
+                .map(|vulnerability| vulnerability.id.as_str())
+                .collect::<Vec<_>>(),
+            ["TEST-ALPHA-1", "TEST-ALPHA-2", "TEST-ALPHA-DUP"]
+        );
+        assert_eq!(
+            results[&packages[1].key()]
+                .iter()
+                .map(|vulnerability| vulnerability.id.as_str())
+                .collect::<Vec<_>>(),
+            ["TEST-BETA-1", "TEST-BETA-2", "TEST-BETA-3"]
+        );
+        for (package, expected) in [
+            (
+                &packages[0],
+                json!(["TEST-ALPHA-1", "TEST-ALPHA-2", "TEST-ALPHA-DUP"]),
+            ),
+            (
+                &packages[1],
+                json!(["TEST-BETA-1", "TEST-BETA-2", "TEST-BETA-3"]),
+            ),
+        ] {
+            let (cached, _) = cache
+                .get(
+                    "osv/query",
+                    &osv_query_cache_key(package),
+                    Duration::seconds(OSV_QUERY_TTL_SECS),
+                )
+                .expect("complete paginated query cache entry");
+            assert_eq!(cached, expected);
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_repeated_page_tokens_without_caching_partial_ids() {
+        let server = MockServer::start().await;
+        let package = npm_package("repeated-token");
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [{"id": "TEST-PARTIAL-1"}],
+                    "next_page_token": "repeat-me"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body_with_tokens(&[(
+                &package,
+                Some("repeat-me"),
+            )])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [{"id": "TEST-PARTIAL-2"}],
+                    "next_page_token": "repeat-me"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let error = client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("repeated a next_page_token"));
+        assert!(
+            !cache
+                .filename("osv/query", &osv_query_cache_key(&package))
+                .exists()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn later_page_failure_does_not_cache_the_partial_query() {
+        let server = MockServer::start().await;
+        let package = npm_package("page-failure");
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "vulns": [{"id": "TEST-PARTIAL-1"}],
+                    "next_page_token": "broken-page"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body_with_tokens(&[(
+                &package,
+                Some("broken-page"),
+            )])))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let error = client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HTTP 400"));
+        assert!(
+            !cache
+                .filename("osv/query", &osv_query_cache_key(&package))
+                .exists()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn malformed_osv_batch_responses_fail_closed_without_query_cache_entries() {
         let cases = [
             (
@@ -2104,6 +2432,18 @@ mod tests {
                 json!({"results": [{"vulns": {}}]}),
                 1,
                 "result 0 has a non-array vulns field",
+            ),
+            (
+                "non-string next page token",
+                json!({"results": [{"vulns": [], "next_page_token": 42}]}),
+                1,
+                "result 0 has a non-string next_page_token field",
+            ),
+            (
+                "empty next page token",
+                json!({"results": [{"vulns": [], "next_page_token": ""}]}),
+                1,
+                "result 0 has an empty next_page_token field",
             ),
             (
                 "non-object vulnerability",
