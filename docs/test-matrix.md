@@ -125,7 +125,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-010 | `dotnet.rs` multi-project/central/legacy matrix |
 | DS-011 | `cargo_manifest.rs` workspace fixture matrix |
 | DS-012 | `python_locks.rs` uv/Poetry provenance matrix and CLI filters |
-| DS-013 | `malformed_osv_batch_responses_fail_closed_without_query_cache_entries` |
+| DS-013 | `malformed_osv_batch_responses_fail_closed_without_query_cache_entries`, `malformed_result_is_soft_when_an_aligned_package_result_is_complete`, and valid-empty alignment/cache regression |
 | DS-014 | `paginates_queries_independently_and_caches_complete_deduplicated_ids` and repeated-token rejection |
 | DS-015 | registry/OSV ETag, revision and racing-writer tests |
 | DS-016 | sync streaming, interruption, retry, validation, atomic replacement and rollback tests |
