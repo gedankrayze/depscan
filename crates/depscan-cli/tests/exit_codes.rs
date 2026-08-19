@@ -194,6 +194,11 @@ checksum = "1111111111111111111111111111111111111111111111111111111111111111""#
         );
     }
 
+    fn seed_empty_osv_query(&self, package_name: &str) {
+        let query_digest = sha256_hex(format!("crates.io:{package_name}:1.0.0").as_bytes());
+        self.seed_cache("osv/query", &query_digest, "[]");
+    }
+
     fn seed_osv_document(&self, advisory_id: &str, document: &str) {
         let hydration_digest = sha256_hex(format!("{advisory_id}@2026-08-19T00:00:00Z").as_bytes());
         self.seed_cache("osv/vuln", &hydration_digest, document);
@@ -1957,6 +1962,112 @@ fn online_osv_total_outage_exits_thirty() {
 
     assert_exit(&output, 30);
     assert_diagnostic_only_on_stderr(&output, "provider hard failure");
+}
+
+#[test]
+fn future_empty_osv_query_cache_cannot_turn_a_total_outage_clean() {
+    let project = TestProject::rust("future-empty-query-total-outage");
+    project.seed_clean("1.0.0");
+    project.set_cache_timestamp(
+        "osv/query",
+        QUERY_DIGEST,
+        Utc::now() + chrono::Duration::days(1),
+    );
+
+    let output = command(&project.cache)
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .args([
+            "scan",
+            "--max-cache-age",
+            "1s",
+            "--format",
+            "json",
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("run depscan with a future-dated empty OSV query cache entry");
+
+    assert_exit(&output, 30);
+    assert_diagnostic_only_on_stderr(&output, "provider hard failure");
+}
+
+#[test]
+fn future_empty_osv_query_failure_is_soft_beside_a_trustworthy_cached_result() {
+    let project = TestProject::rust("future-empty-query-partial-outage");
+    project.seed_clean("1.0.0");
+    project.set_cache_timestamp(
+        "osv/query",
+        QUERY_DIGEST,
+        Utc::now() + chrono::Duration::days(1),
+    );
+    project.add_rust_package("trusted-cache");
+    project.seed_empty_osv_query("trusted-cache");
+
+    let output = command(&project.cache)
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .args([
+            "scan",
+            "--format",
+            "json",
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("run depscan with future and trustworthy OSV query cache entries");
+
+    assert_exit(&output, 0);
+    let report = json_report(&output);
+    let packages = report_packages(&report);
+    let future = packages
+        .iter()
+        .find(|result| {
+            result
+                .pointer("/package/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("demo")
+        })
+        .expect("future-dated package result");
+    assert!(
+        future
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| errors.iter().any(|error| {
+                error.get("provider").and_then(serde_json::Value::as_str) == Some("osv")
+                    && error
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| message.contains("query failed"))
+            }))
+    );
+    let trustworthy = packages
+        .iter()
+        .find(|result| {
+            result
+                .pointer("/package/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("trusted-cache")
+        })
+        .expect("trustworthy cached package result");
+    assert_eq!(
+        trustworthy
+            .get("vulns")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert!(
+        trustworthy
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| errors.iter().all(|error| {
+                error.get("provider").and_then(serde_json::Value::as_str) != Some("osv")
+            }))
+    );
 }
 
 #[test]

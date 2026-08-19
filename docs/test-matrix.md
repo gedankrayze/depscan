@@ -47,7 +47,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | §5 complete CLI/config/filter/help surface | CLI unit merge tests plus `exit_codes.rs` typed-value, config, help, completion, filtering, and stream-contract process tests |
 | §5 exit taxonomy and precedence | the exit-code table below |
 | §6 table, JSON, SARIF 2.1.0 and summary | report unit tests plus all four formats for all four ecosystems in `offline_ecosystem_output_matrix` |
-| §7 cache, ETag, TTL, retries, limits and explicit tools | cache/revalidation/retry suites; capability-safe cache tests; `tool_fallbacks.rs`; implicit authorization denial process test |
+| §7 cache, ETag, TTL, retries, limits and explicit tools | controlled common-cache age boundaries; future registry/sparse revalidation and OSV hard/soft process tests; cache/revalidation/retry suites; capability-safe cache tests; `tool_fallbacks.rs`; implicit authorization denial process test |
 | §8 workspace crate boundaries and packageability | `cargo check/test/clippy --workspace --all-targets`; `cargo package --list`/`cargo package` evidence in DS-024 |
 | §9 required testing layers | parser, version, provider, deterministic E2E, ignored live, three-OS CI, MSRV, and dogfood rows in this document |
 | §10 M1-M6 functional milestones | workspace suite and E2E/provider matrices; `uses: ./` composite-action smoke; artifact publication and real action downloads remain release-gated by DS-045/DS-049 rather than inferred from unit tests |
@@ -88,9 +88,9 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | Native registry malformed responses | `native_registry_http_mocks_reject_malformed_documents_for_every_ecosystem`; crates NDJSON malformed/size matrix |
 | Retry budget, 429/5xx/connect/timeout, `Retry-After`, no final sleep | provider retry-status/date/JSON/bytes/transport tests and sync retry tests |
 | OSV batch alignment, 1,000-item chunks, pagination and hydration | `paginates_queries_independently_and_caches_complete_deduplicated_ids`; malformed batch/document matrices; query-hit affected-entry validation; partial query/hydration tests |
-| ETag/304/cache revalidation and racing writers | sparse and generic registry `stale_*`, `late_*`, changed/missing ETag tests; OSV revision/CAS tests |
-| Offline success, missing/stale/corrupt/future cache | `offline_registry_reuses_valid_cached_metadata_for_every_ecosystem`, `offline_registry_reports_cache_age_and_integrity_failures_without_network`, CLI offline tests |
-| Provider soft versus hard failure | report `soft_provider_errors_are_visible_in_every_report_format`; CLI partial/total outage tests plus malformed cached OSV hard/soft process cases |
+| ETag/304/cache revalidation and racing writers | sparse and generic registry `stale_*`, `future_*`, `late_*`, changed/missing ETag tests; OSV revision/CAS tests |
+| Common and offline cache age/integrity | `common_cache_freshness_rejects_future_timestamps_and_honors_boundaries`; future online OSV/registry/hydration regressions; offline registry fresh/stale/missing/corrupt/future tests; CLI offline tests |
+| Provider soft versus hard failure | report `soft_provider_errors_are_visible_in_every_report_format`; CLI partial/total outage tests, future empty-query hard/soft cases, and malformed cached OSV hard/soft cases |
 | Resource bounds | streamed dump peak-memory test; dump entry/aggregate/count limits; sparse response/line limits; requirements depth/read/byte limits; tool timeout/output-limit tests |
 
 ## Process-level output and exit matrix
@@ -106,7 +106,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | Exit precedence `1 > 2` | `vulnerability_exit_takes_precedence_over_outdated_exit` |
 | Exit `10` | unknown/typed argument, config, output, malformed project, and unsupported schema process tests |
 | Exit `20` | `unsupported_project_exits_twenty` |
-| Exit `30` | `provider_hard_failure_exits_thirty`, total OSV outage, malformed offline advisory |
+| Exit `30` | `provider_hard_failure_exits_thirty`, total OSV outage, future empty OSV cache with denied network, malformed offline advisory |
 | stdout report / stderr diagnostics | success/finding helpers and usage/config/provider process assertions throughout `exit_codes.rs` |
 
 ## Audit issue traceability
@@ -168,6 +168,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-053 | ledger numbering/index/traceability and issue-tagged commit-history completion audit |
 | DS-054 | bounded inline/linked NuGet registration metadata, canonical-ID/mismatch and URL-confinement provider tests; online/offline query-plan identity controls; lowercase exact/range canonical-only OSV process regression |
 | DS-055 | online/offline total manifest-resolution failure, partial-resolution, and report-only process controls |
+| DS-056 | controlled common-cache time boundaries; future OSV query/hydration, generic registry, sparse-index, cache-bypass, and process hard/soft regressions |
 | DS-057 | strict npm v2/v3 entry table; link/alias/group-precedence/concrete-hoist/workspace-pattern/source/v1 controls; npm 11 fixtures; mixed-record exit `10`; source-redaction process test |
 | DS-063 | pending suffix-aware positive/negative-extglob differential corpus and real npm workspace fixture |
 

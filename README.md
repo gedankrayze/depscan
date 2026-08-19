@@ -192,6 +192,8 @@ Expired suppressions are not applied and are emitted as warnings and report meta
 
 Withdrawn OSV advisories are excluded by default, so they do not render, contribute to totals, or affect exit thresholds. `--include-withdrawn` retains them in the scan model; table, JSON, SARIF, and summary output then label and count them explicitly, and their severity participates in `--fail-on` like any other retained advisory.
 
+Reusable provider-cache entries are fresh only when their `stored_at` timestamp is not later than the current UTC time and their age is within both the provider TTL and any stricter `--max-cache-age`. A future-dated entry is never accepted as a vulnerability or freshness result: online providers must revalidate or replace it, while cache-bypass scans continue to ignore reusable values without discarding the raw generation used for race-safe publication.
+
 ## Offline scans
 
 Populate offline advisory archives once:

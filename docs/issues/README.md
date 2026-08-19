@@ -74,5 +74,6 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-053](DS-053.md) | P2 | Closed | Clarify atomic issue-and-fix commits |
 | [DS-054](DS-054.md) | P0 | Closed | Resolve canonical NuGet identities from registration metadata |
 | [DS-055](DS-055.md) | P1 | Closed | Fail hard when every manifest vulnerability coordinate is unresolved |
+| [DS-056](DS-056.md) | P1 | Closed | Reject future-dated reusable provider-cache entries |
 | [DS-057](DS-057.md) | P1 | Closed | Reject malformed npm v2/v3 package records |
 | [DS-063](DS-063.md) | P1 | Open | Support suffix-aware npm extglobs safely |

@@ -896,6 +896,14 @@ impl Cache {
         serde_json::from_str(&text).ok()
     }
     fn lookup_from_entry(&self, entry: CacheEntry, ttl: Duration) -> CacheLookup {
+        self.lookup_from_entry_at(entry, ttl, Utc::now())
+    }
+    fn lookup_from_entry_at(
+        &self,
+        entry: CacheEntry,
+        ttl: Duration,
+        now: DateTime<Utc>,
+    ) -> CacheLookup {
         let limit = self
             .policy
             .max_age
@@ -903,7 +911,7 @@ impl Cache {
         CacheLookup {
             etag: entry.etag,
             value: entry.value,
-            fresh: Utc::now() - entry.stored_at <= limit,
+            fresh: entry.stored_at <= now && now - entry.stored_at <= limit,
         }
     }
     fn lock_for(&self, path: &Path) -> Result<File, ProviderError> {
@@ -4875,10 +4883,122 @@ mod tests {
         write_cache_entry(cache, namespace, key, &entry);
     }
 
+    fn set_cache_entry_timestamp(
+        cache: &Cache,
+        namespace: &str,
+        key: &str,
+        stored_at: DateTime<Utc>,
+    ) {
+        let mut entry = read_cache_entry(cache, namespace, key);
+        entry.stored_at = stored_at;
+        write_cache_entry(cache, namespace, key, &entry);
+    }
+
     fn test_timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn common_cache_freshness_rejects_future_timestamps_and_honors_boundaries() {
+        fn entry(stored_at: DateTime<Utc>) -> CacheEntry {
+            CacheEntry {
+                stored_at,
+                etag: None,
+                value: Value::Null,
+            }
+        }
+
+        let now = test_timestamp("2026-08-19T12:00:00Z");
+        let ttl = Duration::hours(1);
+        let cache = Cache {
+            root: PathBuf::new(),
+            policy: CachePolicy::default(),
+        };
+
+        assert!(cache.lookup_from_entry_at(entry(now), ttl, now).fresh);
+        assert!(cache.lookup_from_entry_at(entry(now - ttl), ttl, now).fresh);
+        assert!(
+            !cache
+                .lookup_from_entry_at(entry(now - ttl - Duration::nanoseconds(1)), ttl, now)
+                .fresh
+        );
+        assert!(
+            !cache
+                .lookup_from_entry_at(entry(now + Duration::nanoseconds(1)), ttl, now)
+                .fresh
+        );
+
+        let max_age = Duration::minutes(30);
+        let strict = Cache {
+            root: PathBuf::new(),
+            policy: CachePolicy {
+                read: true,
+                max_age: Some(max_age),
+            },
+        };
+        assert!(
+            strict
+                .lookup_from_entry_at(entry(now - max_age), ttl, now)
+                .fresh
+        );
+        assert!(
+            !strict
+                .lookup_from_entry_at(entry(now - max_age - Duration::nanoseconds(1)), ttl, now,)
+                .fresh
+        );
+        assert!(
+            !strict
+                .lookup_from_entry_at(entry(now + Duration::nanoseconds(1)), ttl, now)
+                .fresh
+        );
+    }
+
+    #[test]
+    fn future_concurrent_winner_remains_a_non_reusable_cas_generation() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let ttl = Duration::hours(1);
+        cache
+            .put("registry", "future-conflict", &json!({"revision": 1}), None)
+            .unwrap();
+        let expected = cache
+            .snapshot("registry", "future-conflict", ttl)
+            .expect("initial cache generation");
+        cache
+            .put("registry", "future-conflict", &json!({"revision": 2}), None)
+            .unwrap();
+        set_cache_entry_timestamp(
+            &cache,
+            "registry",
+            "future-conflict",
+            Utc::now() + Duration::days(1),
+        );
+
+        let conflict = cache
+            .put_if_unchanged(
+                "registry",
+                "future-conflict",
+                Some(&expected),
+                &json!({"revision": 3}),
+                None,
+                ttl,
+            )
+            .unwrap();
+
+        let CacheCommit::Conflict(Some(current)) = conflict else {
+            panic!("concurrent future entry must remain the raw conflict generation");
+        };
+        assert!(!current.fresh);
+        assert_eq!(current.value, json!({"revision": 2}));
+        assert_eq!(
+            read_cache_entry(&cache, "registry", "future-conflict").value,
+            current.value
+        );
     }
 
     fn valid_offline_document(id: &str, details: &str) -> Vec<u8> {
@@ -8467,6 +8587,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn future_sparse_index_revalidates_before_reuse() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fi/xt/fixture"))
+            .and(header("if-none-match", "\"sparse-future\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "crates:fixture",
+                &json!({
+                    "schema_version": CRATES_IO_INDEX_CACHE_SCHEMA_VERSION,
+                    "entries": [
+                        {"name": "fixture", "vers": "1.0.0", "yanked": false},
+                        {"name": "fixture", "vers": "2.0.0", "yanked": false}
+                    ]
+                }),
+                Some("\"sparse-future\"".to_owned()),
+            )
+            .unwrap();
+        let future = Utc::now() + Duration::days(1);
+        set_cache_entry_timestamp(&cache, "registry", "crates:fixture", future);
+        let client = RegistryClient::with_crates_index_base_url(
+            HttpClient::new().unwrap(),
+            cache.clone(),
+            server.uri(),
+        );
+
+        let latest = client.latest(&crates_package("fixture")).await.unwrap();
+
+        assert_eq!(latest.latest.latest_stable, "2.0.0");
+        let refreshed = read_cache_entry(&cache, "registry", "crates:fixture");
+        assert!(refreshed.stored_at < future);
+        assert!(refreshed.stored_at <= Utc::now());
+        assert_eq!(refreshed.etag.as_deref(), Some("\"sparse-future\""));
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn late_sparse_304_cannot_overwrite_a_concurrent_changed_index() {
         let server = MockServer::start().await;
         let slow_received = Arc::new(tokio::sync::Notify::new());
@@ -8591,6 +8758,50 @@ mod tests {
         assert!(refreshed.stored_at > before);
         assert_eq!(refreshed.etag.as_deref(), Some("\"revision-1\""));
         assert_eq!(refreshed.value, value);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn future_registry_metadata_revalidates_before_reuse() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .and(header("if-none-match", "\"revision-future\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "registry",
+                "future-etag",
+                &json!({"revision": 1}),
+                Some("\"revision-future\"".to_owned()),
+            )
+            .unwrap();
+        let future = Utc::now() + Duration::days(1);
+        set_cache_entry_timestamp(&cache, "registry", "future-etag", future);
+        let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+
+        let value = client
+            .metadata(
+                "future-etag",
+                &format!("{}/metadata", server.uri()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({"revision": 1}));
+        let refreshed = read_cache_entry(&cache, "registry", "future-etag");
+        assert!(refreshed.stored_at < future);
+        assert!(refreshed.stored_at <= Utc::now());
+        assert_eq!(refreshed.etag.as_deref(), Some("\"revision-future\""));
         server.verify().await;
     }
 
@@ -9397,6 +9608,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn future_hydration_entry_is_not_reused_without_network_validation() {
+        let server = MockServer::start().await;
+        let id = "TEST-HYDRATION-FUTURE-1";
+        let revision = OsvVulnerabilityRevision {
+            id: id.to_owned(),
+            modified: test_timestamp(TEST_OSV_MODIFIED),
+        };
+        let cached_document = json!({
+            "id": id,
+            "modified": TEST_OSV_MODIFIED,
+            "summary": "future-dated cached representation",
+            "affected": []
+        });
+        let network_document = json!({
+            "id": id,
+            "modified": TEST_OSV_MODIFIED,
+            "summary": "network-validated representation",
+            "affected": []
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&network_document))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put("osv/vuln", &revision.cache_key(), &cached_document, None)
+            .unwrap();
+        set_cache_entry_timestamp(
+            &cache,
+            "osv/vuln",
+            &revision.cache_key(),
+            Utc::now() + Duration::days(1),
+        );
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let reported = client.hydrate(&revision).await.unwrap();
+
+        assert_eq!(reported.value, network_document);
+        assert!(reported.cache_warning.is_none());
+        assert_eq!(
+            read_cache_entry(&cache, "osv/vuln", &revision.cache_key()).value,
+            cached_document,
+            "the future entry remains only as a raw CAS generation, not a reusable result"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn cache_bypass_returns_network_hydration_but_aliases_the_newer_disk_winner() {
         let server = MockServer::start().await;
         let id = "TEST-HYDRATION-BYPASS-ALIAS-1";
@@ -9464,7 +9730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_bypass_ignores_a_stale_future_osv_revision() {
+    async fn cache_bypass_ignores_a_future_dated_stale_osv_revision() {
         let server = MockServer::start().await;
         let package = npm_package("bypass-future-revision");
         let id = "TEST-BYPASS-FUTURE-1";
@@ -9511,6 +9777,12 @@ mod tests {
                 None,
             )
             .unwrap();
+        set_cache_entry_timestamp(
+            &cache,
+            "osv/query",
+            &query_key,
+            Utc::now() + Duration::days(1),
+        );
         let client =
             OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
 
