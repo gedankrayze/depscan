@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -181,6 +182,45 @@ impl Fixture {
             Utc::now().to_rfc3339(),
         )
         .expect("write dump timestamp");
+    }
+
+    fn seed_npm_registry(&self, name: &str, versions: &[&str]) {
+        let latest = versions.last().expect("registry fixture has a version");
+        let value = serde_json::json!({
+            "dist-tags": {"latest": latest},
+            "versions": versions
+                .iter()
+                .map(|version| ((*version).to_owned(), serde_json::json!({})))
+                .collect::<serde_json::Map<_, _>>()
+        });
+        self.seed_registry_value(&format!("npm:{name}"), value);
+    }
+
+    fn seed_nuget_registry(&self, name: &str, versions: &[&str]) {
+        self.seed_registry_value(
+            &format!("nuget:{}", name.to_ascii_lowercase()),
+            serde_json::json!({"versions": versions}),
+        );
+    }
+
+    fn seed_registry_value(&self, key: &str, value: serde_json::Value) {
+        let digest = Sha256::digest(key.as_bytes());
+        let filename = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let directory = self.cache.join("registry");
+        fs::create_dir_all(&directory).expect("create registry cache");
+        fs::write(
+            directory.join(format!("{filename}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "stored_at": Utc::now().to_rfc3339(),
+                "etag": null,
+                "value": value,
+            }))
+            .expect("encode registry cache entry"),
+        )
+        .expect("write registry cache entry");
     }
 
     fn run(&self, arguments: &[&str]) -> Output {
@@ -539,6 +579,7 @@ fn missing_bun_executable_degrades_to_manifest_constraints() {
     let fixture = Fixture::new();
     fixture.bun_project();
     fixture.seed_dump("npm");
+    fixture.seed_npm_registry("left-pad", &["1.3.0"]);
     let empty_path = env::join_paths([fixture.bin.clone()]).unwrap();
 
     let output = fixture.run_with_path(
@@ -570,6 +611,14 @@ fn tools_are_never_started_without_effective_authorization() {
     bun.bun_workspace_project();
     bun.install("bun", FakeBehavior::Valid(BUN_OUTPUT));
     bun.seed_dump("npm");
+    for (name, version) in [
+        ("root-production", "1.0.0"),
+        ("root-development", "2.0.0"),
+        ("workspace-production", "3.0.0"),
+        ("workspace-development", "4.0.0"),
+    ] {
+        bun.seed_npm_registry(name, &[version]);
+    }
     let output = bun.run(&[
         "scan",
         "--offline",
@@ -612,6 +661,7 @@ fn tools_are_never_started_without_effective_authorization() {
     dotnet.dotnet_project();
     dotnet.install("dotnet", FakeBehavior::Valid(DOTNET_OUTPUT));
     dotnet.seed_dump("NuGet");
+    dotnet.seed_nuget_registry("Humanizer.Core", &["2.14.1"]);
     let output = dotnet.run(&[
         "scan",
         "--offline",

@@ -614,6 +614,7 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         let registry = RegistryOffline::new(cache.clone());
         let freshness = fetch_latest(&registry, &packages, true).await;
         let plan = VulnerabilityQueryPlan::new(&packages, &freshness);
+        reject_totally_unresolved_plan(&plan)?;
         let vulnerabilities = OsvOffline::new(cache)
             .query(plan.packages())
             .await
@@ -624,6 +625,7 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         let registry = RegistryClient::new(http.clone(), cache.clone());
         let freshness = fetch_latest(&registry, &packages, false).await;
         let plan = VulnerabilityQueryPlan::new(&packages, &freshness);
+        reject_totally_unresolved_plan(&plan)?;
         let vulnerabilities = OsvClient::new(http, cache)
             .query(plan.packages())
             .await
@@ -698,6 +700,15 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
     } else {
         Ok(AppExit::Clean)
     }
+}
+
+fn reject_totally_unresolved_plan(plan: &VulnerabilityQueryPlan) -> Result<(), CliError> {
+    let Some(count) = plan.totally_unresolved_count() else {
+        return Ok(());
+    };
+    Err(CliError::provider(format!(
+        "registry metadata did not resolve any of {count} enrichable manifest dependencies to a concrete version for OSV"
+    )))
 }
 
 fn suppression_matches(
