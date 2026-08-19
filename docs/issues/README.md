@@ -77,5 +77,6 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-056](DS-056.md) | P1 | Closed | Reject future-dated reusable provider-cache entries |
 | [DS-057](DS-057.md) | P1 | Closed | Reject malformed npm v2/v3 package records |
 | [DS-058](DS-058.md) | P1 | Open | Do not classify unproven Node dependencies as known transitive |
+| [DS-059](DS-059.md) | P1 | Open | Bind Cargo direct and development metadata to exact locked identities |
 | [DS-061](DS-061.md) | P1 | In progress | Preserve the verified GitHub Action executable identity |
 | [DS-063](DS-063.md) | P1 | Open | Support suffix-aware npm extglobs safely |
