@@ -313,6 +313,14 @@ fn python_fixture(case: &str) -> PathBuf {
         .join(case)
 }
 
+fn lock_schema_fixture(format: &str, case: &str, file: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../depscan-parsers/tests/fixtures/schema-validation")
+        .join(format)
+        .join(case)
+        .join(file)
+}
+
 fn seed_empty_pypi_dump(cache: &Path) {
     seed_empty_osv_dump(cache, "PyPI");
 }
@@ -1713,6 +1721,48 @@ fn malformed_project_input_exits_ten() {
 
     assert_exit(&output, 10);
     assert_diagnostic_only_on_stderr(&output, "failed to parse");
+}
+
+#[test]
+fn unsupported_lock_schemas_exit_ten_before_provider_access() {
+    for (format, file) in [
+        ("npm", "package-lock.json"),
+        ("bun", "bun.lock"),
+        ("pnpm", "pnpm-lock.yaml"),
+        ("uv", "uv.lock"),
+        ("poetry", "poetry.lock"),
+        ("pipfile", "Pipfile.lock"),
+        ("nuget", "packages.lock.json"),
+        ("cargo", "Cargo.lock"),
+    ] {
+        let directory = TestDirectory::new(&format!("unsupported-{format}-lock"));
+        let cache = directory.path().join("cache");
+        fs::copy(
+            lock_schema_fixture(format, "missing-section", file),
+            directory.path().join(file),
+        )
+        .unwrap_or_else(|error| panic!("copy {format} fixture: {error}"));
+
+        let output = command(&cache)
+            .args([
+                "scan",
+                directory.path().to_str().expect("UTF-8 project path"),
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("run malformed {format} scan: {error}"));
+
+        assert_exit(&output, 10);
+        assert_diagnostic_only_on_stderr(&output, file);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("failed to parse"),
+            "{format} did not report a parse failure: {stderr}"
+        );
+        assert!(
+            !stderr.contains("provider hard failure"),
+            "{format} reached provider access after an invalid lock: {stderr}"
+        );
+    }
 }
 
 #[test]

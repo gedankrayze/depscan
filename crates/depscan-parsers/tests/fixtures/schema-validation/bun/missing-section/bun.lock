@@ -1,0 +1,6 @@
+{
+  "lockfileVersion": 2,
+  "workspaces": {
+    "": { "name": "missing-packages" }
+  }
+}

@@ -344,45 +344,109 @@ fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let root = path.parent().unwrap_or(Path::new("."));
     let direct = node_direct_dependencies(root);
     let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
+    let document = value.as_object().ok_or_else(|| {
+        invalid(
+            path,
+            "detected a non-object JSON document; expected an npm package-lock.json object",
+        )
+    })?;
+    let lockfile_version = document
+        .get("lockfileVersion")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "detected JSON without an integer lockfileVersion; expected npm package-lock.json version 1, 2, or 3",
+            )
+        })?;
     let mut packages = Vec::new();
-    if let Some(map) = value.get("packages").and_then(Json::as_object) {
-        for (key, entry) in map {
-            if key.is_empty() || entry.get("link").and_then(Json::as_bool) == Some(true) {
-                continue;
-            }
-            if let Some(version) = entry.get("version").and_then(Json::as_str)
-                && let Some(location) = npm_package_location(key)
-            {
-                let mut pkg =
+    match lockfile_version {
+        1 => {
+            let dependencies = document
+                .get("dependencies")
+                .and_then(Json::as_object)
+                .ok_or_else(|| {
+                    invalid(
+                        path,
+                        "detected npm package-lock.json version 1 without a dependencies object; expected the legacy dependency tree",
+                    )
+                })?;
+            parse_legacy_npm_tree(dependencies, path, &direct.all, true, &mut packages);
+        }
+        2 | 3 => {
+            let package_entries = document
+                .get("packages")
+                .and_then(Json::as_object)
+                .ok_or_else(|| {
+                    invalid(
+                        path,
+                        format!(
+                            "detected npm package-lock.json version {lockfile_version} without a packages object; expected the version 2/3 packages map"
+                        ),
+                    )
+                })?;
+            for (key, entry) in package_entries {
+                let Some(entry) = entry.as_object() else {
+                    continue;
+                };
+                if key.is_empty() || entry.get("link").and_then(Json::as_bool) == Some(true) {
+                    continue;
+                }
+                let Some(location) = npm_package_location(key) else {
+                    // Workspace targets and other local package descriptors do not
+                    // represent registry resolutions in package-lock.json. DS-008
+                    // also deliberately ignores malformed install-location keys.
+                    continue;
+                };
+                let Some(version) = entry
+                    .get("version")
+                    .and_then(Json::as_str)
+                    .filter(|version| !version.is_empty())
+                else {
+                    continue;
+                };
+                let mut package =
                     Package::new(Ecosystem::Npm, &location.name, version, path.to_path_buf());
-                pkg.direct = direct.includes_package_at(&location.install_parent, &location.name);
-                pkg.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
-                packages.push(pkg);
+                package.direct =
+                    direct.includes_package_at(&location.install_parent, &location.name);
+                package.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
+                packages.push(package);
             }
         }
-    } else if let Some(deps) = value.get("dependencies") {
-        parse_legacy_npm_tree(deps, path, &direct.all, true, &mut packages);
+        version => {
+            return Err(invalid(
+                path,
+                format!(
+                    "detected unsupported npm package-lock.json lockfileVersion {version}; expected version 1, 2, or 3"
+                ),
+            ));
+        }
     }
     Ok(dedup(packages))
 }
 fn parse_legacy_npm_tree(
-    node: &Json,
+    dependencies: &serde_json::Map<String, Json>,
     path: &Path,
     direct: &HashSet<String>,
     top_level: bool,
     out: &mut Vec<Package>,
 ) {
-    if let Some(map) = node.as_object() {
-        for (name, entry) in map {
-            if let Some(version) = entry.get("version").and_then(Json::as_str) {
-                let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-                p.direct = top_level && direct.contains(name);
-                p.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
-                out.push(p);
-            }
-            if let Some(children) = entry.get("dependencies") {
-                parse_legacy_npm_tree(children, path, direct, false, out);
-            }
+    for (name, entry) in dependencies {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        if let Some(version) = entry
+            .get("version")
+            .and_then(Json::as_str)
+            .filter(|version| !version.is_empty())
+        {
+            let mut package = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
+            package.direct = top_level && direct.contains(name);
+            package.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
+            out.push(package);
+        }
+        if let Some(children) = entry.get("dependencies").and_then(Json::as_object) {
+            parse_legacy_npm_tree(children, path, direct, false, out);
         }
     }
 }
@@ -391,6 +455,12 @@ fn parse_bun_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let cleaned = strip_jsonc(&text).map_err(|error| invalid(path, error))?;
     let value: Json = serde_json::from_str(&cleaned).map_err(|e| invalid(path, e))?;
+    value.as_object().ok_or_else(|| {
+        invalid(
+            path,
+            "detected a non-object JSONC document; expected a Bun text lockfile object",
+        )
+    })?;
     let lockfile_version = value
         .get("lockfileVersion")
         .and_then(Json::as_u64)
@@ -406,10 +476,16 @@ fn parse_bun_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
 
     let workspace_metadata = parse_bun_workspaces(path, &value)?;
     let mut output = Vec::new();
-    let Some(packages) = value.get("packages") else {
-        return Ok(output);
-    };
-    let packages = packages
+    let packages = value
+        .get("packages")
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "detected Bun lockfileVersion {lockfile_version} without packages; expected a packages object"
+                ),
+            )
+        })?
         .as_object()
         .ok_or_else(|| invalid(path, "Bun packages must be an object"))?;
 
@@ -837,18 +913,103 @@ fn strip_jsonc(input: &str) -> Result<String, String> {
 fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = read_yaml_text(path)?;
     let value = parse_yaml_document(path, &text)?;
+    value.as_mapping().ok_or_else(|| {
+        invalid(
+            path,
+            "detected a non-mapping YAML document; expected a pnpm-lock.yaml mapping",
+        )
+    })?;
+    let lockfile_version = value.get("lockfileVersion").ok_or_else(|| {
+        invalid(
+            path,
+            "detected YAML without lockfileVersion; expected pnpm lockfile version 6.0 or 9.0",
+        )
+    })?;
+    let supported_version = lockfile_version
+        .as_str()
+        .is_some_and(|version| matches!(version, "6" | "6.0" | "9" | "9.0"))
+        || lockfile_version
+            .as_f64()
+            .is_some_and(|version| version == 6.0 || version == 9.0);
+    if !supported_version {
+        let detected = lockfile_version.as_str().map_or_else(
+            || {
+                lockfile_version
+                    .as_f64()
+                    .map_or_else(|| "non-scalar".to_owned(), |version| version.to_string())
+            },
+            str::to_owned,
+        );
+        return Err(invalid(
+            path,
+            format!(
+                "detected unsupported pnpm lockfileVersion {detected:?}; expected version 6.0 or 9.0"
+            ),
+        ));
+    }
     let root = path.parent().unwrap_or(Path::new("."));
     let direct = node_direct_names(root);
     let mut out = Vec::new();
-    if let Some(packages) = value.get("packages").and_then(Yaml::as_mapping) {
-        for (key, entry) in packages {
-            if let Some((name, version)) = parse_pnpm_key(key) {
-                let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-                p.direct = direct.contains(&p.name);
-                p.dev = entry.get("dev").and_then(Yaml::as_bool).unwrap_or(false);
-                out.push(p);
-            }
+    let packages = value
+        .get("packages")
+        .and_then(Yaml::as_mapping)
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "detected a supported pnpm lockfile without a packages mapping; expected the resolved package map",
+            )
+        })?;
+    for (key, entry) in packages {
+        let entry = entry.as_mapping().ok_or_else(|| {
+            invalid(
+                path,
+                format!("pnpm package entry {key:?} must be a mapping"),
+            )
+        })?;
+        let (name, version) = parse_pnpm_key(key).ok_or_else(|| {
+            invalid(
+                path,
+                format!("pnpm package key {key:?} is not a supported package locator"),
+            )
+        })?;
+        validate_bun_package_name(name).map_err(|error| {
+            invalid(
+                path,
+                format!("pnpm package key {key:?} has an invalid package name: {error}"),
+            )
+        })?;
+        if version.starts_with("file:")
+            || version.starts_with("link:")
+            || version.starts_with("workspace:")
+            || version.starts_with("git+")
+            || version.starts_with("github:")
+            || version.starts_with("http://")
+            || version.starts_with("https://")
+        {
+            continue;
         }
+        semver::Version::parse(version).map_err(|error| {
+            invalid(
+                path,
+                format!("pnpm package key {key:?} has an invalid npm version {version:?}: {error}"),
+            )
+        })?;
+        let dev = entry
+            .get("dev")
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    invalid(
+                        path,
+                        format!("pnpm package entry {key:?} dev must be a boolean"),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let mut package = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
+        package.direct = direct.contains(&package.name);
+        package.dev = dev;
+        out.push(package);
     }
     Ok(dedup(out))
 }
@@ -860,7 +1021,8 @@ fn parse_pnpm_key(raw: &str) -> Option<(&str, &str)> {
         key.rfind('@')
     }?;
     let (name, version) = key.split_at(at);
-    Some((name, version.trim_start_matches('@')))
+    let version = version.trim_start_matches('@');
+    (!name.is_empty() && !version.is_empty()).then_some((name, version))
 }
 
 fn parse_yarn_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
@@ -1406,32 +1568,103 @@ impl EcosystemParser for PythonParser {
 fn parse_pipfile_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
+    let document = value.as_object().ok_or_else(|| {
+        invalid(
+            path,
+            "detected a non-object JSON document; expected a Pipfile.lock object",
+        )
+    })?;
+    let metadata = document
+        .get("_meta")
+        .and_then(Json::as_object)
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "detected JSON without a _meta object; expected Pipfile.lock metadata",
+            )
+        })?;
+    let pipfile_spec = metadata
+        .get("pipfile-spec")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "detected Pipfile.lock metadata without an integer pipfile-spec; expected spec 6",
+            )
+        })?;
+    if pipfile_spec != 6 {
+        return Err(invalid(
+            path,
+            format!(
+                "detected unsupported Pipfile.lock pipfile-spec {pipfile_spec}; expected spec 6"
+            ),
+        ));
+    }
     let directness = pipfile_direct_dependencies(path);
     let mut out = Vec::new();
     for section in ["default", "develop"] {
-        if let Some(map) = value.get(section).and_then(Json::as_object) {
-            for (name, item) in map {
-                if let Some(version) = item.get("version").and_then(Json::as_str) {
-                    let mut p = Package::new(
-                        Ecosystem::PyPI,
-                        name,
-                        version.trim_start_matches("=="),
-                        path.to_path_buf(),
-                    );
-                    match directness.for_lock_section(section) {
-                        Some(direct) => {
-                            p.direct = direct.contains(&p.name);
-                            p.direct_known = true;
-                        }
-                        None => {
-                            p.direct = false;
-                            p.direct_known = false;
-                        }
-                    }
-                    p.dev = section == "develop";
-                    out.push(p);
+        let dependencies = document
+            .get(section)
+            .and_then(Json::as_object)
+            .ok_or_else(|| {
+                invalid(
+                    path,
+                    format!(
+                        "detected Pipfile.lock spec 6 without a {section} object; expected both default and develop dependency maps"
+                    ),
+                )
+            })?;
+        for (name, item) in dependencies {
+            let item = item.as_object().ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("Pipfile.lock {section} package {name:?} must be an object"),
+                )
+            })?;
+            let Some(version) = item.get("version") else {
+                if ["git", "path", "file"]
+                    .iter()
+                    .any(|source| item.contains_key(*source))
+                {
+                    // Pipenv can lock non-index sources without a PyPI version.
+                    continue;
+                }
+                return Err(invalid(
+                    path,
+                    format!(
+                        "Pipfile.lock {section} package {name:?} is missing a resolved version or supported non-index source"
+                    ),
+                ));
+            };
+            let version = version
+                .as_str()
+                .filter(|version| !version.trim_start_matches("==").is_empty())
+                .ok_or_else(|| {
+                    invalid(
+                        path,
+                        format!(
+                            "Pipfile.lock {section} package {name:?} version must be a non-empty string"
+                        ),
+                    )
+                })?;
+            let mut package = Package::new(
+                Ecosystem::PyPI,
+                name,
+                version.trim_start_matches("=="),
+                path.to_path_buf(),
+            );
+            match directness.for_lock_section(section) {
+                Some(direct) => {
+                    package.direct = direct.contains(&package.name);
+                    package.direct_known = true;
+                }
+                None => {
+                    package.direct = false;
+                    package.direct_known = false;
                 }
             }
+            package.dev = section == "develop";
+            out.push(package);
         }
     }
     Ok(dedup(out))
@@ -1609,23 +1842,40 @@ fn project_lock_file(project: &Path) -> Option<PathBuf> {
 fn parse_packages_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let value: Json = serde_json::from_str(&text).map_err(|e| invalid(path, e))?;
-    let document = value
-        .as_object()
-        .ok_or_else(|| invalid(path, "NuGet lockfile must be a JSON object"))?;
+    let document = value.as_object().ok_or_else(|| {
+        invalid(
+            path,
+            "detected a non-object JSON document; expected a NuGet packages.lock.json object",
+        )
+    })?;
     let version = document
         .get("version")
         .and_then(Json::as_u64)
-        .ok_or_else(|| invalid(path, "NuGet lockfile is missing an integer version"))?;
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "detected JSON without an integer version; expected NuGet packages.lock.json version 1, 2, or 3",
+            )
+        })?;
     if !(1..=3).contains(&version) {
         return Err(invalid(
             path,
-            format!("unsupported NuGet lockfile version {version}"),
+            format!(
+                "detected unsupported NuGet lockfile version {version}; expected version 1, 2, or 3"
+            ),
         ));
     }
     let frameworks = document
         .get("dependencies")
         .and_then(Json::as_object)
-        .ok_or_else(|| invalid(path, "NuGet lockfile dependencies must be an object"))?;
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "detected NuGet lockfile version {version} without a dependencies object; expected target-framework dependency maps"
+                ),
+            )
+        })?;
     let mut out = Vec::new();
     for (framework_name, framework) in frameworks {
         let items = framework.as_object().ok_or_else(|| {
@@ -2886,30 +3136,106 @@ fn cargo_direct_dependencies(root: &Path) -> Result<BTreeMap<String, bool>, Pars
 fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let value: Toml = toml::from_str(&text).map_err(|e| invalid(path, e))?;
-    let direct = cargo_direct_dependencies(path.parent().unwrap_or(Path::new(".")))?;
-    let mut out = Vec::new();
-    for item in value
+    let document = value.as_table().ok_or_else(|| {
+        invalid(
+            path,
+            "detected a non-table TOML document; expected a Cargo.lock table",
+        )
+    })?;
+    let lockfile_version = match document.get("version") {
+        Some(version) => version.as_integer().ok_or_else(|| {
+            invalid(
+                path,
+                "detected Cargo.lock with a non-integer version; expected lockfile version 1 through 4",
+            )
+        })?,
+        None => 1,
+    };
+    if !(1..=4).contains(&lockfile_version) {
+        return Err(invalid(
+            path,
+            format!(
+                "detected unsupported Cargo.lock version {lockfile_version}; expected version 1 through 4"
+            ),
+        ));
+    }
+    let package_entries = document
         .get("package")
         .and_then(Toml::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let (Some(name), Some(version)) = (
-            item.get("name").and_then(Toml::as_str),
-            item.get("version").and_then(Toml::as_str),
-        ) {
-            let mut p = Package::new(Ecosystem::CratesIo, name, version, path.to_path_buf());
-            if let Some(dev) = direct.get(name) {
-                p.direct = true;
-                p.dev = *dev;
-            }
-            if !item.get("source").and_then(Toml::as_str).is_some_and(|s| {
-                s.starts_with("registry+https://github.com/rust-lang/crates.io-index")
-            }) {
-                p.enrichable = false;
-            }
-            out.push(p);
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "detected Cargo.lock version {lockfile_version} without a package array; expected resolved package entries"
+                ),
+            )
+        })?;
+    let direct = cargo_direct_dependencies(path.parent().unwrap_or(Path::new(".")))?;
+    let mut out = Vec::new();
+    for (index, item) in package_entries.iter().enumerate() {
+        let item = item.as_table().ok_or_else(|| {
+            invalid(
+                path,
+                format!("Cargo.lock package entry {index} must be a table"),
+            )
+        })?;
+        let name = item
+            .get("name")
+            .and_then(Toml::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("Cargo.lock package entry {index} is missing a non-empty string name"),
+                )
+            })?;
+        let version = item
+            .get("version")
+            .and_then(Toml::as_str)
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    path,
+                    format!(
+                        "Cargo.lock package entry {index} is missing a non-empty string version"
+                    ),
+                )
+            })?;
+        semver::Version::parse(version).map_err(|error| {
+            invalid(
+                path,
+                format!(
+                    "Cargo.lock package entry {index} has invalid SemVer version {version:?}: {error}"
+                ),
+            )
+        })?;
+        let source = item
+            .get("source")
+            .map(|source| {
+                source
+                    .as_str()
+                    .filter(|source| !source.is_empty())
+                    .ok_or_else(|| {
+                        invalid(
+                            path,
+                            format!(
+                                "Cargo.lock package entry {index} source must be a non-empty string"
+                            ),
+                        )
+                    })
+            })
+            .transpose()?;
+        let mut package = Package::new(Ecosystem::CratesIo, name, version, path.to_path_buf());
+        if let Some(dev) = direct.get(name) {
+            package.direct = true;
+            package.dev = *dev;
         }
+        if !source.is_some_and(|source| {
+            source.starts_with("registry+https://github.com/rust-lang/crates.io-index")
+        }) {
+            package.enrichable = false;
+        }
+        out.push(package);
     }
     Ok(dedup(out))
 }

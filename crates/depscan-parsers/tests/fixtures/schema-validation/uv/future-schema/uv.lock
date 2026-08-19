@@ -1,0 +1,4 @@
+version = 2
+revision = 0
+requires-python = ">=3.12"
+package = []

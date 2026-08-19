@@ -1,0 +1,7 @@
+{
+  "lockfileVersion": 2,
+  "workspaces": {
+    "": { "name": "empty-bun-project" }
+  },
+  "packages": {}
+}

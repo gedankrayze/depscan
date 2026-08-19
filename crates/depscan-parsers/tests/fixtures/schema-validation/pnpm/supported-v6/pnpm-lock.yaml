@@ -1,0 +1,6 @@
+lockfileVersion: 6.0
+packages:
+  /left-pad@1.3.0:
+    resolution:
+      integrity: sha512-fixture
+    dev: false

@@ -1,0 +1,7 @@
+{
+  "lockfileVersion": 3,
+  "workspaces": {
+    "": { "name": "future-bun-project" }
+  },
+  "packages": {}
+}

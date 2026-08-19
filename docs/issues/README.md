@@ -58,7 +58,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-037](DS-037.md) | P1 | Closed | Distinguish direct and transitive Pipfile.lock packages |
 | [DS-038](DS-038.md) | P1 | Closed | Parse requirements options, includes, and extras correctly |
 | [DS-039](DS-039.md) | P1 | Closed | Implement NuGet prerelease precedence correctly |
-| [DS-040](DS-040.md) | P1 | Open | Reject malformed or unsupported lockfile schemas instead of returning empty |
+| [DS-040](DS-040.md) | P1 | Closed | Reject malformed or unsupported lockfile schemas instead of returning empty |
 | [DS-041](DS-041.md) | P1 | Closed | Error when an explicitly requested config file is missing |
 | [DS-042](DS-042.md) | P1 | Closed | Make JSON output reproducible when requested |
 | [DS-043](DS-043.md) | P1 | Closed | Show yanked installed versions even when otherwise current |
