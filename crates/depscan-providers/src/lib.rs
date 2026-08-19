@@ -2,10 +2,11 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use cvss::Cvss;
 use depscan_core::{
-    classify_staleness, compare_versions, osv_fixed_versions, osv_range_matches, Ecosystem,
-    LatestVersions, Package, ProviderError, Severity, VersionProvider, VulnMap, VulnProvider,
-    Vulnerability,
+    classify_staleness, compare_versions, normalize_name, osv_fixed_versions, osv_range_matches,
+    Ecosystem, LatestVersions, Package, ProviderError, Severity, VersionProvider, VulnMap,
+    VulnProvider, Vulnerability,
 };
 use directories::ProjectDirs;
 use fs2::FileExt;
@@ -416,14 +417,7 @@ impl VulnProvider for OsvClient {
 }
 
 fn vulnerability_from_osv(doc: &Value, package: Option<&Package>) -> Vulnerability {
-    let score = doc
-        .get("severity")
-        .and_then(Value::as_array)
-        .and_then(|a| {
-            a.iter()
-                .find_map(|s| s.get("score").and_then(Value::as_str))
-        })
-        .and_then(approx_cvss_score);
+    let score = osv_cvss_score(doc, package);
     let fixed_in = package
         .map(|p| {
             osv_fixed_versions(
@@ -473,40 +467,83 @@ fn vulnerability_from_osv(doc: &Value, package: Option<&Package>) -> Vulnerabili
         withdrawn: doc.get("withdrawn").is_some(),
     }
 }
-fn approx_cvss_score(vector: &str) -> Option<f32> {
-    if let Ok(n) = vector.parse::<f32>() {
-        return Some(n);
-    }
-    let upper = vector.to_ascii_uppercase();
-    if !upper.starts_with("CVSS:") {
-        return None;
-    }
-    let mut score: f32 = 0.0;
-    if upper.contains("/AV:N") {
-        score += 2.0;
-    } else if upper.contains("/AV:A") {
-        score += 1.0;
-    }
-    if upper.contains("/AC:L") {
-        score += 1.0;
-    }
-    if upper.contains("/PR:N") {
-        score += 1.0;
-    }
-    if upper.contains("/UI:N") {
-        score += 1.0;
-    }
-    for impact in ["/C:H", "/I:H", "/A:H"] {
-        if upper.contains(impact) {
-            score += 1.5;
+
+#[derive(Clone, Copy)]
+enum OsvCvssVersion {
+    V3,
+    V4,
+}
+
+impl OsvCvssVersion {
+    fn osv_type(self) -> &'static str {
+        match self {
+            Self::V3 => "CVSS_V3",
+            Self::V4 => "CVSS_V4",
         }
     }
-    for impact in ["/C:L", "/I:L", "/A:L"] {
-        if upper.contains(impact) {
-            score += 0.5;
-        }
+
+    fn accepts(self, vector: &Cvss) -> bool {
+        matches!(
+            (self, vector),
+            (Self::V3, Cvss::CvssV30(_) | Cvss::CvssV31(_)) | (Self::V4, Cvss::CvssV40(_))
+        )
     }
-    Some(score.min(10.0))
+}
+
+/// OSV top-level severity takes precedence over affected-entry severity. Within either source,
+/// prefer a valid CVSS v4 vector and then fall back to a valid CVSS v3 vector.
+fn osv_cvss_score(doc: &Value, package: Option<&Package>) -> Option<f32> {
+    doc.get("severity")
+        .and_then(Value::as_array)
+        .and_then(|severity| cvss_score_from_severity_lists(&[severity.as_slice()]))
+        .or_else(|| matching_affected_cvss_score(doc, package?))
+}
+
+fn matching_affected_cvss_score(doc: &Value, package: &Package) -> Option<f32> {
+    let severity_lists = doc
+        .get("affected")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|affected| affected_matches_package(affected, package))
+        .filter_map(|affected| affected.get("severity").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+
+    cvss_score_from_severity_lists(&severity_lists)
+}
+
+fn affected_matches_package(affected: &Value, package: &Package) -> bool {
+    let Some(affected_package) = affected.get("package") else {
+        return false;
+    };
+    let Some(ecosystem) = affected_package.get("ecosystem").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(name) = affected_package.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+
+    ecosystem == package.ecosystem.osv_name()
+        && normalize_name(package.ecosystem, name) == package.name
+}
+
+fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Option<f32> {
+    [OsvCvssVersion::V4, OsvCvssVersion::V3]
+        .into_iter()
+        .find_map(|version| {
+            severity_lists
+                .iter()
+                .flat_map(|severity| severity.iter())
+                .filter(|entry| {
+                    entry.get("type").and_then(Value::as_str) == Some(version.osv_type())
+                })
+                .filter_map(|entry| entry.get("score").and_then(Value::as_str))
+                .filter_map(|vector| vector.parse::<Cvss>().ok())
+                .filter(|vector| version.accepts(vector))
+                .map(|vector| vector.score())
+                .max_by(f64::total_cmp)
+                .map(|score| score as f32)
+        })
 }
 
 #[derive(Clone)]
@@ -911,14 +948,173 @@ impl RegistryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn maps_cvss_vector_to_band() {
-        assert_eq!(
-            approx_cvss_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
-                .map(Severity::from_cvss),
-            Some(Severity::Critical)
-        );
+    fn scores_supported_cvss_versions_with_standard_formulas() {
+        let cases = [
+            (
+                "CVSS_V3",
+                "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                9.8,
+                Severity::Critical,
+            ),
+            (
+                "CVSS_V3",
+                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+                7.5,
+                Severity::High,
+            ),
+            (
+                "CVSS_V4",
+                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N/V:C",
+                8.7,
+                Severity::High,
+            ),
+        ];
+
+        for (severity_type, vector, expected_score, expected_severity) in cases {
+            let document = json!({
+                "id": "TEST-1",
+                "severity": [{"type": severity_type, "score": vector}]
+            });
+            let vulnerability = vulnerability_from_osv(&document, None);
+
+            assert_eq!(vulnerability.cvss_score, Some(expected_score), "{vector}");
+            assert_eq!(vulnerability.severity, Some(expected_severity), "{vector}");
+        }
     }
+
+    #[test]
+    fn prefers_cvss_v4_and_falls_back_to_valid_cvss_v3() {
+        let v3_vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H";
+        let v4_vector = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N/V:C";
+        let document = json!({
+            "severity": [
+                {"type": "CVSS_V3", "score": v3_vector},
+                {"type": "CVSS_V4", "score": v4_vector}
+            ]
+        });
+        assert_eq!(osv_cvss_score(&document, None), Some(8.7));
+
+        let document = json!({
+            "severity": [
+                {"type": "CVSS_V4", "score": "CVSS:4.0/not-a-vector"},
+                {"type": "CVSS_V3", "score": v3_vector}
+            ]
+        });
+        assert_eq!(osv_cvss_score(&document, None), Some(7.5));
+    }
+
+    #[test]
+    fn selects_the_highest_score_independent_of_source_order() {
+        let high = json!({
+            "type": "CVSS_V3",
+            "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+        });
+        let critical = json!({
+            "type": "CVSS_V3",
+            "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        });
+
+        for severity in [vec![high.clone(), critical.clone()], vec![critical, high]] {
+            let document = json!({"severity": severity});
+            assert_eq!(osv_cvss_score(&document, None), Some(9.8));
+        }
+    }
+
+    #[test]
+    fn top_level_severity_precedes_matching_affected_severity() {
+        let package = Package::new(
+            Ecosystem::CratesIo,
+            "quick-xml",
+            "0.36.2",
+            PathBuf::from("Cargo.lock"),
+        );
+        let document = json!({
+            "severity": [{
+                "type": "CVSS_V3",
+                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+            }],
+            "affected": [{
+                "package": {"ecosystem": "crates.io", "name": "quick-xml"},
+                "severity": [{
+                    "type": "CVSS_V4",
+                    "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N/V:C"
+                }]
+            }]
+        });
+
+        assert_eq!(osv_cvss_score(&document, Some(&package)), Some(7.5));
+    }
+
+    #[test]
+    fn affected_severity_is_restricted_to_the_matching_package() {
+        let package = Package::new(
+            Ecosystem::CratesIo,
+            "quick-xml",
+            "0.36.2",
+            PathBuf::from("Cargo.lock"),
+        );
+        let document = json!({
+            "affected": [
+                {
+                    "package": {"ecosystem": "npm", "name": "quick-xml"},
+                    "severity": [{
+                        "type": "CVSS_V4",
+                        "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
+                    }]
+                },
+                {
+                    "package": {"ecosystem": "crates.io", "name": "another-crate"},
+                    "severity": [{
+                        "type": "CVSS_V4",
+                        "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
+                    }]
+                },
+                {
+                    "package": {"ecosystem": "crates.io", "name": "quick-xml"},
+                    "severity": [
+                        {
+                            "type": "CVSS_V3",
+                            "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+                        },
+                        {
+                            "type": "CVSS_V4",
+                            "score": "CVSS:4.0/not-a-vector"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let vulnerability = vulnerability_from_osv(&document, Some(&package));
+        assert_eq!(vulnerability.cvss_score, Some(7.5));
+        assert_eq!(vulnerability.severity, Some(Severity::High));
+        assert_eq!(osv_cvss_score(&document, None), None);
+    }
+
+    #[test]
+    fn rejects_malformed_mismatched_and_unscoped_scores() {
+        let cases = [
+            json!({"severity": [{"type": "CVSS_V3", "score": "6.5"}]}),
+            json!({"severity": [{
+                "type": "CVSS_V4",
+                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+            }]}),
+            json!({"severity": [{"type": "CVSS_V3", "score": "not-a-vector"}]}),
+            json!({"severity": [{
+                "type": "CVSS_V2",
+                "score": "CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P"
+            }]}),
+        ];
+
+        for document in cases {
+            let vulnerability = vulnerability_from_osv(&document, None);
+            assert_eq!(vulnerability.cvss_score, None);
+            assert_eq!(vulnerability.severity, None);
+        }
+    }
+
     #[test]
     fn builds_sparse_paths() {
         let path = match "serde".len() {

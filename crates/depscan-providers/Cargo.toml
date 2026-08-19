@@ -10,6 +10,7 @@ rust-version.workspace = true
 depscan-core = { path = "../depscan-core" }
 async-trait.workspace = true
 chrono.workspace = true
+cvss.workspace = true
 directories.workspace = true
 fs2.workspace = true
 futures.workspace = true
