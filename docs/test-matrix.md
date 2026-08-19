@@ -165,6 +165,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-050 | online cached-registry and offline-dump manifest-to-OSV process tests, including exact/ranged constraints, shared-coordinate mapping, vulnerability exit `1`, and unresolved-cache errors |
 | DS-051 | consumed-field document validator, query-hit match/evaluability tests, hydration cache bypass/non-publication, offline shape parity, and CLI hard/soft malformed-record tests |
 | DS-052 | strict root/workspace manifest fallback fixtures plus unauthorized, missing-executable, provenance, and post-start hard-failure process tests |
+| DS-053 | ledger numbering/index/traceability and issue-tagged commit-history completion audit |
 
 ## Platform and external evidence boundary
 

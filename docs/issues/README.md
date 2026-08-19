@@ -4,14 +4,14 @@ This directory is the authoritative ledger for defects and specification gaps fo
 
 ## Workflow
 
-1. Select one open `DS-*` issue.
+1. Select or create one `Open` or `In progress` `DS-*` issue in the working tree.
 2. Implement only the issue's bounded scope, including its tests and documentation.
 3. Run every check named under **Verification**, plus the workspace quality gates where Rust changed:
    - `cargo fmt --all -- --check`
    - `cargo test --workspace --all-targets`
    - `cargo clippy --all-targets -- -D warnings`
 4. Change **Status** to `Closed` only after recording concrete verification evidence in the issue.
-5. Commit that completed issue separately; include its ID in the commit subject.
+5. Commit that completed issue separately; include its ID in the commit subject. The issue record and its bounded fix may land atomically after verification, so a standalone issue-only commit is optional. Do not combine unrelated issue fixes.
 
 Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not delete closed issues or reuse their IDs.
 
@@ -71,3 +71,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-050](DS-050.md) | P1 | Closed | Scan registry-resolved manifest dependencies for vulnerabilities |
 | [DS-051](DS-051.md) | P1 | Closed | Reject malformed OSV advisory shapes without false-clean results |
 | [DS-052](DS-052.md) | P1 | Closed | Degrade unavailable Bun binary-lock extraction to manifests |
+| [DS-053](DS-053.md) | P2 | Closed | Clarify atomic issue-and-fix commits |
