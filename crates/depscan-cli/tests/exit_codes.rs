@@ -86,6 +86,23 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
         );
     }
 
+    fn add_rust_package(&self, name: &str) {
+        let mut lockfile = fs::OpenOptions::new()
+            .append(true)
+            .open(self.directory.path().join("Cargo.lock"))
+            .expect("open Cargo.lock fixture");
+        writeln!(
+            lockfile,
+            r#"
+[[package]]
+name = "{name}"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1111111111111111111111111111111111111111111111111111111111111111""#
+        )
+        .expect("append Cargo.lock package");
+    }
+
     fn seed_yanked_current(&self) {
         self.seed_cache("osv/query", QUERY_DIGEST, "[]");
         self.seed_cache(
@@ -1723,6 +1740,82 @@ fn provider_hard_failure_exits_thirty() {
 
     assert_exit(&output, 30);
     assert_diagnostic_only_on_stderr(&output, "provider hard failure");
+}
+
+#[test]
+fn online_osv_total_outage_exits_thirty() {
+    let project = TestProject::rust("online-provider-outage");
+
+    let output = command(&project.cache)
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .args([
+            "scan",
+            "--format",
+            "json",
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("run depscan with OSV unreachable");
+
+    assert_exit(&output, 30);
+    assert_diagnostic_only_on_stderr(&output, "provider hard failure");
+}
+
+#[test]
+fn online_osv_partial_outage_is_visible_without_a_false_clean_cache_entry() {
+    let project = TestProject::rust("online-provider-partial-outage");
+    project.seed_clean("1.0.0");
+    project.add_rust_package("partial-outage");
+    let failed_query_digest = sha256_hex(b"crates.io:partial-outage:1.0.0");
+
+    let output = command(&project.cache)
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .args([
+            "scan",
+            "--format",
+            "json",
+            project.directory.path().to_str().expect("UTF-8 path"),
+        ])
+        .output()
+        .expect("run depscan with one cached OSV query");
+
+    assert_exit(&output, 0);
+    let report = json_report(&output);
+    let result = report_packages(&report)
+        .iter()
+        .find(|result| {
+            result
+                .pointer("/package/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("partial-outage")
+        })
+        .expect("partial package result");
+    assert!(
+        result
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| errors.iter().any(|error| {
+                error.get("provider").and_then(serde_json::Value::as_str) == Some("osv")
+                    && error
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| message.contains("query failed"))
+            }))
+    );
+    assert!(
+        !project
+            .cache
+            .join("osv/query")
+            .join(format!("{failed_query_digest}.json"))
+            .exists(),
+        "a failed query must not be cached as an empty result"
+    );
 }
 
 #[test]

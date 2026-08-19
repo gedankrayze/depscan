@@ -4,10 +4,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use cvss::Cvss;
 use depscan_core::{
-    Ecosystem, LatestVersions, NuGetVersion, Package, ProviderError, Severity, VersionProvider,
-    VulnMap, VulnProvider, Vulnerability, classify_staleness, compare_versions,
-    evaluate_osv_affected, latest_matching_version, normalize_name, pypi_version_is_prerelease,
-    pypi_version_is_stable,
+    Ecosystem, EnrichError, LatestVersions, NuGetVersion, Package, ProviderError, Severity,
+    VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome, Vulnerability, classify_staleness,
+    compare_versions, evaluate_osv_affected, latest_matching_version, normalize_name,
+    pypi_version_is_prerelease, pypi_version_is_stable,
 };
 use directories::{BaseDirs, ProjectDirs};
 use fs2::FileExt;
@@ -205,6 +205,19 @@ fn osv_document_modified(doc: &Value, expected_id: &str) -> Result<DateTime<Utc>
         })
 }
 
+fn osv_affected_entries<'a>(
+    doc: &'a Value,
+    advisory_id: &str,
+) -> Result<&'a [Value], ProviderError> {
+    match doc.get("affected") {
+        None => Ok(&[]),
+        Some(Value::Array(affected)) => Ok(affected),
+        Some(_) => Err(ProviderError::InvalidResponse(format!(
+            "OSV advisory {advisory_id} has a non-array affected field"
+        ))),
+    }
+}
+
 fn parse_osv_modified(
     value: &Value,
     context: impl std::fmt::Display,
@@ -228,7 +241,7 @@ struct OsvQueryBatchPage {
 fn parse_osv_query_batch_response(
     response: &Value,
     expected_results: usize,
-) -> Result<Vec<OsvQueryBatchPage>, ProviderError> {
+) -> Result<Vec<Result<OsvQueryBatchPage, ProviderError>>, ProviderError> {
     let object = response
         .as_object()
         .ok_or_else(|| invalid_osv_batch_response("the top-level value is not an object"))?;
@@ -245,7 +258,7 @@ fn parse_osv_query_batch_response(
         )));
     }
 
-    results
+    Ok(results
         .iter()
         .enumerate()
         .map(|(result_index, result)| {
@@ -324,7 +337,7 @@ fn parse_osv_query_batch_response(
                 next_page_token,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn nuget_registry_cache_key(package: &Package) -> String {
@@ -860,6 +873,11 @@ struct PublishedHydration {
     reusable: bool,
 }
 
+struct HydratedDocument {
+    value: Value,
+    cache_warning: Option<ProviderError>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RetrySettings {
     attempts: usize,
@@ -1294,12 +1312,21 @@ impl OsvClient {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
         }
     }
+    #[cfg(test)]
     async fn query_batch(
         &self,
         batch: &[Package],
     ) -> Result<Vec<Vec<OsvVulnerabilityRevision>>, ProviderError> {
+        self.query_batch_outcomes(batch).await.into_iter().collect()
+    }
+
+    async fn query_batch_outcomes(
+        &self,
+        batch: &[Package],
+    ) -> Vec<Result<Vec<OsvVulnerabilityRevision>, ProviderError>> {
         let url = format!("{}/v1/querybatch", self.base_url);
         let mut revisions = vec![BTreeMap::<String, DateTime<Utc>>::new(); batch.len()];
+        let mut failures = vec![None::<ProviderError>; batch.len()];
         let mut seen_tokens = vec![BTreeSet::new(); batch.len()];
         let mut pages_seen = vec![0usize; batch.len()];
         let mut pending = (0..batch.len())
@@ -1312,16 +1339,44 @@ impl OsvClient {
                 .map(|(index, page_token)| (&batch[*index], page_token.as_deref()))
                 .collect::<Vec<_>>();
             let body = osv_query_body_with_tokens(&queries);
-            let _permit = self
-                .concurrency
-                .acquire()
-                .await
-                .map_err(|error| ProviderError::Network(error.to_string()))?;
-            let response = self.http.post_json(&url, body).await?;
+            let _permit = match self.concurrency.acquire().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let error = ProviderError::Network(error.to_string());
+                    for (index, _) in &pending {
+                        failures[*index] = Some(error.clone());
+                    }
+                    break;
+                }
+            };
+            let response = match self.http.post_json(&url, body).await {
+                Ok(response) => response,
+                Err(error) => {
+                    for (index, _) in &pending {
+                        failures[*index] = Some(error.clone());
+                    }
+                    break;
+                }
+            };
             drop(_permit);
-            let pages = parse_osv_query_batch_response(&response, pending.len())?;
+            let pages = match parse_osv_query_batch_response(&response, pending.len()) {
+                Ok(pages) => pages,
+                Err(error) => {
+                    for (index, _) in &pending {
+                        failures[*index] = Some(error.clone());
+                    }
+                    break;
+                }
+            };
             let mut next = Vec::new();
             for ((index, _), page) in pending.into_iter().zip(pages) {
+                let page = match page {
+                    Ok(page) => page,
+                    Err(error) => {
+                        failures[index] = Some(error);
+                        continue;
+                    }
+                };
                 pages_seen[index] += 1;
                 for revision in page.revisions {
                     revisions[index]
@@ -1333,14 +1388,16 @@ impl OsvClient {
                 }
                 if let Some(token) = page.next_page_token {
                     if !seen_tokens[index].insert(token.clone()) {
-                        return Err(invalid_osv_batch_response(format!(
+                        failures[index] = Some(invalid_osv_batch_response(format!(
                             "result for query {index} repeated a next_page_token"
                         )));
+                        continue;
                     }
                     if pages_seen[index] >= OSV_MAX_QUERY_PAGES {
-                        return Err(invalid_osv_batch_response(format!(
+                        failures[index] = Some(invalid_osv_batch_response(format!(
                             "result for query {index} exceeded the {OSV_MAX_QUERY_PAGES}-page limit"
                         )));
+                        continue;
                     }
                     next.push((index, Some(token)));
                 }
@@ -1348,15 +1405,21 @@ impl OsvClient {
             pending = next;
         }
 
-        Ok(revisions
+        revisions
             .into_iter()
-            .map(|revisions| {
-                revisions
-                    .into_iter()
-                    .map(|(id, modified)| OsvVulnerabilityRevision { id, modified })
-                    .collect()
+            .zip(failures)
+            .map(|(revisions, failure)| {
+                failure.map_or_else(
+                    || {
+                        Ok(revisions
+                            .into_iter()
+                            .map(|(id, modified)| OsvVulnerabilityRevision { id, modified })
+                            .collect())
+                    },
+                    Err,
+                )
             })
-            .collect())
+            .collect()
     }
     fn publish_hydrated_document(
         &self,
@@ -1400,14 +1463,22 @@ impl OsvClient {
             "OSV hydration cache entry for {id} changed repeatedly during publication"
         )))
     }
-    async fn hydrate(&self, revision: &OsvVulnerabilityRevision) -> Result<Value, ProviderError> {
+    async fn hydrate(
+        &self,
+        revision: &OsvVulnerabilityRevision,
+    ) -> Result<HydratedDocument, ProviderError> {
         let cache_key = revision.cache_key();
         if let Some((value, _)) = self
             .cache
             .get("osv/vuln", &cache_key, Duration::hours(24 * 3650))
         {
             match osv_document_modified(&value, &revision.id) {
-                Ok(modified) if modified >= revision.modified => return Ok(value),
+                Ok(modified) if modified >= revision.modified => {
+                    return Ok(HydratedDocument {
+                        value,
+                        cache_warning: None,
+                    });
+                }
                 Ok(_) => debug!(
                     id = %revision.id,
                     "ignoring hydrated OSV cache entry older than its query revision"
@@ -1427,6 +1498,7 @@ impl OsvClient {
         let url = format!("{}/v1/vulns/{}", self.base_url, revision.id);
         let (value, etag) = self.http.get_json(&url, HeaderMap::new()).await?;
         let actual_modified = osv_document_modified(&value, &revision.id)?;
+        osv_affected_entries(&value, &revision.id)?;
         if actual_modified < revision.modified {
             return Err(ProviderError::InvalidResponse(format!(
                 "OSV hydration for {} is older than query revision {}",
@@ -1437,39 +1509,97 @@ impl OsvClient {
             id: revision.id.clone(),
             modified: actual_modified,
         };
-        let mut published = self.publish_hydrated_document(
+        let mut published = match self.publish_hydrated_document(
             &actual_revision.cache_key(),
             &revision.id,
             &value,
             etag,
             true,
-        )?;
+        ) {
+            Ok(published) => published,
+            Err(error) => {
+                return Ok(HydratedDocument {
+                    value,
+                    cache_warning: Some(error),
+                });
+            }
+        };
         if actual_revision != *revision {
-            published = self.publish_hydrated_document(
+            published = match self.publish_hydrated_document(
                 &cache_key,
                 &revision.id,
                 &published.value,
                 None,
                 published.reusable,
-            )?;
+            ) {
+                Ok(published) => published,
+                Err(error) => {
+                    let value = if self.cache.policy.read && published.reusable {
+                        published.value
+                    } else {
+                        value
+                    };
+                    return Ok(HydratedDocument {
+                        value,
+                        cache_warning: Some(error),
+                    });
+                }
+            };
         }
-        if self.cache.policy.read && published.reusable {
-            Ok(published.value)
+        let value = if self.cache.policy.read && published.reusable {
+            published.value
         } else {
-            Ok(value)
-        }
+            value
+        };
+        Ok(HydratedDocument {
+            value,
+            cache_warning: None,
+        })
     }
 }
+
+fn record_osv_failure(
+    errors: &mut HashMap<String, Vec<EnrichError>>,
+    first_failure: &mut Option<ProviderError>,
+    package_key: &str,
+    context: &str,
+    error: ProviderError,
+) {
+    if first_failure.is_none() {
+        *first_failure = Some(error.clone());
+    }
+    record_osv_warning(errors, package_key, context, error);
+}
+
+fn record_osv_warning(
+    errors: &mut HashMap<String, Vec<EnrichError>>,
+    package_key: &str,
+    context: &str,
+    error: ProviderError,
+) {
+    errors
+        .entry(package_key.to_owned())
+        .or_default()
+        .push(EnrichError {
+            provider: "osv".to_owned(),
+            message: format!("{context}: {error}"),
+        });
+}
+
 #[async_trait]
 impl VulnProvider for OsvClient {
-    async fn query(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
+    async fn query(&self, packages: &[Package]) -> Result<VulnQueryOutcome, ProviderError> {
         let query_ttl = Duration::seconds(OSV_QUERY_TTL_SECS);
         let mut revisions_by_package = HashMap::<String, Vec<OsvVulnerabilityRevision>>::new();
+        let mut errors = HashMap::<String, Vec<EnrichError>>::new();
+        let mut first_failure = None;
         let mut missing = Vec::new();
-        for package in packages
+        let eligible = packages
             .iter()
             .filter(|p| p.enrichable && !p.resolved_from_range)
-        {
+            .collect::<Vec<_>>();
+        let eligible_count = eligible.len();
+        for package in eligible.iter().copied() {
             let query_cache_key = osv_query_cache_key(package);
             let generation = self
                 .cache
@@ -1502,10 +1632,23 @@ impl VulnProvider for OsvClient {
                     .iter()
                     .map(|(package, _, _)| package.clone())
                     .collect::<Vec<_>>();
-                let lists = self.query_batch(&batch).await?;
-                for ((package, generation, enforce_regression), revisions) in
+                let lists = self.query_batch_outcomes(&batch).await;
+                for ((package, generation, enforce_regression), outcome) in
                     chunk.iter().cloned().zip(lists)
                 {
+                    let revisions = match outcome {
+                        Ok(revisions) => revisions,
+                        Err(error) => {
+                            record_osv_failure(
+                                &mut errors,
+                                &mut first_failure,
+                                &package.key(),
+                                "query failed",
+                                error,
+                            );
+                            continue;
+                        }
+                    };
                     if let Some(previous) = enforce_regression
                         .then(|| {
                             generation
@@ -1522,14 +1665,34 @@ impl VulnProvider for OsvClient {
                             next.get(revision.id.as_str())
                                 .is_some_and(|modified| *modified < revision.modified)
                         }) {
-                            return Err(ProviderError::InvalidResponse(format!(
+                            let error = ProviderError::InvalidResponse(format!(
                                 "OSV query revision for {} regressed below {}",
                                 regressed.id, regressed.modified
-                            )));
+                            ));
+                            record_osv_failure(
+                                &mut errors,
+                                &mut first_failure,
+                                &package.key(),
+                                "query failed",
+                                error,
+                            );
+                            continue;
                         }
                     }
-                    let value = serde_json::to_value(&revisions)
-                        .map_err(|error| ProviderError::Cache(error.to_string()))?;
+                    let package_key = package.key();
+                    revisions_by_package.insert(package_key.clone(), revisions.clone());
+                    let value = match serde_json::to_value(&revisions) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            record_osv_warning(
+                                &mut errors,
+                                &package_key,
+                                "query cache serialization failed",
+                                ProviderError::Cache(error.to_string()),
+                            );
+                            continue;
+                        }
+                    };
                     match self.cache.put_if_unchanged(
                         "osv/query",
                         &osv_query_cache_key(&package),
@@ -1537,43 +1700,57 @@ impl VulnProvider for OsvClient {
                         &value,
                         None,
                         query_ttl,
-                    )? {
-                        CacheCommit::Written => {
-                            revisions_by_package.insert(package.key(), revisions);
+                    ) {
+                        Ok(CacheCommit::Written) => {
+                            // The validated network result was already retained for this scan.
                         }
-                        CacheCommit::Conflict(current) => {
+                        Ok(CacheCommit::Conflict(current)) => {
+                            if self.cache.policy.read
+                                && let Some(current) = &current
+                                && current.fresh
+                                && let Some(winner) = canonical_osv_revisions(current.value.clone())
+                            {
+                                revisions_by_package.insert(package_key, winner);
+                            }
                             conflicts.push((package, current, true));
                         }
+                        Err(error) => record_osv_warning(
+                            &mut errors,
+                            &package.key(),
+                            "query cache publication failed",
+                            error,
+                        ),
                     }
                 }
             }
             missing = conflicts;
         }
         if !missing.is_empty() {
-            return Err(ProviderError::Cache(
-                "OSV query cache changed repeatedly during refresh".to_owned(),
-            ));
+            for (package, _, _) in missing {
+                record_osv_warning(
+                    &mut errors,
+                    &package.key(),
+                    "query cache publication failed",
+                    ProviderError::Cache(
+                        "OSV query cache changed repeatedly during refresh".to_owned(),
+                    ),
+                );
+            }
         }
 
-        let mut map = VulnMap::new();
+        // A provider error is hard only when no eligible package produced a complete query from
+        // either a fresh cache entry or the network. Any completed query (including a legitimate
+        // empty result) makes failures for other packages soft and visible in the outcome.
+        if eligible_count > 0 && revisions_by_package.is_empty() {
+            return Err(first_failure.unwrap_or_else(|| {
+                ProviderError::InvalidResponse(
+                    "OSV returned no usable result for any eligible package".to_owned(),
+                )
+            }));
+        }
+
         let mut latest_revisions = BTreeMap::<String, OsvVulnerabilityRevision>::new();
-        for (key, revisions) in &revisions_by_package {
-            map.insert(
-                key.clone(),
-                revisions
-                    .iter()
-                    .map(|revision| Vulnerability {
-                        id: revision.id.clone(),
-                        aliases: vec![],
-                        summary: String::new(),
-                        severity: None,
-                        cvss_score: None,
-                        fixed_in: vec![],
-                        references: vec![],
-                        withdrawn: false,
-                    })
-                    .collect(),
-            );
+        for revisions in revisions_by_package.values() {
             for revision in revisions {
                 latest_revisions
                     .entry(revision.id.clone())
@@ -1588,36 +1765,96 @@ impl VulnProvider for OsvClient {
         let hydrated = stream::iter(latest_revisions.into_values().map(|revision| {
             let client = self.clone();
             async move {
-                let doc = client.hydrate(&revision).await?;
-                Ok::<_, ProviderError>((revision.id, doc))
+                let id = revision.id.clone();
+                (id, client.hydrate(&revision).await)
             }
         }))
         .buffer_unordered(16)
         .collect::<Vec<_>>()
         .await
         .into_iter()
-        .collect::<Result<HashMap<_, _>, _>>()?;
-        for (key, vulns) in &mut map {
-            let package = packages.iter().find(|p| p.key() == *key).ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "OSV query result has no source package for key {key:?}"
-                ))
-            })?;
-            let mut evaluated = Vec::with_capacity(vulns.len());
-            for vuln in std::mem::take(vulns) {
-                let doc = hydrated.get(&vuln.id).ok_or_else(|| {
-                    ProviderError::InvalidResponse(format!(
-                        "OSV advisory {} was not hydrated",
-                        vuln.id
-                    ))
-                })?;
-                if let Some(vulnerability) = vulnerability_from_osv(doc, Some(package))? {
-                    evaluated.push(vulnerability);
+        .collect::<HashMap<_, _>>();
+
+        let mut vulnerabilities = VulnMap::new();
+        let mut usable_packages = 0usize;
+        for package in eligible {
+            let key = package.key();
+            let Some(revisions) = revisions_by_package.get(&key) else {
+                continue;
+            };
+            let mut evaluated = Vec::with_capacity(revisions.len());
+            let mut successful_evaluations = 0usize;
+            for revision in revisions {
+                let Some(document) = hydrated.get(&revision.id) else {
+                    record_osv_failure(
+                        &mut errors,
+                        &mut first_failure,
+                        &key,
+                        &format!("advisory {} hydration failed", revision.id),
+                        ProviderError::InvalidResponse(format!(
+                            "OSV advisory {} has no hydration outcome",
+                            revision.id
+                        )),
+                    );
+                    continue;
+                };
+                let document = match document {
+                    Ok(document) => document,
+                    Err(error) => {
+                        record_osv_failure(
+                            &mut errors,
+                            &mut first_failure,
+                            &key,
+                            &format!("advisory {} hydration failed", revision.id),
+                            error.clone(),
+                        );
+                        continue;
+                    }
+                };
+                if let Some(error) = &document.cache_warning {
+                    record_osv_warning(
+                        &mut errors,
+                        &key,
+                        &format!("advisory {} cache publication failed", revision.id),
+                        error.clone(),
+                    );
+                }
+                match vulnerability_from_osv(&document.value, Some(package)) {
+                    Ok(Some(vulnerability)) => {
+                        successful_evaluations += 1;
+                        evaluated.push(vulnerability);
+                    }
+                    Ok(None) => successful_evaluations += 1,
+                    Err(error) => record_osv_failure(
+                        &mut errors,
+                        &mut first_failure,
+                        &key,
+                        &format!("advisory {} evaluation failed", revision.id),
+                        error,
+                    ),
                 }
             }
-            *vulns = evaluated;
+            if revisions.is_empty() || successful_evaluations > 0 {
+                usable_packages += 1;
+            }
+            vulnerabilities.insert(key, evaluated);
         }
-        Ok(map)
+
+        // A package with only failed advisory hydrations/evaluations has no trustworthy
+        // vulnerability result. If that is true for every completed query, the provider is wholly
+        // unusable and must retain the hard-failure exit path.
+        if eligible_count > 0 && usable_packages == 0 {
+            return Err(first_failure.unwrap_or_else(|| {
+                ProviderError::InvalidResponse(
+                    "OSV returned no usable vulnerability result for any eligible package"
+                        .to_owned(),
+                )
+            }));
+        }
+        Ok(VulnQueryOutcome {
+            vulnerabilities,
+            errors,
+        })
     }
 }
 
@@ -1626,21 +1863,14 @@ fn vulnerability_from_osv(
     package: Option<&Package>,
 ) -> Result<Option<Vulnerability>, ProviderError> {
     let score = osv_cvss_score(doc, package);
+    let advisory_id = doc.get("id").and_then(Value::as_str).unwrap_or("UNKNOWN");
+    let affected = osv_affected_entries(doc, advisory_id)?;
     let evaluation = package
         .map(|package| {
-            evaluate_osv_affected(
-                package,
-                doc.get("affected")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-            )
-            .map_err(|error| {
+            evaluate_osv_affected(package, affected).map_err(|error| {
                 ProviderError::InvalidResponse(format!(
                     "OSV advisory {} cannot be evaluated for {} {}: {error}",
-                    doc.get("id").and_then(Value::as_str).unwrap_or("UNKNOWN"),
-                    package.display_name,
-                    package.version
+                    advisory_id, package.display_name, package.version
                 ))
             })
         })
@@ -2007,12 +2237,13 @@ impl OsvOffline {
 }
 #[async_trait]
 impl VulnProvider for OsvOffline {
-    async fn query(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
+    async fn query(&self, packages: &[Package]) -> Result<VulnQueryOutcome, ProviderError> {
         let this = self.clone();
         let owned = packages.to_vec();
-        tokio::task::spawn_blocking(move || this.query_blocking(&owned))
+        let vulnerabilities = tokio::task::spawn_blocking(move || this.query_blocking(&owned))
             .await
-            .map_err(|e| ProviderError::Offline(e.to_string()))?
+            .map_err(|e| ProviderError::Offline(e.to_string()))??;
+        Ok(VulnQueryOutcome::complete(vulnerabilities))
     }
 }
 
@@ -6959,14 +7190,14 @@ mod tests {
         let results = client.query(&packages).await.unwrap();
 
         assert_eq!(
-            results[&packages[0].key()]
+            results.vulnerabilities[&packages[0].key()]
                 .iter()
                 .map(|vulnerability| vulnerability.id.as_str())
                 .collect::<Vec<_>>(),
             ["TEST-ALPHA-1", "TEST-ALPHA-2", "TEST-ALPHA-DUP"]
         );
         assert_eq!(
-            results[&packages[1].key()]
+            results.vulnerabilities[&packages[1].key()]
                 .iter()
                 .map(|vulnerability| vulnerability.id.as_str())
                 .collect::<Vec<_>>(),
@@ -7184,8 +7415,12 @@ mod tests {
         let client =
             OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
 
-        assert_eq!(client.hydrate(&requested).await.unwrap(), document);
-        assert_eq!(client.hydrate(&requested).await.unwrap(), document);
+        let first = client.hydrate(&requested).await.unwrap();
+        assert_eq!(first.value, document);
+        assert!(first.cache_warning.is_none());
+        let second = client.hydrate(&requested).await.unwrap();
+        assert_eq!(second.value, document);
+        assert!(second.cache_warning.is_none());
 
         let actual_entry = read_cache_entry(&cache, "osv/vuln", &actual.cache_key());
         assert_eq!(actual_entry.value, document);
@@ -7249,7 +7484,8 @@ mod tests {
 
         let reported = client.hydrate(&requested).await.unwrap();
 
-        assert_eq!(reported, network_document);
+        assert_eq!(reported.value, network_document);
+        assert!(reported.cache_warning.is_none());
         assert_eq!(
             read_cache_entry(&cache, "osv/vuln", &actual.cache_key()).value,
             cached_newer
@@ -7313,7 +7549,10 @@ mod tests {
 
         let result = client.query(std::slice::from_ref(&package)).await.unwrap();
 
-        assert_eq!(result[&package.key()][0].summary, "fresh bypass response");
+        assert_eq!(
+            result.vulnerabilities[&package.key()][0].summary,
+            "fresh bypass response"
+        );
         assert_eq!(
             read_cache_entry(&cache, "osv/query", &query_key).value,
             json!([osv_query_vulnerability_at(id, origin_modified)])
@@ -7429,11 +7668,11 @@ mod tests {
         let slow = slow.await.unwrap().unwrap();
 
         assert_eq!(
-            fast[&package.key()][0].summary,
+            fast.vulnerabilities[&package.key()][0].summary,
             "newest concurrent revision"
         );
         assert_eq!(
-            slow[&package.key()][0].summary,
+            slow.vulnerabilities[&package.key()][0].summary,
             "newest concurrent revision"
         );
         assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
@@ -7527,7 +7766,7 @@ mod tests {
             .query(std::slice::from_ref(&package))
             .await
             .unwrap();
-        let first = &first[&package.key()][0];
+        let first = &first.vulnerabilities[&package.key()][0];
         assert_eq!(first.summary, "first revision");
         assert_eq!(first.fixed_in, ["2.0.0"]);
         assert!(!first.withdrawn);
@@ -7568,7 +7807,7 @@ mod tests {
             .query(std::slice::from_ref(&package))
             .await
             .unwrap();
-        let second = &second[&package.key()][0];
+        let second = &second.vulnerabilities[&package.key()][0];
         assert_eq!(second.summary, "updated revision");
         assert_eq!(second.fixed_in, ["3.0.0"]);
         assert!(second.withdrawn);
@@ -7605,7 +7844,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(unchanged[&package.key()][0].summary, "updated revision");
+        assert_eq!(
+            unchanged.vulnerabilities[&package.key()][0].summary,
+            "updated revision"
+        );
         unchanged_server.verify().await;
         let cached_query = read_cache_entry(&cache, "osv/query", &osv_query_cache_key(&package));
         assert_eq!(
@@ -7710,6 +7952,353 @@ mod tests {
         assert!(
             !cache
                 .filename("osv/query", &osv_query_cache_key(&package))
+                .exists()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn later_page_failure_is_soft_for_only_the_still_pending_package() {
+        let server = MockServer::start().await;
+        let packages = vec![npm_package("page-complete"), npm_package("page-incomplete")];
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(&packages)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {},
+                    {
+                        "vulns": [osv_query_vulnerability("TEST-PARTIAL-PAGE")],
+                        "next_page_token": "broken-page"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body_with_tokens(&[(
+                &packages[1],
+                Some("broken-page"),
+            )])))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let outcome = client.query(&packages).await.unwrap();
+
+        assert!(outcome.vulnerabilities[&packages[0].key()].is_empty());
+        assert!(!outcome.vulnerabilities.contains_key(&packages[1].key()));
+        assert!(!outcome.errors.contains_key(&packages[0].key()));
+        assert!(
+            outcome.errors[&packages[1].key()][0]
+                .message
+                .contains("HTTP 400")
+        );
+        assert!(
+            cache
+                .filename("osv/query", &osv_query_cache_key(&packages[0]))
+                .exists()
+        );
+        assert!(
+            !cache
+                .filename("osv/query", &osv_query_cache_key(&packages[1]))
+                .exists()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn failed_query_chunk_is_soft_when_another_chunk_completes() {
+        let server = MockServer::start().await;
+        let packages = (0..1001)
+            .map(|index| npm_package(&format!("chunk-{index}")))
+            .collect::<Vec<_>>();
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(&packages[..1000])))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(&packages[1000..])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [{}]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let outcome = client.query(&packages).await.unwrap();
+
+        assert_eq!(outcome.errors.len(), 1000);
+        assert!(outcome.vulnerabilities[&packages[1000].key()].is_empty());
+        assert!(!outcome.errors.contains_key(&packages[1000].key()));
+        assert!(
+            !cache
+                .filename("osv/query", &osv_query_cache_key(&packages[0]))
+                .exists()
+        );
+        assert!(
+            cache
+                .filename("osv/query", &osv_query_cache_key(&packages[1000]))
+                .exists()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn query_cache_failure_does_not_discard_a_valid_network_result() {
+        let server = MockServer::start().await;
+        let package = npm_package("query-cache-unwritable");
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [{}]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        fs::write(cache_dir.path().join("osv"), b"not a directory").unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache, server.uri());
+
+        let outcome = client.query(std::slice::from_ref(&package)).await.unwrap();
+
+        assert!(outcome.vulnerabilities[&package.key()].is_empty());
+        assert!(
+            outcome.errors[&package.key()]
+                .iter()
+                .any(|error| error.message.contains("query cache publication failed"))
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn hydration_cache_failure_does_not_discard_a_valid_advisory() {
+        let server = MockServer::start().await;
+        let package = npm_package("hydration-cache-unwritable");
+        let advisory = "TEST-CACHE-WARNING";
+        let revision = OsvVulnerabilityRevision {
+            id: advisory.to_owned(),
+            modified: test_timestamp(TEST_OSV_MODIFIED),
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{advisory}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": advisory,
+                "modified": TEST_OSV_MODIFIED,
+                "summary": "valid advisory despite an unwritable cache",
+                "affected": [{
+                    "package": {"ecosystem": "npm", "name": package.name},
+                    "versions": [package.version]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        cache
+            .put(
+                "osv/query",
+                &osv_query_cache_key(&package),
+                &serde_json::to_value(vec![revision]).unwrap(),
+                None,
+            )
+            .unwrap();
+        fs::write(cache.root().join("osv/vuln"), b"not a directory").unwrap();
+        let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache, server.uri());
+
+        let outcome = client.query(std::slice::from_ref(&package)).await.unwrap();
+
+        assert_eq!(outcome.vulnerabilities[&package.key()].len(), 1);
+        assert_eq!(outcome.vulnerabilities[&package.key()][0].id, advisory);
+        assert!(
+            outcome.errors[&package.key()]
+                .iter()
+                .any(|error| error.message.contains("cache publication failed"))
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_affected_hydration_fails_hard_without_entering_the_cache() {
+        let server = MockServer::start().await;
+        let package = npm_package("malformed-affected");
+        let advisory = "TEST-MALFORMED-AFFECTED";
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [osv_query_vulnerability(advisory)]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{advisory}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": advisory,
+                "modified": TEST_OSV_MODIFIED,
+                "affected": {"package": "not-an-array"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let error = client
+            .query(std::slice::from_ref(&package))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("non-array affected"));
+        let revision = OsvVulnerabilityRevision {
+            id: advisory.to_owned(),
+            modified: test_timestamp(TEST_OSV_MODIFIED),
+        };
+        assert!(!cache.filename("osv/vuln", &revision.cache_key()).exists());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn hydration_and_evaluation_failures_preserve_other_advisories() {
+        let server = MockServer::start().await;
+        let package = npm_package("partial-advisories");
+        let hydration_failure = "TEST-HYDRATION-FAILURE";
+        let evaluation_failure = "TEST-EVALUATION-FAILURE";
+        let malformed_affected = "TEST-MALFORMED-AFFECTED-SOFT";
+        let valid = "TEST-VALID-ADVISORY";
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(std::slice::from_ref(&package))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [
+                    osv_query_vulnerability(hydration_failure),
+                    osv_query_vulnerability(evaluation_failure),
+                    osv_query_vulnerability(malformed_affected),
+                    osv_query_vulnerability(valid)
+                ]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{malformed_affected}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": malformed_affected,
+                "modified": TEST_OSV_MODIFIED,
+                "affected": "not-an-array"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{hydration_failure}")))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{evaluation_failure}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": evaluation_failure,
+                "modified": TEST_OSV_MODIFIED,
+                "summary": "cannot evaluate a commit graph",
+                "affected": [{
+                    "package": {"ecosystem": "npm", "name": "partial-advisories"},
+                    "ranges": [{"type": "GIT", "events": [{"introduced": "0"}]}]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/vulns/{valid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": valid,
+                "modified": TEST_OSV_MODIFIED,
+                "summary": "valid advisory",
+                "affected": [{
+                    "package": {"ecosystem": "npm", "name": "partial-advisories"},
+                    "versions": ["1.0.0"]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let outcome = client.query(std::slice::from_ref(&package)).await.unwrap();
+
+        assert_eq!(outcome.vulnerabilities[&package.key()].len(), 1);
+        assert_eq!(outcome.vulnerabilities[&package.key()][0].id, valid);
+        let messages = outcome.errors[&package.key()]
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| {
+            message.contains(hydration_failure) && message.contains("hydration failed")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains(evaluation_failure) && message.contains("evaluation failed")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains(malformed_affected) && message.contains("hydration failed")
+        }));
+        let failed_revision = OsvVulnerabilityRevision {
+            id: hydration_failure.to_owned(),
+            modified: DateTime::parse_from_rfc3339(TEST_OSV_MODIFIED)
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert!(
+            !cache
+                .filename("osv/vuln", &failed_revision.cache_key())
+                .exists()
+        );
+        let malformed_revision = OsvVulnerabilityRevision {
+            id: malformed_affected.to_owned(),
+            modified: test_timestamp(TEST_OSV_MODIFIED),
+        };
+        assert!(
+            !cache
+                .filename("osv/vuln", &malformed_revision.cache_key())
                 .exists()
         );
         server.verify().await;
@@ -7821,15 +8410,6 @@ mod tests {
                 "vulnerability 0 has an invalid modified timestamp",
             ),
             (
-                "malformed later result",
-                json!({"results": [
-                    {"vulns": []},
-                    {"vulns": [{"id": null}]}
-                ]}),
-                2,
-                "result 1 vulnerability 0 has no string id",
-            ),
-            (
                 "empty vulnerability id",
                 json!({"results": [{"vulns": [{"id": ""}]}]}),
                 1,
@@ -7892,6 +8472,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_result_is_soft_when_an_aligned_package_result_is_complete() {
+        let server = MockServer::start().await;
+        let packages = vec![npm_package("valid-empty"), npm_package("malformed")];
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(osv_query_body(&packages)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"vulns": []},
+                    {"vulns": [{"id": null}]}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client =
+            OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
+
+        let outcome = client.query(&packages).await.unwrap();
+
+        assert!(outcome.vulnerabilities[&packages[0].key()].is_empty());
+        assert!(!outcome.vulnerabilities.contains_key(&packages[1].key()));
+        assert!(
+            outcome.errors[&packages[1].key()][0]
+                .message
+                .contains("result 1 vulnerability 0 has no string id")
+        );
+        assert!(
+            cache
+                .filename("osv/query", &osv_query_cache_key(&packages[0]))
+                .exists()
+        );
+        assert!(
+            !cache
+                .filename("osv/query", &osv_query_cache_key(&packages[1]))
+                .exists()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn valid_empty_osv_batch_results_preserve_alignment_and_are_cached() {
         let server = MockServer::start().await;
         let packages = vec![npm_package("empty-object"), npm_package("empty-array")];
@@ -7914,9 +8540,9 @@ mod tests {
 
         let results = client.query(&packages).await.unwrap();
 
-        assert_eq!(results.len(), packages.len());
+        assert_eq!(results.vulnerabilities.len(), packages.len());
         for package in &packages {
-            assert!(results[&package.key()].is_empty());
+            assert!(results.vulnerabilities[&package.key()].is_empty());
             let (cached, _) = cache
                 .get(
                     "osv/query",
@@ -8069,7 +8695,7 @@ mod tests {
 
         for (fixture, package) in fixtures.iter().zip(&packages) {
             let hydrated_results = online.query(std::slice::from_ref(package)).await.unwrap();
-            let hydrated = hydrated_results[&package.key()]
+            let hydrated = hydrated_results.vulnerabilities[&package.key()]
                 .iter()
                 .map(|vulnerability| (vulnerability.id.clone(), vulnerability.fixed_in.clone()))
                 .collect::<Vec<_>>();

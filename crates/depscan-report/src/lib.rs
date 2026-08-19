@@ -299,7 +299,7 @@ pub fn render_summary(document: &ScanDocument) -> String {
         })
         .count();
     format!(
-        "depscan: {} packages | {} vulns{} | {} withdrawn | {} outdated ({} major, {} yanked) | {} suppressed | {} expired ignores\n",
+        "depscan: {} packages | {} vulns{} | {} withdrawn | {} outdated ({} major, {} yanked) | {} suppressed | {} expired ignores | {} soft failures\n",
         t.packages,
         t.vulns,
         if detail.is_empty() {
@@ -312,7 +312,8 @@ pub fn render_summary(document: &ScanDocument) -> String {
         major,
         t.yanked,
         t.suppressed,
-        t.expired_ignores
+        t.expired_ignores,
+        t.errors
     )
 }
 
@@ -423,6 +424,38 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
                     "latest_stable": latest.latest_stable,
                     "staleness": latest.staleness,
                     "yanked": true
+                }
+            }));
+        }
+        for error in &result.errors {
+            let rule_id = "DEPSCAN-PROVIDER-ERROR";
+            rules.entry(rule_id.to_owned()).or_insert_with(|| {
+                json!({
+                    "id": rule_id,
+                    "shortDescription": {
+                        "text": "Dependency enrichment was incomplete"
+                    }
+                })
+            });
+            results.push(json!({
+                "ruleId": rule_id,
+                "level": "warning",
+                "message": {"text": format!(
+                    "{} {} could not be fully enriched by {}: {}",
+                    result.package.display_name,
+                    result.package.version,
+                    error.provider,
+                    error.message
+                )},
+                "locations": [{"physicalLocation": {"artifactLocation": {
+                    "uri": result.package.source_file.to_string_lossy()
+                }}}],
+                "properties": {
+                    "ecosystem": result.package.ecosystem.osv_name(),
+                    "package": result.package.name,
+                    "version": result.package.version,
+                    "provider": error.provider,
+                    "soft_failure": true
                 }
             }));
         }
@@ -539,8 +572,8 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use depscan_core::{
-        Ecosystem, LatestVersions, Package, ScanResult, SuppressedFinding, SuppressionMatch,
-        SuppressionSource, SuppressionState, Vulnerability,
+        Ecosystem, EnrichError, LatestVersions, Package, ScanResult, SuppressedFinding,
+        SuppressionMatch, SuppressionSource, SuppressionState, Vulnerability,
     };
     use std::path::PathBuf;
 
@@ -566,6 +599,46 @@ mod tests {
             errors: vec![],
             suppressed: vec![],
         }])
+    }
+
+    #[test]
+    fn soft_provider_errors_are_visible_in_every_report_format() {
+        let mut document = freshness_document(Staleness::Current, false);
+        document.results[0].errors.push(EnrichError {
+            provider: "osv".to_owned(),
+            message: "advisory TEST-FAIL hydration failed".to_owned(),
+        });
+
+        let table = render_table(&document, false);
+        assert!(table.contains("1 soft failures"));
+        assert!(table.contains("WARNING"));
+        assert!(table.contains("TEST-FAIL"));
+
+        let summary = render_summary(&document);
+        assert!(summary.contains("1 soft failures"));
+
+        let json = render(&document, OutputFormat::Json, false).unwrap();
+        assert!(json.contains("\"provider\": \"osv\""));
+        assert!(json.contains("TEST-FAIL"));
+
+        let sarif = render_sarif(&document);
+        let soft_failure = sarif
+            .pointer("/runs/0/results")
+            .and_then(Value::as_array)
+            .and_then(|results| {
+                results.iter().find(|result| {
+                    result.get("ruleId").and_then(Value::as_str) == Some("DEPSCAN-PROVIDER-ERROR")
+                })
+            })
+            .expect("SARIF soft failure result");
+        assert_eq!(
+            soft_failure.pointer("/properties/provider"),
+            Some(&json!("osv"))
+        );
+        assert_eq!(
+            soft_failure.pointer("/properties/soft_failure"),
+            Some(&json!(true))
+        );
     }
 
     fn vulnerability_document(withdrawn: bool) -> ScanDocument {

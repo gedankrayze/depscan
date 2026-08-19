@@ -577,7 +577,7 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         max_age: max_cache_age,
     })
     .map_err(CliError::provider)?;
-    let (vulnerabilities, freshness) = if args.offline {
+    let (vulnerability_outcome, freshness) = if args.offline {
         let vulnerabilities = OsvOffline::new(cache.clone())
             .query(&packages)
             .await
@@ -595,10 +595,13 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         let freshness = fetch_latest(&registry, &packages, false).await;
         (vulnerabilities, freshness)
     };
+    let vulnerabilities = vulnerability_outcome.vulnerabilities;
+    let mut vulnerability_errors = vulnerability_outcome.errors;
     let mut results = Vec::new();
     for package in packages {
+        let package_key = package.key();
         let mut vulns = vulnerabilities
-            .get(&package.key())
+            .get(&package_key)
             .cloned()
             .unwrap_or_default();
         if !args.include_withdrawn {
@@ -620,10 +623,15 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
             });
             !active
         });
-        let (latest, errors) = freshness
-            .get(&package.key())
+        let (latest, mut errors) = freshness
+            .get(&package_key)
             .cloned()
             .unwrap_or((None, Vec::new()));
+        errors.extend(
+            vulnerability_errors
+                .remove(&package_key)
+                .unwrap_or_default(),
+        );
         results.push(ScanResult {
             package,
             vulns,
