@@ -13,10 +13,19 @@ version = "1.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gedankrayze/depscan"
+homepage = "https://github.com/gedankrayze/depscan"
 rust-version = "1.95.0"
 authors = ["depscan contributors"]
+readme = "README.md"
+keywords = ["security", "dependencies", "vulnerability", "osv", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+publish = ["crates-io"]
 
 [workspace.dependencies]
+depscan-core = { version = "1.1.0", path = "crates/depscan-core" }
+depscan-parsers = { version = "1.1.0", path = "crates/depscan-parsers" }
+depscan-providers = { version = "1.1.0", path = "crates/depscan-providers" }
+depscan-report = { version = "1.1.0", path = "crates/depscan-report" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 chrono = { version = "0.4.45", features = ["serde"] }

@@ -34,10 +34,16 @@ NuGet's split is intentional: its package identity and flat-container endpoint a
 
 ## Installation
 
-The repository pins its development and release toolchain in `rust-toolchain.toml`:
+Published crates.io releases use the package name `depscan-cli` and install the `depscan` binary:
 
 ```bash
-cargo install --path crates/depscan-cli
+cargo install depscan-cli --locked
+```
+
+Before the first registry release, or to install from a source checkout instead, use the repository's pinned development and release toolchain:
+
+```bash
+cargo install --path crates/depscan-cli --locked
 ```
 
 Alternatively, build and execute the workspace binary directly:
@@ -165,4 +171,4 @@ The implementation does not execute package-manager binaries automatically. `bun
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+Licensed under either the Apache License, Version 2.0 or the MIT license, at your option. Both complete license texts are distributed together in [LICENSE](LICENSE).

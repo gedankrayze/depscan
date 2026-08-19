@@ -4,17 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+description = "Dependency vulnerability and version freshness scanner for local development and CI"
+include = ["src/**", "tests/**", "LICENSE"]
 
 [[bin]]
 name = "depscan"
 path = "src/main.rs"
 
 [dependencies]
-depscan-core = { path = "../depscan-core" }
-depscan-parsers = { path = "../depscan-parsers" }
-depscan-providers = { path = "../depscan-providers" }
-depscan-report = { path = "../depscan-report" }
+depscan-core.workspace = true
+depscan-parsers.workspace = true
+depscan-providers.workspace = true
+depscan-report.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

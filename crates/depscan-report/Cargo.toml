@@ -4,10 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+description = "Deterministic table, JSON, SARIF, and summary renderers for depscan"
+include = ["src/**", "LICENSE"]
 
 [dependencies]
-depscan-core = { path = "../depscan-core" }
+depscan-core.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true

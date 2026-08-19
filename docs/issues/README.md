@@ -42,7 +42,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-021](DS-021.md) | P1 | Closed | Preserve auditable suppression details |
 | [DS-022](DS-022.md) | P1 | Closed | Support the full CLI surface in configuration |
 | [DS-023](DS-023.md) | P1 | Open | Implement explicitly allowed Bun and dotnet tool fallbacks |
-| [DS-024](DS-024.md) | P1 | Open | Make workspace crates publishable |
+| [DS-024](DS-024.md) | P1 | Closed | Make workspace crates publishable |
 | [DS-025](DS-025.md) | P1 | Closed | Modernize the Rust toolchain, edition, resolver, and MSRV policy |
 | [DS-026](DS-026.md) | P1 | Closed | Upgrade direct dependencies to current stable releases |
 | [DS-027](DS-027.md) | P1 | Closed | Replace unmaintained `serde_yaml` |
