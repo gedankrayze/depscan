@@ -4436,18 +4436,35 @@ impl EcosystemParser for CargoParser {
         }
     }
 }
+
+const CARGO_CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+#[derive(Clone, Debug)]
+enum CargoDependencySource {
+    CratesIo,
+    RegistryName,
+    RegistryIndex(String),
+    Git {
+        url: String,
+        selector: Option<(String, String)>,
+    },
+    Path,
+}
+
 #[derive(Clone, Debug)]
 struct CargoDependencySpec {
     package_name: String,
     version: Option<String>,
     enrichable: bool,
     local_path: Option<PathBuf>,
+    source: CargoDependencySource,
 }
 
 #[derive(Debug)]
 struct CargoDeclaration {
     dependency: CargoDependencySpec,
     declaring_manifest: PathBuf,
+    declaring_package: CargoProjectPackageId,
     dev: bool,
 }
 
@@ -4455,11 +4472,95 @@ struct CargoDeclaration {
 struct CargoManifest {
     path: PathBuf,
     value: Toml,
+    package: CargoProjectPackageId,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CargoProjectPackageId {
+    name: String,
+    version: String,
 }
 
 fn read_cargo_manifest(path: &Path) -> Result<Toml, ParseError> {
     let text = fs::read_to_string(path).map_err(|error| io_error(path, error))?;
     toml::from_str(&text).map_err(|error| invalid(path, error))
+}
+
+fn cargo_workspace_package_version(
+    path: &Path,
+    value: &Toml,
+) -> Result<Option<String>, ParseError> {
+    let Some(version) = value
+        .get("workspace")
+        .and_then(Toml::as_table)
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(Toml::as_table)
+        .and_then(|package| package.get("version"))
+    else {
+        return Ok(None);
+    };
+    let version = version
+        .as_str()
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                "Cargo workspace package version must be a non-empty string",
+            )
+        })?;
+    semver::Version::parse(version).map_err(|error| {
+        invalid(
+            path,
+            format!("Cargo workspace package version {version:?} is invalid SemVer: {error}"),
+        )
+    })?;
+    Ok(Some(version.to_owned()))
+}
+
+fn cargo_manifest_package_id(
+    path: &Path,
+    value: &Toml,
+    workspace_version: Option<&str>,
+) -> Result<CargoProjectPackageId, ParseError> {
+    let package = value
+        .get("package")
+        .and_then(Toml::as_table)
+        .ok_or_else(|| invalid(path, "Cargo workspace member is missing a [package] table"))?;
+    let name = package
+        .get("name")
+        .and_then(Toml::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid(path, "Cargo package name must be a non-empty string"))?;
+    let version = match package.get("version") {
+        Some(Toml::String(version)) if !version.is_empty() => version.as_str(),
+        Some(Toml::Table(version))
+            if version.get("workspace").and_then(Toml::as_bool) == Some(true) =>
+        {
+            workspace_version.ok_or_else(|| {
+                invalid(
+                    path,
+                    "Cargo package inherits version from missing [workspace.package].version",
+                )
+            })?
+        }
+        Some(_) => {
+            return Err(invalid(
+                path,
+                "Cargo package version must be a non-empty string or inherit from the workspace",
+            ));
+        }
+        None => "0.0.0",
+    };
+    semver::Version::parse(version).map_err(|error| {
+        invalid(
+            path,
+            format!("Cargo package version {version:?} is invalid SemVer: {error}"),
+        )
+    })?;
+    Ok(CargoProjectPackageId {
+        name: name.to_owned(),
+        version: version.to_owned(),
+    })
 }
 
 fn dependency_field<'a>(
@@ -4496,6 +4597,7 @@ fn parse_cargo_dependency(
             version: Some(version.to_owned()),
             enrichable: true,
             local_path: None,
+            source: CargoDependencySource::CratesIo,
         });
     }
 
@@ -4559,6 +4661,7 @@ fn parse_cargo_dependency(
     let git = dependency_field(manifest, alias, table, "git")?;
     let registry = dependency_field(manifest, alias, table, "registry")?;
     let registry_index = dependency_field(manifest, alias, table, "registry-index")?;
+    let mut git_selector = None;
     for selector in ["branch", "tag", "rev"] {
         let value = dependency_field(manifest, alias, table, selector)?;
         if value.is_some() && git.is_none() {
@@ -4566,6 +4669,15 @@ fn parse_cargo_dependency(
                 manifest,
                 format!("Cargo dependency {alias:?} field {selector:?} requires a \"git\" source"),
             ));
+        }
+        if let Some(value) = value {
+            if git_selector.is_some() {
+                return Err(invalid(
+                    manifest,
+                    format!("Cargo dependency {alias:?} declares conflicting Git selectors"),
+                ));
+            }
+            git_selector = Some((selector.to_owned(), value.to_owned()));
         }
     }
     let source_count = [
@@ -4594,6 +4706,20 @@ fn parse_cargo_dependency(
             .unwrap_or(Path::new("."))
             .join(dependency_path)
     });
+    let source = if local_path.is_some() {
+        CargoDependencySource::Path
+    } else if let Some(git) = git {
+        CargoDependencySource::Git {
+            url: git.to_owned(),
+            selector: git_selector,
+        }
+    } else if let Some(registry_index) = registry_index {
+        CargoDependencySource::RegistryIndex(registry_index.to_owned())
+    } else if registry.is_some() {
+        CargoDependencySource::RegistryName
+    } else {
+        CargoDependencySource::CratesIo
+    };
     Ok(CargoDependencySpec {
         package_name: package.unwrap_or(alias).to_owned(),
         version,
@@ -4602,6 +4728,7 @@ fn parse_cargo_dependency(
             && registry.is_none()
             && registry_index.is_none(),
         local_path,
+        source,
     })
 }
 
@@ -4661,6 +4788,7 @@ fn cargo_manifest_declarations(
                     Some(workspace_dependencies),
                 )?,
                 declaring_manifest: manifest.path.clone(),
+                declaring_package: manifest.package.clone(),
                 dev,
             });
         }
@@ -4838,6 +4966,7 @@ fn cargo_workspace_manifests(
         .collect::<Result<Vec<_>, _>>()?;
     let workspace_dependencies =
         workspace_dependency_definitions(workspace_manifest, &workspace_value)?;
+    let workspace_version = cargo_workspace_package_version(workspace_manifest, &workspace_value)?;
 
     let mut pending = VecDeque::new();
     let mut queued = BTreeSet::new();
@@ -4893,6 +5022,7 @@ fn cargo_workspace_manifests(
         }
         let manifest = CargoManifest {
             path: path.clone(),
+            package: cargo_manifest_package_id(&path, &value, workspace_version.as_deref())?,
             value,
         };
         let declarations = cargo_manifest_declarations(&manifest, &workspace_dependencies)?;
@@ -5014,34 +5144,553 @@ fn cargo_project_manifests(
     Ok((
         vec![CargoManifest {
             path: source_manifest.to_path_buf(),
+            package: cargo_manifest_package_id(source_manifest, &source_value, None)?,
             value: source_value,
         }],
         BTreeMap::new(),
     ))
 }
 
-fn cargo_project_declarations(path: &Path) -> Result<Vec<CargoDeclaration>, ParseError> {
+struct CargoProjectEvidence {
+    packages: BTreeSet<CargoProjectPackageId>,
+    declarations: Vec<CargoDeclaration>,
+}
+
+fn cargo_project_evidence(path: &Path) -> Result<CargoProjectEvidence, ParseError> {
     let (manifests, workspace_dependencies) = cargo_project_manifests(path)?;
-    manifests
+    let mut packages = BTreeSet::new();
+    for manifest in &manifests {
+        if !packages.insert(manifest.package.clone()) {
+            return Err(invalid(
+                &manifest.path,
+                format!(
+                    "Cargo project repeats package identity {} {}",
+                    manifest.package.name, manifest.package.version
+                ),
+            ));
+        }
+    }
+    let declarations = manifests
         .iter()
         .map(|manifest| cargo_manifest_declarations(manifest, &workspace_dependencies))
         .collect::<Result<Vec<_>, _>>()
-        .map(|declarations| declarations.into_iter().flatten().collect())
+        .map(|declarations| declarations.into_iter().flatten().collect())?;
+    Ok(CargoProjectEvidence {
+        packages,
+        declarations,
+    })
 }
 
-fn cargo_direct_dependencies(root: &Path) -> Result<BTreeMap<String, bool>, ParseError> {
-    let manifest = root.join("Cargo.toml");
-    if !manifest.is_file() {
-        return Ok(BTreeMap::new());
+fn cargo_project_declarations(path: &Path) -> Result<Vec<CargoDeclaration>, ParseError> {
+    cargo_project_evidence(path).map(|evidence| evidence.declarations)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CargoLockId {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
+
+struct CargoRawLockNode {
+    id: CargoLockId,
+    dependency_references: Vec<String>,
+    replacement_reference: Option<String>,
+    emit: bool,
+    context: String,
+}
+
+struct CargoLockNode {
+    id: CargoLockId,
+    dependencies: Vec<usize>,
+    replacement: Option<usize>,
+    emit: bool,
+}
+
+struct CargoLockReference {
+    name: String,
+    version: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CargoScope {
+    Production,
+    Development,
+    Unknown,
+}
+
+fn cargo_lock_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn cargo_normalize_lock_source(source: &str) -> Result<String, String> {
+    if source.starts_with("sparse+") {
+        return Url::parse(source)
+            .map(|url| url.to_string())
+            .map_err(|error| format!("invalid sparse registry source URL: {error}"));
     }
-    let mut direct = BTreeMap::new();
-    for declaration in cargo_project_declarations(&manifest)? {
-        direct
-            .entry(declaration.dependency.package_name)
-            .and_modify(|dev_only| *dev_only &= declaration.dev)
-            .or_insert(declaration.dev);
+    let (prefix, kind, url) = if let Some(url) = source.strip_prefix("git+") {
+        ("git+", "Git", url)
+    } else if let Some(url) = source.strip_prefix("registry+") {
+        ("registry+", "registry", url)
+    } else if let Some(url) = source.strip_prefix("path+") {
+        ("path+", "path", url)
+    } else {
+        return Err(format!("unsupported source identity {source:?}"));
+    };
+    let url = Url::parse(url).map_err(|error| format!("invalid {kind} source URL: {error}"))?;
+    Ok(format!("{prefix}{url}"))
+}
+
+fn cargo_lock_node(
+    path: &Path,
+    context: &str,
+    item: &toml::Table,
+    emit: bool,
+) -> Result<CargoRawLockNode, ParseError> {
+    let name = item
+        .get("name")
+        .and_then(Toml::as_str)
+        .filter(|name| cargo_lock_name_valid(name))
+        .ok_or_else(|| invalid(path, format!("{context} is missing a valid package name")))?;
+    let version = item
+        .get("version")
+        .and_then(Toml::as_str)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!("{context} is missing a non-empty string version"),
+            )
+        })?;
+    semver::Version::parse(version).map_err(|error| {
+        invalid(
+            path,
+            format!("{context} has invalid SemVer version {version:?}: {error}"),
+        )
+    })?;
+    let source = item
+        .get("source")
+        .map(|source| {
+            let source = source
+                .as_str()
+                .filter(|source| !source.is_empty())
+                .ok_or_else(|| {
+                    invalid(path, format!("{context} source must be a non-empty string"))
+                })?;
+            cargo_normalize_lock_source(source)
+                .map_err(|error| invalid(path, format!("{context} has {error}")))
+        })
+        .transpose()?;
+    let replacement_reference = item
+        .get("replace")
+        .map(|replacement| {
+            replacement
+                .as_str()
+                .filter(|replacement| !replacement.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    invalid(
+                        path,
+                        format!("{context} replace must be a non-empty package ID string"),
+                    )
+                })
+        })
+        .transpose()?;
+    if item.contains_key("dependencies") && replacement_reference.is_some() {
+        return Err(invalid(
+            path,
+            format!("{context} cannot define both dependencies and replace"),
+        ));
     }
-    Ok(direct)
+    let dependency_references = match item.get("dependencies") {
+        None => Vec::new(),
+        Some(dependencies) => dependencies
+            .as_array()
+            .ok_or_else(|| invalid(path, format!("{context} dependencies must be an array")))?
+            .iter()
+            .enumerate()
+            .map(|(index, dependency)| {
+                dependency
+                    .as_str()
+                    .filter(|dependency| !dependency.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        invalid(
+                            path,
+                            format!(
+                                "{context} dependency entry {index} must be a non-empty string"
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(CargoRawLockNode {
+        id: CargoLockId {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source,
+        },
+        dependency_references,
+        replacement_reference,
+        emit,
+        context: context.to_owned(),
+    })
+}
+
+fn parse_cargo_lock_reference(
+    path: &Path,
+    context: &str,
+    reference: &str,
+) -> Result<CargoLockReference, ParseError> {
+    if reference.trim() != reference
+        || reference
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() && byte != b' ')
+    {
+        return Err(invalid(
+            path,
+            format!("{context} has malformed dependency reference {reference:?}"),
+        ));
+    }
+    let (identity, source) = if let Some(open) = reference.rfind(" (") {
+        if !reference.ends_with(')') {
+            return Err(invalid(
+                path,
+                format!("{context} has malformed dependency reference {reference:?}"),
+            ));
+        }
+        let source = &reference[open + 2..reference.len() - 1];
+        if source.is_empty() || source.contains(' ') {
+            return Err(invalid(
+                path,
+                format!("{context} has empty dependency source in {reference:?}"),
+            ));
+        }
+        let source = cargo_normalize_lock_source(source).map_err(|error| {
+            invalid(
+                path,
+                format!("{context} dependency reference {reference:?} has {error}"),
+            )
+        })?;
+        (&reference[..open], Some(source))
+    } else {
+        if reference.contains(['(', ')']) {
+            return Err(invalid(
+                path,
+                format!("{context} has malformed dependency reference {reference:?}"),
+            ));
+        }
+        (reference, None)
+    };
+    let (name, version) = match identity.split_once(' ') {
+        None => (identity, None),
+        Some((name, version))
+            if !name.is_empty() && !version.is_empty() && !version.contains(' ') =>
+        {
+            semver::Version::parse(version).map_err(|error| {
+                invalid(
+                    path,
+                    format!(
+                        "{context} dependency reference {reference:?} has invalid SemVer: {error}"
+                    ),
+                )
+            })?;
+            (name, Some(version.to_owned()))
+        }
+        _ => {
+            return Err(invalid(
+                path,
+                format!("{context} has malformed dependency reference {reference:?}"),
+            ));
+        }
+    };
+    if !cargo_lock_name_valid(name) || (source.is_some() && version.is_none()) {
+        return Err(invalid(
+            path,
+            format!("{context} has malformed dependency reference {reference:?}"),
+        ));
+    }
+    Ok(CargoLockReference {
+        name: name.to_owned(),
+        version,
+        source,
+    })
+}
+
+fn cargo_git_source_key(source: &str) -> Option<(String, Vec<(String, String)>)> {
+    let source = source.strip_prefix("git+")?;
+    let mut url = Url::parse(source).ok()?;
+    let mut query = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    query.sort();
+    url.set_query(None);
+    url.set_fragment(None);
+    Some((url.to_string(), query))
+}
+
+fn cargo_lock_source_matches(reference: &str, target: &str) -> bool {
+    match (
+        cargo_git_source_key(reference),
+        cargo_git_source_key(target),
+    ) {
+        (Some(reference), Some(target)) => reference == target,
+        (None, None) => reference == target,
+        _ => false,
+    }
+}
+
+fn cargo_lock_reference_source_matches(
+    reference: &str,
+    target: &str,
+    lockfile_version: i64,
+) -> bool {
+    if cargo_lock_source_matches(reference, target) {
+        return true;
+    }
+    let (Some(reference), Some(target)) = (
+        cargo_git_source_key(reference),
+        cargo_git_source_key(target),
+    ) else {
+        return false;
+    };
+    lockfile_version <= 2
+        && reference.0 == target.0
+        && reference.1.is_empty()
+        && target.1 == [("branch".to_owned(), "master".to_owned())]
+}
+
+fn cargo_registry_index_source(index: &str) -> Option<String> {
+    let source = if index.starts_with("registry+") || index.starts_with("sparse+") {
+        index.to_owned()
+    } else {
+        format!("registry+{index}")
+    };
+    cargo_normalize_lock_source(&source).ok()
+}
+
+fn resolve_cargo_lock_reference(
+    path: &Path,
+    context: &str,
+    reference: &CargoLockReference,
+    nodes: &[CargoRawLockNode],
+    lockfile_version: i64,
+) -> Result<usize, ParseError> {
+    let mut candidates = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.id.name == reference.name)
+        .collect::<Vec<_>>();
+    if let Some(version) = &reference.version {
+        candidates.retain(|(_, node)| node.id.version == *version);
+    } else {
+        let versions = candidates
+            .iter()
+            .map(|(_, node)| node.id.version.as_str())
+            .collect::<BTreeSet<_>>();
+        if versions.len() > 1 {
+            return Err(invalid(
+                path,
+                format!(
+                    "{context} dependency reference {:?} omits a version shared by multiple locked versions",
+                    reference.name
+                ),
+            ));
+        }
+    }
+    if let Some(source) = &reference.source {
+        candidates.retain(|(_, node)| {
+            node.id.source.as_deref().is_some_and(|target| {
+                cargo_lock_reference_source_matches(source, target, lockfile_version)
+            })
+        });
+    } else {
+        let local_candidates = candidates
+            .iter()
+            .filter(|(_, node)| {
+                node.id
+                    .source
+                    .as_deref()
+                    .is_none_or(|source| source.starts_with("path+"))
+            })
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        if local_candidates.len() == 1 {
+            return Ok(local_candidates[0]);
+        }
+    }
+    match candidates.as_slice() {
+        [(index, _)] => Ok(*index),
+        [] => Err(invalid(
+            path,
+            format!(
+                "{context} dependency reference to {:?} has no matching locked package",
+                reference.name
+            ),
+        )),
+        _ => Err(invalid(
+            path,
+            format!(
+                "{context} dependency reference to {:?} is ambiguous across locked identities",
+                reference.name
+            ),
+        )),
+    }
+}
+
+fn cargo_dependency_source_exact(source: &CargoDependencySource, target: &CargoLockId) -> bool {
+    match source {
+        CargoDependencySource::CratesIo => target.source.as_deref() == Some(CARGO_CRATES_IO_SOURCE),
+        CargoDependencySource::RegistryName => false,
+        CargoDependencySource::RegistryIndex(index) => cargo_registry_index_source(index)
+            .as_deref()
+            .is_some_and(|index| target.source.as_deref() == Some(index)),
+        CargoDependencySource::Git { url, selector } => {
+            let Ok(mut expected) = Url::parse(url) else {
+                return false;
+            };
+            if let Some((kind, value)) = selector {
+                expected.query_pairs_mut().append_pair(kind, value);
+            }
+            let expected = format!("git+{expected}");
+            target
+                .source
+                .as_deref()
+                .is_some_and(|target| cargo_lock_source_matches(&expected, target))
+        }
+        CargoDependencySource::Path => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CargoDeclarationTargetStrength {
+    None,
+    Possible,
+    Exact,
+}
+
+fn cargo_declaration_target_strength(
+    declaration: &CargoDeclaration,
+    target: &CargoLockId,
+) -> CargoDeclarationTargetStrength {
+    if declaration.dependency.package_name != target.name {
+        return CargoDeclarationTargetStrength::None;
+    }
+    if let Some(requirement) = &declaration.dependency.version {
+        let (Ok(requirement), Ok(version)) = (
+            semver::VersionReq::parse(requirement),
+            semver::Version::parse(&target.version),
+        ) else {
+            return CargoDeclarationTargetStrength::None;
+        };
+        if !requirement.matches(&version) {
+            return CargoDeclarationTargetStrength::None;
+        }
+    }
+    if cargo_dependency_source_exact(&declaration.dependency.source, target) {
+        CargoDeclarationTargetStrength::Exact
+    } else {
+        CargoDeclarationTargetStrength::Possible
+    }
+}
+
+fn cargo_member_edge_scopes(
+    member: &CargoProjectPackageId,
+    dependencies: &[usize],
+    nodes: &[CargoLockNode],
+    declarations: &[CargoDeclaration],
+) -> BTreeMap<usize, CargoScope> {
+    let declarations = declarations
+        .iter()
+        .filter(|declaration| declaration.declaring_package == *member)
+        .collect::<Vec<_>>();
+    let mut exact = BTreeMap::<usize, Vec<bool>>::new();
+    let mut possible = BTreeMap::<usize, Vec<bool>>::new();
+    for declaration in declarations {
+        let exact_targets = dependencies
+            .iter()
+            .copied()
+            .filter(|target| {
+                cargo_declaration_target_strength(declaration, &nodes[*target].id)
+                    == CargoDeclarationTargetStrength::Exact
+            })
+            .collect::<Vec<_>>();
+        if exact_targets.len() == 1 {
+            exact
+                .entry(exact_targets[0])
+                .or_default()
+                .push(declaration.dev);
+            continue;
+        }
+        let possible_targets = dependencies
+            .iter()
+            .copied()
+            .filter(|target| {
+                cargo_declaration_target_strength(declaration, &nodes[*target].id)
+                    != CargoDeclarationTargetStrength::None
+            })
+            .collect::<Vec<_>>();
+        for target in possible_targets {
+            possible.entry(target).or_default().push(declaration.dev);
+        }
+    }
+    dependencies
+        .iter()
+        .copied()
+        .map(|target| {
+            if nodes[target].replacement.is_some() {
+                return (target, CargoScope::Unknown);
+            }
+            let exact = exact.get(&target).map(Vec::as_slice).unwrap_or(&[]);
+            let possible = possible.get(&target).map(Vec::as_slice).unwrap_or(&[]);
+            let scope = if exact.iter().any(|dev| !dev) {
+                CargoScope::Production
+            } else if possible.iter().any(|dev| !dev) {
+                CargoScope::Unknown
+            } else if exact.iter().any(|dev| *dev) {
+                CargoScope::Development
+            } else {
+                CargoScope::Unknown
+            };
+            (target, scope)
+        })
+        .collect()
+}
+
+fn cargo_reachable(
+    seeds: impl IntoIterator<Item = usize>,
+    nodes: &[CargoLockNode],
+    members: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    let mut reached = BTreeSet::new();
+    let mut pending = VecDeque::new();
+    for seed in seeds {
+        if reached.insert(seed) {
+            pending.push_back(seed);
+        }
+    }
+    while let Some(index) = pending.pop_front() {
+        if members.contains(&index) {
+            continue;
+        }
+        let dependencies = nodes[index]
+            .replacement
+            .iter()
+            .chain(nodes[index].dependencies.iter());
+        for dependency in dependencies {
+            if reached.insert(*dependency) {
+                pending.push_back(*dependency);
+            }
+        }
+    }
+    reached
 }
 
 fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
@@ -5070,19 +5719,26 @@ fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
             ),
         ));
     }
-    let package_entries = document
-        .get("package")
-        .and_then(Toml::as_array)
-        .ok_or_else(|| {
+    let package_entries: &[Toml] = match document.get("package") {
+        Some(package_entries) => package_entries.as_array().map(Vec::as_slice).ok_or_else(|| {
             invalid(
                 path,
                 format!(
                     "detected Cargo.lock version {lockfile_version} without a package array; expected resolved package entries"
                 ),
             )
-        })?;
-    let direct = cargo_direct_dependencies(path.parent().unwrap_or(Path::new(".")))?;
-    let mut out = Vec::new();
+        })?,
+        None if lockfile_version == 1 && document.contains_key("root") => &[],
+        None => {
+            return Err(invalid(
+                path,
+                format!(
+                    "detected Cargo.lock version {lockfile_version} without a package array; expected resolved package entries"
+                ),
+            ));
+        }
+    };
+    let mut raw_nodes = Vec::new();
     for (index, item) in package_entries.iter().enumerate() {
         let item = item.as_table().ok_or_else(|| {
             invalid(
@@ -5090,62 +5746,204 @@ fn parse_cargo_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                 format!("Cargo.lock package entry {index} must be a table"),
             )
         })?;
-        let name = item
-            .get("name")
-            .and_then(Toml::as_str)
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                invalid(
-                    path,
-                    format!("Cargo.lock package entry {index} is missing a non-empty string name"),
-                )
-            })?;
-        let version = item
-            .get("version")
-            .and_then(Toml::as_str)
-            .filter(|version| !version.is_empty())
-            .ok_or_else(|| {
-                invalid(
-                    path,
-                    format!(
-                        "Cargo.lock package entry {index} is missing a non-empty string version"
-                    ),
-                )
-            })?;
-        semver::Version::parse(version).map_err(|error| {
-            invalid(
+        raw_nodes.push(cargo_lock_node(
+            path,
+            &format!("Cargo.lock package entry {index}"),
+            item,
+            true,
+        )?);
+    }
+    if let Some(root) = document.get("root") {
+        if lockfile_version != 1 {
+            return Err(invalid(
+                path,
+                "Cargo.lock [root] is supported only for version 1 lockfiles",
+            ));
+        }
+        let root = root
+            .as_table()
+            .ok_or_else(|| invalid(path, "Cargo.lock [root] must be a table"))?;
+        raw_nodes.push(cargo_lock_node(
+            path,
+            "Cargo.lock legacy root",
+            root,
+            false,
+        )?);
+    }
+
+    let mut identities = BTreeMap::new();
+    for (index, node) in raw_nodes.iter().enumerate() {
+        if let Some(previous) = identities.insert(node.id.clone(), index) {
+            return Err(invalid(
                 path,
                 format!(
-                    "Cargo.lock package entry {index} has invalid SemVer version {version:?}: {error}"
+                    "Cargo.lock repeats exact package identity {} {} at entries {previous} and {index}",
+                    node.id.name, node.id.version
                 ),
-            )
-        })?;
-        let source = item
-            .get("source")
-            .map(|source| {
-                source
-                    .as_str()
-                    .filter(|source| !source.is_empty())
-                    .ok_or_else(|| {
-                        invalid(
-                            path,
-                            format!(
-                                "Cargo.lock package entry {index} source must be a non-empty string"
-                            ),
-                        )
-                    })
+            ));
+        }
+    }
+
+    let mut nodes = Vec::with_capacity(raw_nodes.len());
+    for (raw_index, raw) in raw_nodes.iter().enumerate() {
+        let mut dependencies = BTreeSet::new();
+        for dependency in &raw.dependency_references {
+            let reference = parse_cargo_lock_reference(path, &raw.context, dependency)?;
+            let dependency = resolve_cargo_lock_reference(
+                path,
+                &raw.context,
+                &reference,
+                &raw_nodes,
+                lockfile_version,
+            )?;
+            if dependency == raw_index {
+                return Err(invalid(
+                    path,
+                    format!("{} cannot depend on itself", raw.context),
+                ));
+            }
+            dependencies.insert(dependency);
+        }
+        let replacement = raw
+            .replacement_reference
+            .as_deref()
+            .map(|replacement| {
+                let reference = parse_cargo_lock_reference(path, &raw.context, replacement)?;
+                resolve_cargo_lock_reference(
+                    path,
+                    &raw.context,
+                    &reference,
+                    &raw_nodes,
+                    lockfile_version,
+                )
             })
             .transpose()?;
-        let mut package = Package::new(Ecosystem::CratesIo, name, version, path.to_path_buf());
-        if let Some(dev) = direct.get(name) {
-            package.direct = true;
-            package.dev = *dev;
+        if let Some(replacement) = replacement {
+            let target = &raw_nodes[replacement];
+            if target.id == raw.id {
+                return Err(invalid(
+                    path,
+                    format!("{} cannot replace itself", raw.context),
+                ));
+            }
+            if target.id.name != raw.id.name || target.id.version != raw.id.version {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "{} replacement must have the same package name and version",
+                        raw.context
+                    ),
+                ));
+            }
+            if target.replacement_reference.is_some() {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "{} replacement target cannot itself define replace",
+                        raw.context
+                    ),
+                ));
+            }
         }
-        if !source.is_some_and(|source| {
-            source.starts_with("registry+https://github.com/rust-lang/crates.io-index")
-        }) {
-            package.enrichable = false;
+        nodes.push(CargoLockNode {
+            id: raw.id.clone(),
+            dependencies: dependencies.into_iter().collect(),
+            replacement,
+            emit: raw.emit,
+        });
+    }
+
+    let mut direct = vec![false; nodes.len()];
+    let mut direct_known = vec![false; nodes.len()];
+    let mut dev = vec![false; nodes.len()];
+    let mut dev_known = vec![false; nodes.len()];
+    let manifest = path.parent().unwrap_or(Path::new(".")).join("Cargo.toml");
+    if manifest.is_file() {
+        let evidence = cargo_project_evidence(&manifest)?;
+        let member_indices = evidence
+            .packages
+            .iter()
+            .map(|member| {
+                nodes.iter().position(|node| {
+                    node.id.name == member.name
+                        && node.id.version == member.version
+                        && node.id.source.is_none()
+                })
+            })
+            .collect::<Option<BTreeSet<_>>>();
+        if let Some(member_indices) = member_indices {
+            let mut direct_targets = BTreeSet::new();
+            let mut production_seeds = member_indices.clone();
+            let mut development_seeds = BTreeSet::new();
+            let mut unknown_seeds = BTreeSet::new();
+            for member_index in &member_indices {
+                let member = CargoProjectPackageId {
+                    name: nodes[*member_index].id.name.clone(),
+                    version: nodes[*member_index].id.version.clone(),
+                };
+                let scopes = cargo_member_edge_scopes(
+                    &member,
+                    &nodes[*member_index].dependencies,
+                    &nodes,
+                    &evidence.declarations,
+                );
+                for target in &nodes[*member_index].dependencies {
+                    direct_targets.insert(*target);
+                    match scopes.get(target).copied().unwrap_or(CargoScope::Unknown) {
+                        CargoScope::Production => {
+                            production_seeds.insert(*target);
+                        }
+                        CargoScope::Development => {
+                            development_seeds.insert(*target);
+                        }
+                        CargoScope::Unknown => {
+                            unknown_seeds.insert(*target);
+                        }
+                    }
+                }
+            }
+
+            let reachable =
+                cargo_reachable(member_indices.iter().copied(), &nodes, &BTreeSet::new());
+            let production =
+                cargo_reachable(production_seeds.iter().copied(), &nodes, &member_indices);
+            let development =
+                cargo_reachable(development_seeds.iter().copied(), &nodes, &member_indices);
+            let unknown = cargo_reachable(unknown_seeds.iter().copied(), &nodes, &member_indices);
+            for index in reachable {
+                direct[index] = direct_targets.contains(&index);
+                direct_known[index] = true;
+                if production.contains(&index) {
+                    dev[index] = false;
+                    dev_known[index] = true;
+                } else if unknown.contains(&index) {
+                    dev[index] = false;
+                    dev_known[index] = false;
+                } else if development.contains(&index) {
+                    dev[index] = true;
+                    dev_known[index] = true;
+                }
+            }
         }
+    }
+
+    let mut out = Vec::new();
+    for (index, node) in nodes.into_iter().enumerate() {
+        if !node.emit {
+            continue;
+        }
+        let mut package = Package::new(
+            Ecosystem::CratesIo,
+            node.id.name,
+            node.id.version,
+            path.to_path_buf(),
+        );
+        package.direct = direct[index];
+        package.direct_known = direct_known[index];
+        package.dev = dev[index];
+        package.dev_known = dev_known[index];
+        package.enrichable =
+            node.replacement.is_none() && node.id.source.as_deref() == Some(CARGO_CRATES_IO_SOURCE);
         out.push(package);
     }
     Ok(dedup(out))
@@ -6745,6 +7543,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result[0].name, "serde");
+        assert!(!result[0].direct_known);
+        assert!(!result[0].dev_known);
     }
 
     #[test]

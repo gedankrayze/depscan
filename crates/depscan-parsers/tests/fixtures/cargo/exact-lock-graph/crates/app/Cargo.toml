@@ -1,0 +1,17 @@
+[package]
+name = "app"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+prod-parent.workspace = true
+renamed-prod = { package = "renamed", version = "=1.0.0", optional = true }
+git-control = { package = "git-real", git = "https://example.invalid/git-real.git", tag = "release#candidate&signed" }
+lookalike = "=1.0.0"
+scope-prod = { package = "scope-collision", version = "=1.0.0", registry = "private" }
+
+[dev-dependencies]
+dup-dev.workspace = true
+shared-dev.workspace = true
+member-lib = { path = "../member-lib" }
+scope-dev = { package = "scope-collision", version = "=1.0.0", registry = "other" }

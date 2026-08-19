@@ -424,6 +424,23 @@ fn report_package_names(report: &serde_json::Value) -> BTreeSet<&str> {
         .collect()
 }
 
+fn report_package_coordinates(report: &serde_json::Value) -> BTreeSet<String> {
+    report_packages(report)
+        .iter()
+        .map(|result| {
+            let name = result
+                .pointer("/package/name")
+                .and_then(serde_json::Value::as_str)
+                .expect("reported package name");
+            let version = result
+                .pointer("/package/version")
+                .and_then(serde_json::Value::as_str)
+                .expect("reported package version");
+            format!("{name}@{version}")
+        })
+        .collect()
+}
+
 #[test]
 fn npm_direct_only_uses_lock_edges_and_retains_unbound_unknowns() {
     let directory = TestDirectory::new("npm-lock-directness-filter");
@@ -501,6 +518,184 @@ fn npm_direct_only_uses_lock_edges_and_retains_unbound_unknowns() {
                     == Some("1.0.0"))
         }),
         "proven-transitive duplicate@1.0.0 must be filtered"
+    );
+}
+
+#[test]
+fn cargo_filters_use_exact_locked_identities_and_retain_unknowns() {
+    let directory = TestDirectory::new("cargo-exact-graph-filters");
+    let cache = directory.path().join("cache");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        r#"[package]
+name = "cargo-filter-root"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+prod-parent = "1"
+shared-prod = { package = "shared", version = "1" }
+
+[dev-dependencies]
+dup-dev = { package = "dup", version = "1" }
+shared-dev = { package = "shared", version = "1" }
+
+[workspace]
+"#,
+    )
+    .expect("write Cargo manifest with duplicate-name and mixed-scope declarations");
+    fs::write(
+        directory.path().join("Cargo.lock"),
+        r#"version = 4
+
+[[package]]
+name = "cargo-filter-root"
+version = "0.1.0"
+dependencies = [
+ "dup 1.0.0",
+ "prod-parent",
+ "shared",
+]
+
+[[package]]
+name = "dup"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+dependencies = [
+ "dev-child",
+]
+
+[[package]]
+name = "dev-child"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[package]]
+name = "dup"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2222222222222222222222222222222222222222222222222222222222222222"
+dependencies = [
+ "prod-child",
+]
+
+[[package]]
+name = "prod-child"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[package]]
+name = "prod-parent"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4444444444444444444444444444444444444444444444444444444444444444"
+dependencies = [
+ "dup 2.0.0",
+ "shared",
+]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5555555555555555555555555555555555555555555555555555555555555555"
+
+[[package]]
+name = "stale-disconnected"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6666666666666666666666666666666666666666666666666666666666666666"
+"#,
+    )
+    .expect("write exact Cargo lock graph");
+    seed_empty_cargo_dump(&cache);
+
+    let run = |filters: &[&str]| {
+        let mut arguments = vec!["scan", "--offline", "--format", "json"];
+        arguments.extend_from_slice(filters);
+        arguments.push(directory.path().to_str().expect("UTF-8 project path"));
+        command(&cache)
+            .args(arguments)
+            .output()
+            .expect("run Cargo graph filter scan")
+    };
+
+    let baseline = run(&[]);
+    assert_exit(&baseline, 0);
+    assert_eq!(
+        report_package_coordinates(&json_report(&baseline)),
+        BTreeSet::from([
+            "cargo-filter-root@0.1.0".to_owned(),
+            "dev-child@1.0.0".to_owned(),
+            "dup@1.0.0".to_owned(),
+            "dup@2.0.0".to_owned(),
+            "prod-child@1.0.0".to_owned(),
+            "prod-parent@1.0.0".to_owned(),
+            "shared@1.0.0".to_owned(),
+            "stale-disconnected@1.0.0".to_owned(),
+        ])
+    );
+
+    let direct_only = run(&["--direct-only"]);
+    assert_exit(&direct_only, 0);
+    let direct_report = json_report(&direct_only);
+    assert_eq!(
+        report_package_coordinates(&direct_report),
+        BTreeSet::from([
+            "dup@1.0.0".to_owned(),
+            "prod-parent@1.0.0".to_owned(),
+            "shared@1.0.0".to_owned(),
+            "stale-disconnected@1.0.0".to_owned(),
+        ])
+    );
+    let stale = report_packages(&direct_report)
+        .iter()
+        .find(|result| {
+            result
+                .pointer("/package/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("stale-disconnected")
+        })
+        .expect("retained disconnected Cargo record");
+    assert_eq!(
+        stale
+            .pointer("/package/direct_known")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        stale
+            .pointer("/package/dev_known")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+
+    let no_dev = run(&["--no-dev"]);
+    assert_exit(&no_dev, 0);
+    assert_eq!(
+        report_package_coordinates(&json_report(&no_dev)),
+        BTreeSet::from([
+            "cargo-filter-root@0.1.0".to_owned(),
+            "dup@2.0.0".to_owned(),
+            "prod-child@1.0.0".to_owned(),
+            "prod-parent@1.0.0".to_owned(),
+            "shared@1.0.0".to_owned(),
+            "stale-disconnected@1.0.0".to_owned(),
+        ])
+    );
+
+    let combined = run(&["--direct-only", "--no-dev"]);
+    assert_exit(&combined, 0);
+    assert_eq!(
+        report_package_coordinates(&json_report(&combined)),
+        BTreeSet::from([
+            "prod-parent@1.0.0".to_owned(),
+            "shared@1.0.0".to_owned(),
+            "stale-disconnected@1.0.0".to_owned(),
+        ])
     );
 }
 
@@ -1470,10 +1665,21 @@ fn complete_implicit_config_drives_the_default_scan_and_root_relative_output() {
         r#"version = 3
 
 [[package]]
+name = "fixture"
+version = "0.1.0"
+dependencies = [
+ "demo",
+ "devcrate",
+]
+
+[[package]]
 name = "demo"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+dependencies = [
+ "transitive",
+]
 
 [[package]]
 name = "devcrate"

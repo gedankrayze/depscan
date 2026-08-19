@@ -1,0 +1,9 @@
+[package]
+name = "member-lib"
+edition = "2024"
+
+[dependencies]
+member-prod-child = "=1.0.0"
+
+[dev-dependencies]
+member-dev-child = "=1.0.0"

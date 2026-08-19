@@ -5,7 +5,21 @@ expression: "normalized(&packages, &root)"
 [
   {
     "dev": false,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "display_name": "app",
+    "enrichable": false,
+    "name": "app",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "0.1.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "auto-child",
     "enrichable": true,
     "name": "auto-child",
@@ -15,7 +29,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "cc",
     "enrichable": true,
     "name": "cc",
@@ -25,7 +41,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": false,
     "direct": false,
+    "direct_known": false,
     "display_name": "excluded-direct",
     "enrichable": true,
     "name": "excluded-direct",
@@ -35,7 +53,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "git-only",
     "enrichable": false,
     "name": "git-only",
@@ -45,7 +65,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "git-real",
     "enrichable": false,
     "name": "git-real",
@@ -55,7 +77,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "local-only",
     "enrichable": false,
     "name": "local-only",
@@ -65,7 +89,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "local-shared",
     "enrichable": false,
     "name": "local-shared",
@@ -75,7 +101,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "other-direct",
     "enrichable": true,
     "name": "other-direct",
@@ -85,7 +113,21 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
+    "direct": false,
+    "direct_known": true,
+    "display_name": "other",
+    "enrichable": false,
+    "name": "other",
+    "resolved_from_range": false,
+    "source": "Cargo.lock",
+    "version": "0.1.0"
+  },
+  {
+    "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "real-crate",
     "enrichable": true,
     "name": "real-crate",
@@ -95,7 +137,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "serde",
     "enrichable": true,
     "name": "serde",
@@ -105,7 +149,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "shared-child",
     "enrichable": true,
     "name": "shared-child",
@@ -115,7 +161,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "target-build-real",
     "enrichable": true,
     "name": "target-build-real",
@@ -125,7 +173,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": true,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "target-dev",
     "enrichable": true,
     "name": "target-dev",
@@ -135,7 +185,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "target-real",
     "enrichable": true,
     "name": "target-real",
@@ -145,7 +197,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": false,
+    "dev_known": false,
     "direct": false,
+    "direct_known": false,
     "display_name": "unused-real",
     "enrichable": true,
     "name": "unused-real",
@@ -155,7 +209,9 @@ expression: "normalized(&packages, &root)"
   },
   {
     "dev": true,
+    "dev_known": true,
     "direct": true,
+    "direct_known": true,
     "display_name": "workspace-dev",
     "enrichable": true,
     "name": "workspace-dev",

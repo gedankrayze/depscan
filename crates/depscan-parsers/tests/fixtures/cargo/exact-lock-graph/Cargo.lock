@@ -1,0 +1,100 @@
+version = 4
+
+[[package]]
+name = "app"
+version = "0.5.0"
+dependencies = [
+ "dup 1.0.0",
+ "git-real",
+ "lookalike",
+ "member-lib",
+ "prod-parent",
+ "renamed",
+ "scope-collision 1.0.0 (registry+https://private.invalid/index)",
+ "scope-collision 1.0.0 (registry+https://other.invalid/index)",
+ "shared",
+]
+
+[[package]]
+name = "dev-child"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "dup"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = ["dev-child"]
+
+[[package]]
+name = "dup"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = ["prod-child"]
+
+[[package]]
+name = "git-real"
+version = "3.0.0"
+source = "git+https://example.invalid/git-real.git?tag=release%23candidate%26signed#0123456789abcdef0123456789abcdef01234567"
+
+[[package]]
+name = "lookalike"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index.attacker"
+
+[[package]]
+name = "member-dev-child"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "member-lib"
+version = "0.0.0"
+dependencies = [
+ "member-dev-child",
+ "member-prod-child",
+]
+
+[[package]]
+name = "member-prod-child"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "prod-child"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "prod-parent"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "dup 2.0.0",
+ "shared",
+]
+
+[[package]]
+name = "renamed"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "scope-collision"
+version = "1.0.0"
+source = "registry+https://private.invalid/index"
+
+[[package]]
+name = "scope-collision"
+version = "1.0.0"
+source = "registry+https://other.invalid/index"
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "stale"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"

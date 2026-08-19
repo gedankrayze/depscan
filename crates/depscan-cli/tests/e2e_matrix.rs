@@ -112,7 +112,7 @@ const CARGO_PACKAGES: &[ExpectedPackage] = &[
         display_name: "regex-syntax",
         version: "0.8.5",
         direct: false,
-        dev: false,
+        dev: true,
     },
     ExpectedPackage {
         name: "serde",

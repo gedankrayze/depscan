@@ -6,6 +6,23 @@ version = "12.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "git-only",
+ "git-real",
+ "local-only",
+ "local-shared",
+ "real-crate",
+ "serde",
+ "target-build-real",
+ "target-dev",
+ "target-real",
+ "workspace-dev",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28,10 +45,20 @@ source = "git+https://example.invalid/git-real.git#00000000000000000000000000000
 [[package]]
 name = "local-only"
 version = "0.1.0"
+dependencies = ["auto-child"]
 
 [[package]]
 name = "local-shared"
 version = "0.3.0"
+dependencies = ["shared-child"]
+
+[[package]]
+name = "other"
+version = "0.1.0"
+dependencies = [
+ "other-direct",
+ "serde",
+]
 
 [[package]]
 name = "other-direct"
