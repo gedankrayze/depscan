@@ -637,7 +637,8 @@ fn parse_xml_packages(path: &Path) -> Result<Vec<Package>, ParseError> {
                 ) {
                     let mut name = None;
                     let mut version = None;
-                    for attr in e.attributes().flatten() {
+                    for attr in e.attributes() {
+                        let attr = attr.map_err(|error| invalid(path, error))?;
                         let key = String::from_utf8_lossy(attr.key.as_ref());
                         let val = String::from_utf8_lossy(&attr.value).to_string();
                         match key.as_ref() {
@@ -848,6 +849,55 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "newtonsoft.json");
         assert_eq!(result[0].display_name, "Newtonsoft.Json");
+    }
+
+    #[test]
+    fn rejects_duplicate_nuget_attributes_after_large_attribute_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("duplicate-attributes.csproj");
+        let mut attributes = String::from(r#"Include="First.Package" Version="1.2.3""#);
+        // quick-xml 0.41 switches duplicate detection to its linear-time hash path
+        // after 32 attributes. Keep the duplicate beyond that boundary so this
+        // exercises depscan's real `attributes()` call through the patched path.
+        for index in 0..40 {
+            attributes.push_str(&format!(r#" data-{index}="value""#));
+        }
+        attributes.push_str(r#" Include="Second.Package""#);
+        fs::write(
+            &project,
+            format!("<Project><ItemGroup><PackageReference {attributes} /></ItemGroup></Project>"),
+        )
+        .unwrap();
+
+        let error = parse_xml_packages(&project).unwrap_err();
+
+        assert!(error.to_string().contains("duplicated attribute"));
+    }
+
+    #[test]
+    fn plain_nuget_reader_accepts_more_than_namespace_resolver_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("namespace-declarations.csproj");
+        let mut namespaces = String::new();
+        // RUSTSEC-2026-0195 affects NsReader's namespace resolver. depscan uses
+        // plain Reader, so even an element above NsReader's 256-declaration cap
+        // is handled as ordinary attributes without a resolver-side allocation.
+        for index in 0..300 {
+            namespaces.push_str(&format!(r#" xmlns:p{index}="urn:test:{index}""#));
+        }
+        fs::write(
+            &project,
+            format!(
+                "<Project{namespaces}><ItemGroup><PackageReference Include=\"Safe.Package\" Version=\"4.5.6\" /></ItemGroup></Project>"
+            ),
+        )
+        .unwrap();
+
+        let result = parse_xml_packages(&project).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].display_name, "Safe.Package");
+        assert_eq!(result[0].version, "4.5.6");
     }
 
     #[test]
