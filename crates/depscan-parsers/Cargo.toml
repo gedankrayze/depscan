@@ -14,6 +14,8 @@ description = "Filesystem-only dependency manifest and lockfile parsers for deps
 include = ["src/**", "tests/**", "LICENSE"]
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 depscan-core.workspace = true
 glob.workspace = true
 pep440_rs.workspace = true
@@ -30,9 +32,14 @@ quick-xml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["json"] }
 tempfile = "3.27.0"
 
-[lints]
-workspace = true
+[lints.rust]
+# Windows capability attachment checks require one audited FILE_ID_INFO call. The scoped
+# module permits that FFI while every other unsafe use in this crate remains an error.
+unsafe_code = "deny"

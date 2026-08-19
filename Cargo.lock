@@ -522,6 +522,8 @@ dependencies = [
 name = "depscan-parsers"
 version = "1.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "depscan-core",
  "glob",
  "insta",
@@ -539,6 +541,7 @@ dependencies = [
  "unicode-general-category",
  "url",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

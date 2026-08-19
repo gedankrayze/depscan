@@ -59,6 +59,7 @@ url = "2.5.8"
 urlencoding = "2.1.3"
 unicode-general-category = "1.1.0"
 walkdir = "2.5.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 quick-xml = { version = "0.41.0", features = ["serialize"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 pep440_rs = "0.7.3"

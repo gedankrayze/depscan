@@ -1,15 +1,24 @@
 use super::{dedup, invalid};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, File, OpenOptions},
+};
 use depscan_core::{Ecosystem, Package, ParseError, normalize_name};
 use pep440_rs::{Version as Pep440Version, VersionSpecifiers};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    ffi::{OsStr, OsString},
+    fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
+mod process_barrier;
 mod syntax;
 
+use process_barrier::process_test_barrier;
 use syntax::{ConstraintSpec, GlobalOption, IncludeKind, ParsedLine};
 
 const MAX_INCLUDE_DEPTH: usize = 32;
@@ -43,18 +52,258 @@ enum FileRole {
     Constraint,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadBoundary {
+    RootOpened,
+    DirectoryOpened,
+    FileOpened,
+    BeforeRead,
+    AfterRead,
+}
+
+impl ReadBoundary {
+    #[cfg(debug_assertions)]
+    fn label(self) -> &'static str {
+        match self {
+            Self::RootOpened => "root-opened",
+            Self::DirectoryOpened => "directory-opened",
+            Self::FileOpened => "file-opened",
+            Self::BeforeRead => "before-read",
+            Self::AfterRead => "after-read",
+        }
+    }
+}
+
+struct RequirementsRoot {
+    directory: Arc<DirectoryCapability>,
+    canonical: PathBuf,
+    requested_absolute: PathBuf,
+}
+
+struct DirectoryCapability {
+    directory: Dir,
+    identity: FileIdentity,
+    relative: PathBuf,
+    parent: Option<Arc<Self>>,
+    name: Option<PathBuf>,
+}
+
+struct OpenRequirementsFile {
+    file: File,
+    identity: FileIdentity,
+    parent: Arc<DirectoryCapability>,
+    logical_parent: Arc<DirectoryCapability>,
+    relative: PathBuf,
+    display: PathBuf,
+    name: OsString,
+    logical_name: OsString,
+}
+
+struct ActiveFile {
+    display: PathBuf,
+    identity: FileIdentity,
+}
+
+#[derive(Debug)]
+struct FileIdentity {
+    key: IdentityKey,
+    _handle: std::fs::File,
+}
+
+impl PartialEq for FileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for FileIdentity {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IdentityKey {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
+}
+
+#[cfg(unix)]
+fn platform_file_identity(file: &std::fs::File) -> std::io::Result<IdentityKey> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(IdentityKey::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn platform_file_identity(file: &std::fs::File) -> std::io::Result<IdentityKey> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx},
+    };
+
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: `file` owns a valid handle for this call, `information` provides a correctly sized
+    // initialized writable FILE_ID_INFO buffer, and the return value is checked before its fields
+    // are trusted.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&raw mut information).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+                .expect("FILE_ID_INFO size fits a Windows DWORD"),
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(IdentityKey::Windows {
+        volume_serial_number: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+    })
+}
+
+fn directory_identity(directory: &Dir, path: &Path) -> Result<FileIdentity, ParseError> {
+    let file = directory
+        .try_clone()
+        .map_err(|error| {
+            invalid(
+                path,
+                format!("cannot clone requirements directory: {error}"),
+            )
+        })?
+        .into_std_file();
+    let key = platform_file_identity(&file).map_err(|error| {
+        invalid(
+            path,
+            format!("cannot identify requirements directory: {error}"),
+        )
+    })?;
+    Ok(FileIdentity { key, _handle: file })
+}
+
+fn file_identity(file: &File, path: &Path) -> Result<FileIdentity, ParseError> {
+    let file = file
+        .try_clone()
+        .map_err(|error| invalid(path, format!("cannot clone requirements file: {error}")))?
+        .into_std();
+    let key = platform_file_identity(&file)
+        .map_err(|error| invalid(path, format!("cannot identify requirements file: {error}")))?;
+    Ok(FileIdentity { key, _handle: file })
+}
+
+fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(path)
+    };
+    normalize_lexical(&absolute).ok_or_else(|| "path escapes its filesystem root".to_owned())
+}
+
+fn normalize_lexical(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    let mut normal_components = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normal_components == 0 || !normalized.pop() {
+                    return None;
+                }
+                normal_components -= 1;
+            }
+            Component::Normal(name) => {
+                normalized.push(name);
+                normal_components += 1;
+            }
+        }
+    }
+    Some(normalized)
+}
+
+fn normalize_relative(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+#[cfg(not(windows))]
+fn strip_root_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn strip_root_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    let path_components = path.components().collect::<Vec<_>>();
+    let root_components = root.components().collect::<Vec<_>>();
+    if root_components.len() > path_components.len()
+        || !root_components
+            .iter()
+            .zip(&path_components)
+            .all(|(expected, actual)| {
+                expected
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&actual.as_os_str().to_string_lossy())
+            })
+    {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for component in &path_components[root_components.len()..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
 fn parse_with_limits(path: &Path, limits: RequirementsLimits) -> Result<Vec<Package>, ParseError> {
+    let mut hook = |boundary, relative: &Path, display: &Path| {
+        process_test_barrier(boundary, relative, display)
+    };
+    parse_with_limits_and_hook(path, limits, &mut hook)
+}
+
+fn parse_with_limits_and_hook(
+    path: &Path,
+    limits: RequirementsLimits,
+    hook: &mut dyn FnMut(ReadBoundary, &Path, &Path) -> Result<(), ParseError>,
+) -> Result<Vec<Package>, ParseError> {
     let requested_root = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let root = fs::canonicalize(requested_root).map_err(|error| {
-        invalid(
-            requested_root,
-            format!("cannot canonicalize requirements scan root: {error}"),
-        )
-    })?;
-    let metadata = fs::metadata(&root).map_err(|error| {
+    let root_directory =
+        Dir::open_ambient_dir(requested_root, ambient_authority()).map_err(|error| {
+            invalid(
+                requested_root,
+                format!("cannot open requirements scan root: {error}"),
+            )
+        })?;
+    let metadata = root_directory.dir_metadata().map_err(|error| {
         invalid(
             requested_root,
             format!("cannot inspect requirements scan root: {error}"),
@@ -66,6 +315,50 @@ fn parse_with_limits(path: &Path, limits: RequirementsLimits) -> Result<Vec<Pack
             "requirements scan root is not a directory",
         ));
     }
+    let root_identity = directory_identity(&root_directory, requested_root)?;
+    let canonical = fs::canonicalize(requested_root).map_err(|error| {
+        invalid(
+            requested_root,
+            format!("cannot canonicalize requirements scan root: {error}"),
+        )
+    })?;
+    let canonical_directory =
+        Dir::open_ambient_dir(&canonical, ambient_authority()).map_err(|error| {
+            invalid(
+                requested_root,
+                format!("cannot validate canonical requirements scan root: {error}"),
+            )
+        })?;
+    if directory_identity(&canonical_directory, &canonical)? != root_identity {
+        return Err(invalid(
+            requested_root,
+            "requirements scan root changed while its capability was acquired",
+        ));
+    }
+    let requested_absolute = lexical_absolute(requested_root).map_err(|message| {
+        invalid(
+            requested_root,
+            format!("cannot resolve requirements scan root: {message}"),
+        )
+    })?;
+    let root = RequirementsRoot {
+        directory: Arc::new(DirectoryCapability {
+            directory: root_directory,
+            identity: root_identity,
+            relative: PathBuf::new(),
+            parent: None,
+            name: None,
+        }),
+        canonical,
+        requested_absolute,
+    };
+    hook(ReadBoundary::RootOpened, Path::new("."), &root.canonical)?;
+    let root_capability = root.directory.clone();
+
+    let root_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid(path, "requirements source is not a regular file"))?;
 
     let mut parser = RequirementsParser {
         root,
@@ -76,8 +369,13 @@ fn parse_with_limits(path: &Path, limits: RequirementsLimits) -> Result<Vec<Pack
         registry_origin_ambiguous: false,
         range_resolution_ambiguous: false,
         constraints: BTreeMap::new(),
+        hook,
     };
-    let mut packages = parser.parse_file(path, FileRole::Requirement)?;
+    let mut packages = parser.parse_file(
+        Path::new(root_name),
+        FileRole::Requirement,
+        &root_capability,
+    )?;
     apply_constraints(path, &mut packages, &parser.constraints)?;
     if parser.registry_origin_ambiguous {
         for package in &mut packages {
@@ -93,15 +391,16 @@ fn parse_with_limits(path: &Path, limits: RequirementsLimits) -> Result<Vec<Pack
     Ok(dedup(packages))
 }
 
-struct RequirementsParser {
-    root: PathBuf,
+struct RequirementsParser<'hook> {
+    root: RequirementsRoot,
     limits: RequirementsLimits,
-    active: Vec<PathBuf>,
+    active: Vec<ActiveFile>,
     files_read: usize,
     bytes_read: u64,
     registry_origin_ambiguous: bool,
     range_resolution_ambiguous: bool,
     constraints: BTreeMap<String, Vec<ConstraintSpec>>,
+    hook: &'hook mut dyn FnMut(ReadBoundary, &Path, &Path) -> Result<(), ParseError>,
 }
 
 fn apply_constraints(
@@ -181,12 +480,18 @@ fn apply_constraints(
     Ok(())
 }
 
-impl RequirementsParser {
-    fn parse_file(&mut self, requested: &Path, role: FileRole) -> Result<Vec<Package>, ParseError> {
+impl RequirementsParser<'_> {
+    fn parse_file(
+        &mut self,
+        relative: &Path,
+        role: FileRole,
+        base: &Arc<DirectoryCapability>,
+    ) -> Result<Vec<Package>, ParseError> {
+        let display = self.root.canonical.join(relative);
         let depth = self.active.len();
         if depth > self.limits.include_depth {
             return Err(self.rejected(
-                requested,
+                &display,
                 format!(
                     "requirements include depth {depth} exceeds the maximum of {}",
                     self.limits.include_depth
@@ -195,7 +500,7 @@ impl RequirementsParser {
         }
         if self.files_read >= self.limits.files {
             return Err(self.rejected(
-                requested,
+                &display,
                 format!(
                     "requirements file count exceeds the maximum of {}",
                     self.limits.files
@@ -203,69 +508,250 @@ impl RequirementsParser {
             ));
         }
 
-        let requested_metadata = fs::symlink_metadata(requested).map_err(|error| {
-            self.rejected(
-                requested,
-                format!("cannot inspect requirements file: {error}"),
-            )
-        })?;
-        if requested_metadata.file_type().is_symlink() {
-            return Err(self.rejected(
-                requested,
-                "requirements file is a symbolic link; symbolic includes are not allowed",
-            ));
+        let mut opened = self.open_file(relative, base)?;
+        if self
+            .active
+            .iter()
+            .any(|active| active.identity == opened.identity)
+        {
+            return Err(self.rejected(&opened.display, "requirements include cycle detected"));
         }
-        if !requested_metadata.is_file() {
-            return Err(self.rejected(requested, "requirements include is not a regular file"));
-        }
-
-        let canonical = fs::canonicalize(requested).map_err(|error| {
-            self.rejected(
-                requested,
-                format!("cannot canonicalize requirements file: {error}"),
-            )
-        })?;
-        if !canonical.starts_with(&self.root) {
-            return Err(self.rejected(
-                requested,
-                format!(
-                    "requirements include resolves outside scan root {}",
-                    self.root.display()
-                ),
-            ));
-        }
-        if self.active.contains(&canonical) {
-            return Err(self.rejected(&canonical, "requirements include cycle detected"));
-        }
-
-        self.active.push(canonical.clone());
-        let result = self.read_and_parse(&canonical, role);
+        self.active.push(ActiveFile {
+            display: opened.display.clone(),
+            identity: file_identity(&opened.file, &opened.display)?,
+        });
+        let result = self.read_and_parse(&mut opened, role);
         self.active.pop();
         result
     }
 
-    fn read_and_parse(
+    fn open_file(
         &mut self,
-        canonical: &Path,
-        role: FileRole,
-    ) -> Result<Vec<Package>, ParseError> {
-        let file = File::open(canonical).map_err(|error| {
-            self.current_error(canonical, format!("cannot open requirements file: {error}"))
+        relative: &Path,
+        base: &Arc<DirectoryCapability>,
+    ) -> Result<OpenRequirementsFile, ParseError> {
+        let relative = normalize_relative(relative).ok_or_else(|| {
+            self.rejected(
+                &self.root.canonical.join(relative),
+                format!(
+                    "requirements include resolves outside scan root {}",
+                    self.root.canonical.display()
+                ),
+            )
+        })?;
+        let logical_name = relative
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| self.rejected(&relative, "requirements include is not a regular file"))?
+            .to_os_string();
+        let logical_parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+        let logical_parent = self.resolve_directory(logical_parent_relative, base)?;
+        let logical_display = self.root.canonical.join(&relative);
+        let first_file =
+            self.open_regular_nofollow(&logical_parent.directory, &logical_name, &logical_display)?;
+        let first_identity = file_identity(&first_file, &logical_display)?;
+
+        let canonical_relative = self
+            .root
+            .directory
+            .directory
+            .canonicalize(&relative)
+            .map_err(|error| {
+                self.rejected(
+                    &logical_display,
+                    format!(
+                        "requirements include path changed while resolving within scan root: {error}"
+                    ),
+                )
+            })?;
+        let canonical_relative = normalize_relative(&canonical_relative).ok_or_else(|| {
+            self.rejected(
+                &logical_display,
+                format!(
+                    "requirements include resolves outside scan root {}",
+                    self.root.canonical.display()
+                ),
+            )
+        })?;
+        let name = canonical_relative
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .expect("a normalized requirements path has a final component")
+            .to_os_string();
+        let canonical_parent_relative =
+            canonical_relative.parent().unwrap_or_else(|| Path::new(""));
+        let parent = self.resolve_directory(canonical_parent_relative, base)?;
+        let display = self.root.canonical.join(&canonical_relative);
+        let canonical_file = self.open_regular_nofollow(&parent.directory, &name, &display)?;
+        if file_identity(&canonical_file, &display)? != first_identity {
+            return Err(self.rejected(
+                &logical_display,
+                "requirements file changed while its capability was acquired",
+            ));
+        }
+        let identity = file_identity(&first_file, &display)?;
+        (self.hook)(ReadBoundary::FileOpened, &canonical_relative, &display)?;
+        Ok(OpenRequirementsFile {
+            file: first_file,
+            identity,
+            parent,
+            logical_parent,
+            relative: canonical_relative,
+            display,
+            name,
+            logical_name,
+        })
+    }
+
+    fn open_regular_nofollow(
+        &self,
+        parent: &Dir,
+        name: &OsStr,
+        display: &Path,
+    ) -> Result<File, ParseError> {
+        let metadata = parent.symlink_metadata(name).map_err(|error| {
+            self.rejected(
+                display,
+                format!("cannot inspect requirements file: {error}"),
+            )
+        })?;
+        if metadata.is_symlink() {
+            return Err(self.rejected(
+                display,
+                "requirements file is a symbolic link; symbolic includes are not allowed",
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(self.rejected(display, "requirements include is not a regular file"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = parent.open_with(name, &options).map_err(|error| {
+            self.rejected(
+                display,
+                format!("cannot open requirements file without following links: {error}"),
+            )
         })?;
         let metadata = file.metadata().map_err(|error| {
-            self.current_error(
-                canonical,
+            self.rejected(
+                display,
                 format!("cannot inspect open requirements file: {error}"),
             )
         })?;
         if !metadata.is_file() {
-            return Err(self.current_error(canonical, "requirements include is not a regular file"));
+            return Err(self.rejected(display, "requirements include is not a regular file"));
         }
+        Ok(file)
+    }
 
+    fn resolve_directory(
+        &mut self,
+        relative: &Path,
+        base: &Arc<DirectoryCapability>,
+    ) -> Result<Arc<DirectoryCapability>, ParseError> {
+        let target = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::CurDir => None,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                    unreachable!("requirements directory paths are normalized before resolution")
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut ancestry = Vec::new();
+        let mut cursor = Some(base.clone());
+        while let Some(capability) = cursor {
+            cursor = capability.parent.clone();
+            ancestry.push(capability);
+        }
+        ancestry.reverse();
+        let base_components = base
+            .relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_os_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let common = target
+            .iter()
+            .zip(&base_components)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut current = ancestry[common].clone();
+        for name in &target[common..] {
+            let relative = current.relative.join(name);
+            let display = self.root.canonical.join(&relative);
+            let directory = match current.directory.open_dir(name) {
+                Ok(directory) => directory,
+                Err(component_error) => {
+                    let full_relative = PathBuf::from_iter(&target);
+                    let full_display = self.root.canonical.join(&full_relative);
+                    let directory = self
+                        .root
+                        .directory
+                        .directory
+                        .open_dir(&full_relative)
+                        .map_err(|error| {
+                            self.rejected(
+                                &full_display,
+                                format!(
+                                    "cannot open requirements include directory within scan root: {error}; component resolution failed: {component_error}"
+                                ),
+                            )
+                        })?;
+                    let identity = directory_identity(&directory, &full_display)?;
+                    let capability = Arc::new(DirectoryCapability {
+                        directory,
+                        identity,
+                        relative: full_relative.clone(),
+                        parent: Some(self.root.directory.clone()),
+                        name: Some(full_relative.clone()),
+                    });
+                    (self.hook)(ReadBoundary::DirectoryOpened, &full_relative, &full_display)?;
+                    return Ok(capability);
+                }
+            };
+            let metadata = directory.dir_metadata().map_err(|error| {
+                self.rejected(
+                    &display,
+                    format!("cannot inspect requirements include directory: {error}"),
+                )
+            })?;
+            if !metadata.is_dir() {
+                return Err(
+                    self.rejected(&display, "requirements include parent is not a directory")
+                );
+            }
+            let identity = directory_identity(&directory, &display)?;
+            current = Arc::new(DirectoryCapability {
+                directory,
+                identity,
+                relative: relative.clone(),
+                parent: Some(current),
+                name: Some(PathBuf::from(name)),
+            });
+            (self.hook)(ReadBoundary::DirectoryOpened, &relative, &display)?;
+        }
+        Ok(current)
+    }
+
+    fn read_and_parse(
+        &mut self,
+        opened: &mut OpenRequirementsFile,
+        role: FileRole,
+    ) -> Result<Vec<Package>, ParseError> {
+        let metadata = opened.file.metadata().map_err(|error| {
+            self.current_error(
+                &opened.display,
+                format!("cannot inspect open requirements file: {error}"),
+            )
+        })?;
         let remaining = self.limits.bytes.saturating_sub(self.bytes_read);
         if metadata.len() > remaining {
             return Err(self.current_error(
-                canonical,
+                &opened.display,
                 format!(
                     "requirements input exceeds the maximum total of {} bytes",
                     self.limits.bytes
@@ -273,16 +759,24 @@ impl RequirementsParser {
             ));
         }
 
+        (self.hook)(ReadBoundary::BeforeRead, &opened.relative, &opened.display)?;
         let mut bytes = Vec::new();
-        file.take(remaining.saturating_add(1))
+        (&mut opened.file)
+            .take(remaining.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|error| {
-                self.current_error(canonical, format!("cannot read requirements file: {error}"))
+                self.current_error(
+                    &opened.display,
+                    format!("cannot read requirements file: {error}"),
+                )
             })?;
+        (self.hook)(ReadBoundary::AfterRead, &opened.relative, &opened.display)?;
+        self.revalidate_file(opened)?;
+
         let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if byte_count > remaining {
             return Err(self.current_error(
-                canonical,
+                &opened.display,
                 format!(
                     "requirements input exceeds the maximum total of {} bytes",
                     self.limits.bytes
@@ -294,16 +788,94 @@ impl RequirementsParser {
 
         let text = String::from_utf8(bytes).map_err(|error| {
             self.current_error(
-                canonical,
+                &opened.display,
                 format!("requirements file is not valid UTF-8: {error}"),
             )
         })?;
-        self.parse_text(canonical, &text, role)
+        self.parse_text(
+            &opened.display,
+            &opened.relative,
+            &opened.parent,
+            &text,
+            role,
+        )
+    }
+
+    fn revalidate_file(&self, opened: &OpenRequirementsFile) -> Result<(), ParseError> {
+        let logical_parent = self.revalidate_directory(&opened.logical_parent, &opened.display)?;
+        let canonical_parent = self.revalidate_directory(&opened.parent, &opened.display)?;
+        self.revalidate_name(
+            &logical_parent,
+            &opened.logical_name,
+            &opened.identity,
+            &opened.display,
+        )?;
+        self.revalidate_name(
+            &canonical_parent,
+            &opened.name,
+            &opened.identity,
+            &opened.display,
+        )
+    }
+
+    fn revalidate_directory(
+        &self,
+        expected: &Arc<DirectoryCapability>,
+        display: &Path,
+    ) -> Result<Dir, ParseError> {
+        let root =
+            Dir::open_ambient_dir(&self.root.canonical, ambient_authority()).map_err(|_| {
+                self.current_error(display, "requirements scan root changed while reading")
+            })?;
+        if directory_identity(&root, &self.root.canonical)? != self.root.directory.identity {
+            return Err(self.current_error(display, "requirements scan root changed while reading"));
+        }
+        let mut ancestry = Vec::new();
+        let mut cursor = Some(expected.clone());
+        while let Some(capability) = cursor {
+            cursor = capability.parent.clone();
+            ancestry.push(capability);
+        }
+        ancestry.reverse();
+        let mut current = root;
+        for capability in ancestry.iter().skip(1) {
+            let name = capability
+                .name
+                .as_deref()
+                .expect("non-root directory capability has a name");
+            current = current.open_dir(name).map_err(|_| {
+                self.current_error(display, "requirements include path changed while reading")
+            })?;
+            if directory_identity(&current, display)? != capability.identity {
+                return Err(
+                    self.current_error(display, "requirements include path changed while reading")
+                );
+            }
+        }
+        Ok(current)
+    }
+
+    fn revalidate_name(
+        &self,
+        parent: &Dir,
+        name: &OsStr,
+        expected: &FileIdentity,
+        display: &Path,
+    ) -> Result<(), ParseError> {
+        let file = self
+            .open_regular_nofollow(parent, name, display)
+            .map_err(|_| self.current_error(display, "requirements file changed while reading"))?;
+        if &file_identity(&file, display)? != expected {
+            return Err(self.current_error(display, "requirements file changed while reading"));
+        }
+        Ok(())
     }
 
     fn parse_text(
         &mut self,
         canonical: &Path,
+        relative: &Path,
+        parent: &Arc<DirectoryCapability>,
         text: &str,
         role: FileRole,
     ) -> Result<Vec<Package>, ParseError> {
@@ -314,7 +886,10 @@ impl RequirementsParser {
                 format!("invalid requirements syntax: {}", error.message()),
             )
         })?;
-        let base = canonical.parent().unwrap_or(&self.root).to_path_buf();
+        let base = canonical
+            .parent()
+            .unwrap_or(&self.root.canonical)
+            .to_path_buf();
         for logical in logical_lines {
             let parsed = syntax::parse_line(&logical.text, &base).map_err(|error| {
                 self.current_error(
@@ -350,16 +925,27 @@ impl RequirementsParser {
                         ));
                     }
                     let include_path = Path::new(&target);
-                    let requested = if include_path.is_absolute() {
+                    let requested_display = if include_path.is_absolute() {
                         include_path.to_path_buf()
                     } else {
                         base.join(include_path)
                     };
+                    let requested =
+                        self.include_relative(relative, include_path)
+                            .ok_or_else(|| {
+                                self.rejected(
+                                    &requested_display,
+                                    format!(
+                                        "requirements include resolves outside scan root {}",
+                                        self.root.canonical.display()
+                                    ),
+                                )
+                            })?;
                     let include_role = match kind {
                         IncludeKind::Requirement => role,
                         IncludeKind::Constraint => FileRole::Constraint,
                     };
-                    packages.extend(self.parse_file(&requested, include_role)?);
+                    packages.extend(self.parse_file(&requested, include_role, parent)?);
                 }
                 ParsedLine::Package(spec) => {
                     if spec.has_marker {
@@ -419,6 +1005,17 @@ impl RequirementsParser {
         Ok(packages)
     }
 
+    fn include_relative(&self, including: &Path, requested: &Path) -> Option<PathBuf> {
+        if requested.is_absolute() {
+            let requested = normalize_lexical(requested)?;
+            return strip_root_prefix(&requested, &self.root.canonical)
+                .or_else(|| strip_root_prefix(&requested, &self.root.requested_absolute))
+                .and_then(|relative| normalize_relative(&relative));
+        }
+        let base = including.parent().unwrap_or_else(|| Path::new(""));
+        normalize_relative(&base.join(requested))
+    }
+
     fn rejected(&self, requested: &Path, message: impl AsRef<str>) -> ParseError {
         invalid(
             requested,
@@ -444,269 +1041,11 @@ impl RequirementsParser {
     fn include_chain(&self, next: Option<&Path>) -> String {
         self.active
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|active| active.display.display().to_string())
             .chain(next.into_iter().map(|path| path.display().to_string()))
             .collect::<Vec<_>>()
             .join(" -> ")
     }
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink as symlink_file;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_file;
-
-    fn write(path: &Path, text: impl AsRef<[u8]>) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, text).unwrap();
-    }
-
-    fn names(packages: &[Package]) -> Vec<&str> {
-        packages
-            .iter()
-            .map(|package| package.name.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn parses_nested_relative_and_long_form_includes() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        write(
-            &root,
-            "root-package==1.0\n-r nested/base.txt\n--requirement nested/more.txt\n",
-        );
-        write(
-            &directory.path().join("nested/base.txt"),
-            "base-package==2.0\n-r ../shared.txt\n",
-        );
-        write(
-            &directory.path().join("nested/more.txt"),
-            "more-package==3.0\n",
-        );
-        write(
-            &directory.path().join("shared.txt"),
-            "shared-package==4.0\n",
-        );
-
-        let packages = parse(&root).unwrap();
-
-        assert_eq!(
-            names(&packages),
-            vec![
-                "base-package",
-                "more-package",
-                "root-package",
-                "shared-package"
-            ]
-        );
-    }
-
-    #[test]
-    fn preserves_pep440_constraint_without_extras_or_environment_marker() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        write(
-            &root,
-            "range-package[security]>=1.0,<2.0,!=1.5; python_version >= '3.11'\n",
-        );
-
-        let packages = parse(&root).unwrap();
-
-        assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0].name, "range-package");
-        assert_eq!(packages[0].version, ">=1.0,<2.0,!=1.5");
-        let constraint = packages[0].manifest_constraint.as_ref().unwrap();
-        assert_eq!(constraint.raw(), ">=1.0,<2.0,!=1.5");
-        assert_eq!(constraint.normalized(), ">=1.0, !=1.5, <2.0");
-    }
-
-    #[test]
-    fn rejects_parent_escape_without_exposing_outside_contents() {
-        let directory = tempfile::tempdir().unwrap();
-        let project = directory.path().join("project");
-        let root = project.join("requirements.txt");
-        let outside = directory.path().join("outside.txt");
-        let secret = "outside-secret-must-not-appear==9.9.9";
-        write(&root, "-r ../outside.txt\n");
-        write(&outside, secret);
-
-        let error = parse(&root).unwrap_err().to_string();
-
-        assert!(error.contains("outside scan root"));
-        assert!(error.contains("requirements include chain"));
-        assert!(error.contains("outside.txt"));
-        assert!(!error.contains(secret));
-    }
-
-    #[test]
-    fn rejects_absolute_external_include() {
-        let directory = tempfile::tempdir().unwrap();
-        let project = directory.path().join("project");
-        let root = project.join("requirements.txt");
-        let outside = directory.path().join("absolute-outside.txt");
-        write(&outside, "outside==1\n");
-        write(&root, format!("-r {}\n", outside.display()));
-
-        let error = parse(&root).unwrap_err().to_string();
-
-        assert!(error.contains("outside scan root"));
-        assert!(error.contains(&outside.to_string_lossy().into_owned()));
-    }
-
-    #[test]
-    fn accepts_native_absolute_include_that_remains_inside_root() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        let included = directory.path().join("absolute-inside.txt");
-        write(&included, "inside==1\n");
-        write(&root, format!("--requirement {}\n", included.display()));
-
-        let packages = parse(&root).unwrap();
-
-        assert_eq!(names(&packages), vec!["inside"]);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn rejects_symbolic_include_before_reading_its_target() {
-        let directory = tempfile::tempdir().unwrap();
-        let project = directory.path().join("project");
-        let root = project.join("requirements.txt");
-        let outside = directory.path().join("outside.txt");
-        let linked = project.join("linked.txt");
-        write(&root, "-r linked.txt\n");
-        write(&outside, "symlink-secret==1\n");
-        if let Err(error) = symlink_file(&outside, &linked) {
-            #[cfg(windows)]
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                return;
-            }
-            panic!("create requirements symlink: {error}");
-        }
-
-        let error = parse(&root).unwrap_err().to_string();
-
-        assert!(error.contains("symbolic link"));
-        assert!(error.contains("linked.txt"));
-        assert!(!error.contains("symlink-secret"));
-    }
-
-    #[test]
-    fn detects_canonical_alias_cycle_with_full_chain() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        let nested = directory.path().join("nested/requirements.txt");
-        write(&root, "-r nested/requirements.txt\n");
-        write(&nested, "-r .././requirements.txt\n");
-
-        let error = parse(&root).unwrap_err().to_string();
-
-        assert!(error.contains("include cycle detected"));
-        assert!(error.contains("requirements include chain"));
-        assert_eq!(error.matches("requirements.txt").count(), 4);
-    }
-
-    #[test]
-    fn allows_repeated_include_when_it_is_not_active() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        write(&root, "-r shared.txt\n-r shared.txt\n");
-        write(&directory.path().join("shared.txt"), "shared==1\n");
-
-        let packages = parse(&root).unwrap();
-
-        assert_eq!(names(&packages), vec!["shared"]);
-    }
-
-    #[test]
-    fn rejects_missing_and_non_file_includes_with_chain() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        write(&root, "-r missing.txt\n");
-
-        let missing = parse(&root).unwrap_err().to_string();
-        assert!(missing.contains("cannot inspect requirements file"));
-        assert!(missing.contains("missing.txt"));
-        assert!(missing.contains("requirements include chain"));
-
-        fs::create_dir(directory.path().join("included-directory")).unwrap();
-        write(&root, "-r included-directory\n");
-        let directory_error = parse(&root).unwrap_err().to_string();
-        assert!(directory_error.contains("not a regular file"));
-        assert!(directory_error.contains("included-directory"));
-    }
-
-    #[test]
-    fn enforces_include_depth_limit() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        write(&root, "-r one.txt\n");
-        write(&directory.path().join("one.txt"), "-r two.txt\n");
-        write(&directory.path().join("two.txt"), "-r three.txt\n");
-        write(&directory.path().join("three.txt"), "leaf==1\n");
-
-        let error = parse_with_limits(
-            &root,
-            RequirementsLimits {
-                include_depth: 2,
-                ..RequirementsLimits::default()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("include depth 3 exceeds the maximum of 2"));
-        assert!(error.contains("three.txt"));
-    }
-
-    #[test]
-    fn enforces_file_count_limit_across_repeated_includes() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        write(&root, "-r shared.txt\n-r shared.txt\n");
-        write(&directory.path().join("shared.txt"), "shared==1\n");
-
-        let error = parse_with_limits(
-            &root,
-            RequirementsLimits {
-                files: 2,
-                ..RequirementsLimits::default()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("file count exceeds the maximum of 2"));
-        assert!(error.contains("shared.txt"));
-    }
-
-    #[test]
-    fn enforces_total_byte_limit_before_reading_included_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("requirements.txt");
-        let root_text = "-r included.txt\n";
-        write(&root, root_text);
-        write(&directory.path().join("included.txt"), "included==1\n");
-
-        let error = parse_with_limits(
-            &root,
-            RequirementsLimits {
-                bytes: u64::try_from(root_text.len()).unwrap(),
-                ..RequirementsLimits::default()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("maximum total"));
-        assert!(error.contains("included.txt"));
-    }
-}
+mod tests;
