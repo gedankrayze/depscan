@@ -193,7 +193,8 @@ impl Package {
     }
 
     /// Merge parser metadata for the same package coordinate without turning unknown
-    /// classifications into false certainty.
+    /// classifications into false certainty. Provider eligibility is existential:
+    /// one proven public-registry occurrence is sufficient to query that coordinate.
     pub fn merge_metadata(&mut self, other: &Self) {
         merge_directness(
             &mut self.direct,
@@ -207,7 +208,7 @@ impl Package {
             other.dev,
             other.dev_known,
         );
-        self.enrichable &= other.enrichable;
+        self.enrichable |= other.enrichable;
         self.resolved_from_range &= other.resolved_from_range;
     }
 }
@@ -687,7 +688,14 @@ mod tests {
         assert!(!package.direct_known);
         assert!(!package.dev);
         assert!(!package.dev_known);
-        assert!(!package.enrichable);
+        assert!(package.enrichable);
+
+        let mut unavailable = package.clone();
+        unavailable.enrichable = false;
+        let mut also_unavailable = unavailable.clone();
+        also_unavailable.enrichable = false;
+        unavailable.merge_metadata(&also_unavailable);
+        assert!(!unavailable.enrichable);
 
         let mut observed = package.clone();
         observed.direct = true;

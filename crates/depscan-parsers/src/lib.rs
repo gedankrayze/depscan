@@ -1,7 +1,8 @@
 //! Offline, filesystem-only dependency parsers.
 
 use depscan_core::{
-    DetectedSource, Ecosystem, EcosystemParser, Package, ParseError, SourceKind, normalize_name,
+    DetectedSource, Ecosystem, EcosystemParser, Package, ParseError, SourceKind,
+    latest_matching_version, normalize_name,
 };
 use noyalib::policy::MaxScalarLength;
 use noyalib::{DuplicateKeyPolicy, MergeKeyPolicy, ParserConfig, Value as Yaml};
@@ -17,12 +18,16 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use toml::Value as Toml;
+use url::Url;
 use walkdir::WalkDir;
 
+mod npm_minimatch;
 mod python_locks;
 mod python_manifest;
 mod requirements;
 mod tool_outputs;
+
+use npm_minimatch::{MAX_WORKSPACE_PATTERNS, NpmMinimatch};
 
 pub use tool_outputs::{parse_bun_lockb_output, parse_dotnet_list_json};
 
@@ -327,11 +332,15 @@ fn yarn_direct_dependencies(root: &Path) -> HashMap<String, YarnDirectness> {
 struct NpmPackageLocation {
     name: String,
     install_parent: PathBuf,
+    install_parent_key: String,
 }
 
 fn npm_package_location(location: &str) -> Option<NpmPackageLocation> {
     let segments: Vec<_> = location.split('/').collect();
-    if segments.iter().any(|segment| segment.is_empty()) {
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "" | "." | ".."))
+    {
         return None;
     }
 
@@ -360,11 +369,867 @@ fn npm_package_location(location: &str) -> Option<NpmPackageLocation> {
     Some(NpmPackageLocation {
         name,
         install_parent: segments[..node_modules].iter().collect(),
+        install_parent_key: segments[..node_modules].join("/"),
     })
 }
 
 fn valid_npm_package_segment(segment: &str) -> bool {
     !matches!(segment, "" | "." | ".." | "node_modules")
+}
+
+fn npm_lock_optional_bool(
+    path: &Path,
+    location: &str,
+    entry: &serde_json::Map<String, Json>,
+    field: &str,
+) -> Result<Option<bool>, ParseError> {
+    entry
+        .get(field)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("npm package entry {location:?} field {field:?} must be a boolean"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn npm_lock_source_locator(version: &str) -> bool {
+    let lower = version.to_ascii_lowercase();
+    lower.starts_with("workspace:")
+        || lower.starts_with("file:")
+        || lower.starts_with("link:")
+        || lower.starts_with("git:")
+        || lower.starts_with("git+")
+        || lower.starts_with("git@")
+        || lower.starts_with("github:")
+        || lower.starts_with("gitlab:")
+        || lower.starts_with("bitbucket:")
+        || lower.starts_with("gist:")
+        || lower.starts_with("http:")
+        || lower.starts_with("https:")
+        || lower.starts_with("ssh:")
+        || lower.starts_with("npm:")
+        || version.starts_with('/')
+        || version.starts_with("./")
+        || version.starts_with("../")
+}
+
+fn npm_lock_declared_nonregistry(specification: &str) -> bool {
+    npm_lock_source_locator(specification) && npm_alias_reference(specification).is_none()
+}
+
+fn npm_alias_reference(specification: &str) -> Option<&str> {
+    specification
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("npm:"))
+        .map(|_| &specification[4..])
+}
+
+fn npm_alias_parts(reference: &str) -> Result<(&str, &str), String> {
+    if reference.is_empty() {
+        return Err("alias target is empty".to_owned());
+    }
+    let separator = if reference.starts_with('@') {
+        let slash = reference
+            .find('/')
+            .ok_or_else(|| "scoped alias target is missing '/'".to_owned())?;
+        reference[slash + 1..]
+            .find('@')
+            .map(|index| slash + 1 + index)
+    } else {
+        reference.find('@')
+    };
+    let (name, version) = separator.map_or((reference, None), |separator| {
+        (&reference[..separator], Some(&reference[separator + 1..]))
+    });
+    validate_bun_package_name(name)?;
+    if version.is_some_and(|version| !version.is_empty() && npm_lock_source_locator(version)) {
+        return Err("alias target version must be a registry version, range, or tag".to_owned());
+    }
+    Ok((
+        name,
+        version.filter(|version| !version.is_empty()).unwrap_or("*"),
+    ))
+}
+
+#[cfg(test)]
+fn npm_alias_target(reference: &str) -> Result<&str, String> {
+    npm_alias_parts(reference).map(|(name, _)| name)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NpmResolvedSource {
+    PublicRegistry,
+    Nonregistry,
+    OmittedRegistryResolution,
+    ConfiguredRegistry,
+}
+
+fn npm_lock_resolved_source(resolved: Option<&str>) -> Result<NpmResolvedSource, String> {
+    let Some(resolved) = resolved else {
+        return Ok(NpmResolvedSource::OmittedRegistryResolution);
+    };
+    if resolved == "registry.npmjs.org" || resolved.starts_with("registry.npmjs.org/") {
+        // npm documents this as a magic reference to the configured registry,
+        // which is not necessarily the public registry used by this scanner.
+        return Ok(NpmResolvedSource::ConfiguredRegistry);
+    }
+    if resolved.starts_with('/') || resolved.starts_with("./") || resolved.starts_with("../") {
+        return Ok(NpmResolvedSource::Nonregistry);
+    }
+    if resolved.starts_with("git@") {
+        let Some((authority, repository)) = resolved.split_once(':') else {
+            return Err("SCP-style Git source is missing ':'".to_owned());
+        };
+        let repository = repository
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if authority.trim_start_matches("git@").is_empty() || repository.is_empty() {
+            return Err("SCP-style Git source must contain a host and repository path".to_owned());
+        }
+        return Ok(NpmResolvedSource::Nonregistry);
+    }
+    if resolved.ends_with(".tgz")
+        && resolved.contains('/')
+        && !resolved.contains("://")
+        && !resolved.contains([':', '?', '#', '@'])
+        && !resolved.contains(char::is_whitespace)
+        && !resolved.contains('\\')
+    {
+        return Ok(NpmResolvedSource::Nonregistry);
+    }
+
+    if let Some((scheme, suffix)) = resolved.split_once(':')
+        && matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "bitbucket"
+                | "file"
+                | "gist"
+                | "git"
+                | "git+file"
+                | "git+http"
+                | "git+https"
+                | "git+ssh"
+                | "github"
+                | "gitlab"
+                | "link"
+                | "npm"
+                | "ssh"
+                | "workspace"
+        )
+    {
+        let payload = suffix.split(['?', '#']).next().unwrap_or_default().trim();
+        if payload.trim_matches('/').is_empty() {
+            return Err("source URL has no package or repository path".to_owned());
+        }
+    }
+
+    let parsed = Url::parse(resolved).map_err(|_| "source is not a supported URL or path")?;
+    match parsed.scheme() {
+        "http" | "https" => {
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| "HTTP source has no host".to_owned())?;
+            let canonical_public = host.eq_ignore_ascii_case("registry.npmjs.org")
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.port().is_none();
+            Ok(if canonical_public {
+                NpmResolvedSource::PublicRegistry
+            } else {
+                NpmResolvedSource::Nonregistry
+            })
+        }
+        "bitbucket" | "file" | "gist" | "git" | "git+file" | "git+http" | "git+https"
+        | "git+ssh" | "github" | "gitlab" | "link" | "npm" | "ssh" | "workspace" => {
+            if parsed.path().is_empty() {
+                Err("source URL has no path".to_owned())
+            } else {
+                Ok(NpmResolvedSource::Nonregistry)
+            }
+        }
+        _ => Err("source uses an unsupported URL scheme".to_owned()),
+    }
+}
+
+fn npm_percent_decode_path_component(component: &str) -> Option<String> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            let hex = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            decoded.push(hex(high)? * 16 + hex(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn npm_public_tarball_matches(resolved: &str, package_name: &str, version: &str) -> bool {
+    let Ok(parsed) = Url::parse(resolved) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed
+            .host_str()
+            .is_none_or(|host| !host.eq_ignore_ascii_case("registry.npmjs.org"))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(segments) = parsed.path_segments() else {
+        return false;
+    };
+    let Some(segments) = segments
+        .map(npm_percent_decode_path_component)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let tarball_name = package_name
+        .rsplit_once('/')
+        .map_or(package_name, |(_, name)| name);
+    let expected_tarball = format!("{tarball_name}-{version}.tgz");
+    match segments.as_slice() {
+        [name, separator, tarball] => {
+            name == package_name && separator == "-" && tarball == &expected_tarball
+        }
+        [scope, name, separator, tarball] => {
+            package_name == format!("{scope}/{name}")
+                && separator == "-"
+                && tarball == &expected_tarball
+        }
+        _ => false,
+    }
+}
+
+fn npm_lock_report_coordinate(resolved: &str) -> String {
+    let credential_shaped = |value: &str| {
+        value.split('/').any(|segment| {
+            let decoded =
+                npm_percent_decode_path_component(segment).unwrap_or_else(|| segment.to_owned());
+            decoded
+                .rsplit_once('@')
+                .is_some_and(|(userinfo, host)| userinfo.contains(':') && !host.is_empty())
+        })
+    };
+    let raw_without_secrets = || {
+        let secret = resolved.find(['?', '#']).unwrap_or(resolved.len());
+        let sanitized = &resolved[..secret];
+        if sanitized.trim().is_empty() || credential_shaped(sanitized) {
+            "[redacted-source]".to_owned()
+        } else {
+            sanitized.to_owned()
+        }
+    };
+    if resolved.starts_with("git@") && resolved.contains(':') {
+        return raw_without_secrets();
+    }
+    let Ok(mut parsed) = Url::parse(resolved) else {
+        return raw_without_secrets();
+    };
+    if credential_shaped(parsed.path())
+        || (parsed.cannot_be_a_base() && parsed.path().contains('@'))
+    {
+        return "[redacted-source]".to_owned();
+    }
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_username("");
+    }
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(None);
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
+fn npm_declared_local_target(descriptor: &str, specification: &str) -> Option<String> {
+    let local = ["file:", "link:"]
+        .into_iter()
+        .find_map(|prefix| {
+            specification
+                .get(..prefix.len())
+                .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+                .map(|_| &specification[prefix.len()..])
+        })
+        .or_else(|| {
+            specification
+                .starts_with(['.', '/'])
+                .then_some(specification)
+        })?;
+    let local = local.replace('\\', "/");
+    if local.is_empty()
+        || local.starts_with('/')
+        || local.contains(['?', '#', '\0'])
+        || local.contains("://")
+    {
+        return None;
+    }
+
+    let mut segments = descriptor
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for segment in local.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if segments.last().is_some_and(|segment| segment != "..") {
+                    segments.pop();
+                } else {
+                    segments.push("..".to_owned());
+                }
+            }
+            value => segments.push(value.to_owned()),
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
+#[derive(Default)]
+struct NpmDependencyDeclaration {
+    nonregistry: bool,
+    nonregistry_specification: Option<String>,
+    registry_identity: Option<String>,
+    registry_constraint: Option<String>,
+}
+
+#[derive(Default)]
+struct NpmDependencyDeclarations {
+    nonregistry: bool,
+    nonregistry_specifications: BTreeMap<String, String>,
+    registry_identities: BTreeMap<String, String>,
+    registry_constraints: BTreeMap<String, String>,
+}
+
+impl NpmDependencyDeclarations {
+    fn has_registry_declaration(&self) -> bool {
+        !self.registry_identities.is_empty()
+    }
+
+    fn registry_identity_matches(&self, package_name: &str) -> bool {
+        self.registry_identities
+            .values()
+            .all(|identity| identity == package_name)
+    }
+
+    fn non_root_registry_identity_matches(&self, package_name: &str) -> bool {
+        self.registry_identities
+            .iter()
+            .filter(|(descriptor, _)| !descriptor.is_empty())
+            .all(|(_, identity)| identity == package_name)
+    }
+
+    fn validate_non_root_registry_constraints(&self, version: &str) -> Result<(), String> {
+        for (descriptor, constraint) in self
+            .registry_constraints
+            .iter()
+            .filter(|(descriptor, _)| !descriptor.is_empty())
+        {
+            match latest_matching_version(Ecosystem::Npm, constraint, [version]) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(format!(
+                        "dependency constraint {constraint:?} from descriptor {descriptor:?} does not accept linked workspace version {version:?}"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "dependency constraint {constraint:?} from descriptor {descriptor:?} cannot safely validate linked workspace version {version:?}: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_non_root_registry_constraints(&self) -> bool {
+        self.registry_constraints
+            .keys()
+            .any(|descriptor| !descriptor.is_empty())
+    }
+
+    fn validate_nonregistry_sources(
+        &self,
+        target: &str,
+        proven_workspace_identity: bool,
+    ) -> Result<(), String> {
+        for (descriptor, specification) in &self.nonregistry_specifications {
+            if descriptor.is_empty() && proven_workspace_identity {
+                continue;
+            }
+            if specification
+                .get(..10)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("workspace:"))
+            {
+                if proven_workspace_identity {
+                    continue;
+                }
+                return Err(format!(
+                    "workspace dependency source {specification:?} from descriptor {descriptor:?} cannot resolve to non-workspace link target {target:?}"
+                ));
+            }
+            if npm_declared_local_target(descriptor, specification).as_deref() == Some(target) {
+                continue;
+            }
+            return Err(format!(
+                "non-registry dependency source {specification:?} from descriptor {descriptor:?} does not resolve to linked target {target:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, descriptor: &str, other: NpmDependencyDeclaration) {
+        self.nonregistry |= other.nonregistry;
+        if let Some(specification) = other.nonregistry_specification {
+            self.nonregistry_specifications
+                .insert(descriptor.to_owned(), specification);
+        }
+        if let Some(identity) = other.registry_identity {
+            self.registry_identities
+                .insert(descriptor.to_owned(), identity);
+        }
+        if let Some(constraint) = other.registry_constraint {
+            self.registry_constraints
+                .insert(descriptor.to_owned(), constraint);
+        }
+    }
+}
+
+#[derive(Default)]
+struct NpmLockDeclarations {
+    by_install_location: HashMap<String, NpmDependencyDeclarations>,
+}
+
+impl NpmLockDeclarations {
+    fn selected(&self, install_location: &str) -> Option<&NpmDependencyDeclarations> {
+        self.by_install_location.get(install_location)
+    }
+}
+
+fn npm_dependency_install_location<'a>(
+    descriptor: &str,
+    name: &str,
+    package_entries: &'a serde_json::Map<String, Json>,
+) -> Option<&'a str> {
+    let mut segments = if descriptor.is_empty() {
+        Vec::new()
+    } else {
+        let segments = descriptor.split('/').collect::<Vec<_>>();
+        if segments.iter().any(|segment| segment.is_empty()) {
+            return None;
+        }
+        segments
+    };
+
+    loop {
+        if segments.last().copied() != Some("node_modules") {
+            let candidate = if segments.is_empty() {
+                format!("node_modules/{name}")
+            } else {
+                format!("{}/node_modules/{name}", segments.join("/"))
+            };
+            if let Some((location, _)) = package_entries.get_key_value(&candidate) {
+                return Some(location);
+            }
+        }
+        segments.pop()?;
+    }
+}
+
+struct NpmWorkspacePattern {
+    source: String,
+    matcher: NpmMinimatch,
+}
+
+#[derive(Default)]
+struct NpmWorkspacePatterns {
+    included: Vec<NpmWorkspacePattern>,
+    excluded: Vec<NpmWorkspacePattern>,
+}
+
+fn npm_lock_workspace_patterns(
+    path: &Path,
+    package_entries: &serde_json::Map<String, Json>,
+) -> Result<NpmWorkspacePatterns, ParseError> {
+    let Some(root) = package_entries.get("").and_then(Json::as_object) else {
+        return Ok(NpmWorkspacePatterns::default());
+    };
+    let Some(workspaces) = root.get("workspaces") else {
+        return Ok(NpmWorkspacePatterns::default());
+    };
+    let entries = match workspaces {
+        Json::Array(entries) => entries,
+        Json::Object(object) => {
+            object
+                .get("packages")
+                .and_then(Json::as_array)
+                .ok_or_else(|| {
+                    invalid(
+                        path,
+                        "npm lock root workspaces object must contain a packages array",
+                    )
+                })?
+        }
+        _ => {
+            return Err(invalid(
+                path,
+                "npm lock root workspaces must be an array or object containing a packages array",
+            ));
+        }
+    };
+    if entries.len() > MAX_WORKSPACE_PATTERNS {
+        return Err(invalid(
+            path,
+            format!("npm lock root workspaces exceeds the {MAX_WORKSPACE_PATTERNS}-pattern limit"),
+        ));
+    }
+    let mut patterns = NpmWorkspacePatterns::default();
+    for (index, entry) in entries.iter().enumerate() {
+        let raw = entry
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("npm lock root workspace entry {index} must be a non-empty string"),
+                )
+            })?;
+        let bang_count = raw.bytes().take_while(|byte| *byte == b'!').count();
+        let excluded = bang_count % 2 == 1;
+        let normalized_separators = raw[bang_count..].replace('\\', "/");
+        // npm map-workspaces applies exactly `/^\.?\/+/'` once. In
+        // particular, `.//packages/*` becomes `packages/*`, while
+        // `././packages/*` becomes `./packages/*` and must not be simplified
+        // again into a broader workspace proof.
+        let normalized = normalized_separators
+            .strip_prefix('.')
+            .filter(|suffix| suffix.starts_with('/'))
+            .map_or_else(
+                || normalized_separators.trim_start_matches('/'),
+                |suffix| suffix.trim_start_matches('/'),
+            );
+        let normalized = normalized.trim_end_matches('/');
+        let relative = Path::new(normalized);
+        if normalized.is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(invalid(
+                path,
+                format!("npm lock root workspace pattern {raw:?} must remain within the project"),
+            ));
+        }
+        let matcher = NpmMinimatch::compile(normalized).map_err(|error| {
+            invalid(
+                path,
+                format!("invalid npm workspace pattern {raw:?}: {error}"),
+            )
+        })?;
+        let pattern = NpmWorkspacePattern {
+            source: normalized.to_owned(),
+            matcher,
+        };
+        if excluded {
+            patterns.excluded.push(pattern);
+        } else {
+            // npm removes an earlier exclusion only when this positive
+            // pattern is itself selected by that exclusion. A later
+            // broad include therefore does not accidentally re-include
+            // a specifically excluded workspace.
+            let mut negative_index = 0usize;
+            while negative_index < patterns.excluded.len() {
+                let negative = &patterns.excluded[negative_index];
+                let selected = negative.matcher.is_match(normalized).map_err(|error| {
+                    invalid(
+                        path,
+                        format!(
+                            "npm workspace pattern {:?} could not evaluate positive pattern {normalized:?}: {error}",
+                            negative.source
+                        ),
+                    )
+                })?;
+                if selected {
+                    // npm's map-workspaces mutates the negative list with
+                    // splice while incrementing the loop index. Preserve
+                    // that observable ordering: the entry shifted into this
+                    // slot is intentionally not reconsidered.
+                    patterns.excluded.remove(negative_index);
+                }
+                negative_index += 1;
+            }
+            patterns.included.push(pattern);
+        }
+    }
+    for negative in &patterns.excluded {
+        let mut retained = Vec::with_capacity(patterns.included.len());
+        for positive in patterns.included.drain(..) {
+            let selected = negative
+                .matcher
+                .is_match(positive.source.as_str())
+                .map_err(|error| {
+                    invalid(
+                        path,
+                        format!(
+                            "npm workspace exclusion {:?} could not evaluate positive pattern {:?}: {error}",
+                            negative.source, positive.source
+                        ),
+                    )
+                })?;
+            if !selected {
+                retained.push(positive);
+            }
+        }
+        patterns.included = retained;
+    }
+    Ok(patterns)
+}
+
+fn npm_is_workspace_descriptor(
+    path: &Path,
+    location: &str,
+    patterns: &NpmWorkspacePatterns,
+) -> Result<bool, ParseError> {
+    if location.is_empty()
+        || location
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".." | "node_modules"))
+    {
+        return Ok(false);
+    }
+    let mut excluded = false;
+    for pattern in &patterns.excluded {
+        if pattern.matcher.is_match(location).map_err(|error| {
+            invalid(
+                path,
+                format!(
+                    "npm workspace exclusion {:?} could not evaluate package location {location:?}: {error}",
+                    pattern.source
+                ),
+            )
+        })? {
+            excluded = true;
+            break;
+        }
+    }
+    let mut included = false;
+    for pattern in &patterns.included {
+        if pattern.matcher.is_match(location).map_err(|error| {
+            invalid(
+                path,
+                format!(
+                    "npm workspace pattern {:?} could not evaluate package location {location:?}: {error}",
+                    pattern.source
+                ),
+            )
+        })? {
+            included = true;
+            break;
+        }
+    }
+    Ok(!excluded && included)
+}
+
+fn parse_npm_lock_declaration(
+    path: &Path,
+    location: &str,
+    name: &str,
+    specification: &str,
+) -> Result<NpmDependencyDeclaration, ParseError> {
+    let mut declaration = NpmDependencyDeclaration::default();
+    if let Some(alias) = npm_alias_reference(specification) {
+        let (target, constraint) = npm_alias_parts(alias).map_err(|error| {
+            invalid(
+                path,
+                format!(
+                    "npm package entry {location:?} dependency alias {name:?} has an invalid npm target: {error}"
+                ),
+            )
+        })?;
+        declaration.registry_identity = Some(target.to_owned());
+        declaration.registry_constraint = Some(constraint.to_owned());
+    } else if npm_lock_declared_nonregistry(specification) {
+        declaration.nonregistry = true;
+        declaration.nonregistry_specification = Some(specification.to_owned());
+    } else {
+        declaration.registry_identity = Some(name.to_owned());
+        declaration.registry_constraint = Some(specification.to_owned());
+    }
+    Ok(declaration)
+}
+
+fn npm_lock_declarations(
+    path: &Path,
+    package_entries: &serde_json::Map<String, Json>,
+    workspace_patterns: &NpmWorkspacePatterns,
+) -> Result<NpmLockDeclarations, ParseError> {
+    let mut declarations = NpmLockDeclarations::default();
+    for (location, entry) in package_entries {
+        let entry = entry.as_object().ok_or_else(|| {
+            invalid(
+                path,
+                format!("npm package entry {location:?} must be an object"),
+            )
+        })?;
+        if npm_lock_optional_bool(path, location, entry, "link")? == Some(true) {
+            continue;
+        }
+        if !location.is_empty()
+            && npm_package_location(location).is_none()
+            && !npm_is_workspace_descriptor(path, location, workspace_patterns)?
+        {
+            // npm may snapshot an external file/link target's package metadata,
+            // but its dependency graph is not installed into the scanned root.
+            continue;
+        }
+        let project_descriptor =
+            location.is_empty() || npm_is_workspace_descriptor(path, location, workspace_patterns)?;
+        let mut effective = BTreeMap::new();
+        // npm Arborist loads peer, production, optional, then development
+        // edges; a later group replaces an earlier same-name edge. Development
+        // edges are active only for the root and workspace project nodes.
+        for group in [
+            "peerDependencies",
+            "dependencies",
+            "optionalDependencies",
+            "devDependencies",
+        ] {
+            if group == "devDependencies" && !project_descriptor {
+                continue;
+            }
+            let Some(dependencies) = entry.get(group) else {
+                continue;
+            };
+            let dependencies = dependencies.as_object().ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("npm package entry {location:?} field {group:?} must be an object"),
+                )
+            })?;
+            for (name, specification) in dependencies {
+                validate_bun_package_name(name).map_err(|error| {
+                    invalid(
+                        path,
+                        format!(
+                            "npm package entry {location:?} has an invalid dependency name {name:?}: {error}"
+                        ),
+                    )
+                })?;
+                let specification = specification
+                    .as_str()
+                    .filter(|specification| !specification.trim().is_empty())
+                    .ok_or_else(|| {
+                        invalid(
+                            path,
+                            format!(
+                                "npm package entry {location:?} dependency {name:?} in {group:?} must have a non-empty string specification"
+                            ),
+                        )
+                })?;
+                let parsed = parse_npm_lock_declaration(path, location, name, specification)?;
+                effective.insert(
+                    name.clone(),
+                    (
+                        parsed,
+                        matches!(group, "dependencies" | "devDependencies"),
+                        group,
+                    ),
+                );
+            }
+        }
+        for (name, (parsed, required, group)) in effective {
+            if let Some(install_location) =
+                npm_dependency_install_location(location, &name, package_entries)
+            {
+                declarations
+                    .by_install_location
+                    .entry(install_location.to_owned())
+                    .or_default()
+                    .merge(location, parsed);
+            } else if required {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "npm package entry {location:?} required dependency {name:?} in {group:?} has no installed package record"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(declarations)
+}
+
+fn npm_lock_link_target(
+    path: &Path,
+    location: &str,
+    entry: &serde_json::Map<String, Json>,
+) -> Result<String, ParseError> {
+    let target = entry
+        .get("resolved")
+        .and_then(Json::as_str)
+        .filter(|target| !target.trim().is_empty())
+        .ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "npm link package entry {location:?} must have a non-empty string resolved target"
+                ),
+            )
+        })?;
+    let target = target.strip_prefix("./").unwrap_or(target);
+    if target.is_empty() || target == "." {
+        return Err(invalid(
+            path,
+            format!(
+                "npm link package entry {location:?} resolved target {target:?} must identify a local descriptor or installed package record"
+            ),
+        ));
+    }
+    Ok(target.to_owned())
+}
+
+fn npm_descriptor_fallback_name(target: &str) -> Option<String> {
+    let segments = target.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    let name = *segments.last()?;
+    if matches!(name, "." | ".." | "node_modules") {
+        return None;
+    }
+    let fallback = match segments.iter().rev().nth(1) {
+        Some(scope) if scope.starts_with('@') => format!("{scope}/{name}"),
+        _ => name.to_owned(),
+    };
+    validate_bun_package_name(&fallback).ok()?;
+    Some(fallback)
 }
 
 fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
@@ -413,31 +1278,424 @@ fn parse_package_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
                         ),
                     )
                 })?;
-            for (key, entry) in package_entries {
-                let Some(entry) = entry.as_object() else {
-                    continue;
+
+            // First validate link records without using them to suppress any
+            // installed package. Declaration provenance is resolved only after
+            // every concrete link target has been validated.
+            let mut link_targets = BTreeMap::new();
+            for (key, value) in package_entries {
+                let entry = value.as_object().ok_or_else(|| {
+                    invalid(path, format!("npm package entry {key:?} must be an object"))
+                })?;
+                npm_lock_optional_bool(path, key, entry, "dev")?;
+                if let Some(resolved) = entry.get("resolved")
+                    && resolved
+                        .as_str()
+                        .filter(|resolved| !resolved.trim().is_empty())
+                        .is_none()
+                {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "npm package entry {key:?} field \"resolved\" must be a non-empty string"
+                        ),
+                    ));
+                }
+                if npm_lock_optional_bool(path, key, entry, "link")? == Some(true) {
+                    if let Some(field) = [
+                        "name",
+                        "version",
+                        "dependencies",
+                        "optionalDependencies",
+                        "peerDependencies",
+                        "devDependencies",
+                    ]
+                    .into_iter()
+                    .find(|field| entry.contains_key(*field))
+                    {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm link package entry {key:?} must not contain package metadata field {field:?}; metadata belongs on its resolved descriptor"
+                            ),
+                        ));
+                    }
+                    let location = npm_package_location(key).ok_or_else(|| {
+                        invalid(
+                            path,
+                            format!(
+                                "npm link package entry {key:?} is not a valid node_modules install location"
+                            ),
+                        )
+                    })?;
+                    if !location.install_parent_key.is_empty()
+                        && package_entries
+                            .get(&location.install_parent_key)
+                            .and_then(Json::as_object)
+                            .is_none()
+                    {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm link package entry {key:?} has unproven install prefix {:?}; the parent package or workspace descriptor is missing",
+                                location.install_parent_key
+                            ),
+                        ));
+                    }
+                    validate_bun_package_name(&location.name).map_err(|error| {
+                        invalid(
+                            path,
+                            format!("npm link package entry {key:?} has an invalid name: {error}"),
+                        )
+                    })?;
+                    let target = npm_lock_link_target(path, key, entry)?;
+                    let Some(target_entry) = package_entries.get(&target).and_then(Json::as_object)
+                    else {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm link package entry {key:?} resolved target {target:?} does not name an existing package descriptor object"
+                            ),
+                        ));
+                    };
+                    if target == key.as_str()
+                        || npm_lock_optional_bool(path, &target, target_entry, "link")?
+                            == Some(true)
+                    {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm link package entry {key:?} resolved target {target:?} must not be itself or another link record"
+                            ),
+                        ));
+                    }
+                    if npm_package_location(&target).is_none()
+                        && target.split('/').any(|segment| segment == "node_modules")
+                    {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm link package entry {key:?} resolved target {target:?} is not a valid installed package location"
+                            ),
+                        ));
+                    }
+                    link_targets.insert(key.clone(), target);
+                }
+            }
+            let workspace_patterns = npm_lock_workspace_patterns(path, package_entries)?;
+            let declarations = npm_lock_declarations(path, package_entries, &workspace_patterns)?;
+            let mut local_descriptors = BTreeSet::new();
+            for (key, target) in &link_targets {
+                let location = npm_package_location(key).expect("validated npm link location");
+                let target_entry = package_entries
+                    .get(target)
+                    .and_then(Json::as_object)
+                    .expect("validated npm link target object");
+                let target_name = match target_entry.get("name") {
+                    None => npm_descriptor_fallback_name(target).ok_or_else(|| {
+                        invalid(
+                            path,
+                            format!(
+                                "npm local descriptor {target:?} has no valid fallback package identity"
+                            ),
+                        )
+                    })?,
+                    Some(Json::String(name)) if !name.trim().is_empty() => name.clone(),
+                    Some(_) => {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm workspace descriptor {target:?} field \"name\" must be a non-empty string when present"
+                            ),
+                        ));
+                    }
                 };
-                if key.is_empty() || entry.get("link").and_then(Json::as_bool) == Some(true) {
+                validate_bun_package_name(&target_name).map_err(|error| {
+                    invalid(
+                        path,
+                        format!(
+                            "npm workspace descriptor {target:?} has invalid package name {target_name:?}: {error}"
+                        ),
+                    )
+                })?;
+                let target_version = match target_entry.get("version") {
+                    None => None,
+                    Some(Json::String(version)) if !version.trim().is_empty() => {
+                        Some(version.as_str())
+                    }
+                    Some(_) => {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm workspace descriptor {target:?} field \"version\" must be a non-empty string when present"
+                            ),
+                        ));
+                    }
+                };
+                let target_is_installed = npm_package_location(target).is_some();
+                let proven_workspace_identity = !target_is_installed
+                    && npm_is_workspace_descriptor(path, target, &workspace_patterns)?
+                    && target_name == location.name;
+                let declaration = declarations.selected(key);
+                if let Some(declaration) = declaration {
+                    declaration
+                        .validate_nonregistry_sources(target, proven_workspace_identity)
+                        .map_err(|error| {
+                            invalid(
+                                path,
+                                format!(
+                                    "npm link package entry {key:?} cannot satisfy its non-registry declaration with target {target:?}: {error}"
+                                ),
+                            )
+                        })?;
+                }
+                if let Some(declaration) = declaration
+                    && declaration.has_registry_declaration()
+                    && !(proven_workspace_identity
+                        && declaration.non_root_registry_identity_matches(&target_name))
+                {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "npm link package entry {key:?} replaces a registry declaration with unproven local target {target:?}"
+                        ),
+                    ));
+                }
+                if proven_workspace_identity
+                    && let Some(declaration) = declaration
+                    && declaration.has_non_root_registry_constraints()
+                {
+                    let target_version = target_version.ok_or_else(|| {
+                            invalid(
+                                path,
+                                format!(
+                                    "npm workspace descriptor {target:?} must have a non-empty string version to satisfy non-root registry declarations"
+                                ),
+                            )
+                        })?;
+                    declaration
+                        .validate_non_root_registry_constraints(target_version)
+                        .map_err(|error| {
+                            invalid(
+                                path,
+                                format!(
+                                    "npm link package entry {key:?} cannot satisfy its registry declaration with workspace target {target:?}: {error}"
+                                ),
+                            )
+                        })?;
+                }
+                if !target_is_installed
+                    && !proven_workspace_identity
+                    && declaration.is_none_or(|declaration| !declaration.nonregistry)
+                {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "npm link package entry {key:?} has no matching workspace identity or explicit non-registry declaration for target {target:?}"
+                        ),
+                    ));
+                }
+                if npm_package_location(target).is_none() {
+                    local_descriptors.insert(target.clone());
+                }
+            }
+
+            for (key, entry) in package_entries {
+                let entry = entry.as_object().expect("packages map validated above");
+                if key.is_empty() || local_descriptors.contains(key) {
                     continue;
                 }
-                let Some(location) = npm_package_location(key) else {
-                    // Workspace targets and other local package descriptors do not
-                    // represent registry resolutions in package-lock.json. DS-008
-                    // also deliberately ignores malformed install-location keys.
+                if npm_lock_optional_bool(path, key, entry, "link")? == Some(true) {
                     continue;
-                };
-                let Some(version) = entry
+                }
+
+                let location = npm_package_location(key).ok_or_else(|| {
+                    invalid(
+                        path,
+                        format!(
+                            "npm package entry {key:?} is neither a linked local descriptor nor a valid node_modules install location"
+                        ),
+                    )
+                })?;
+                if !location.install_parent_key.is_empty()
+                    && package_entries
+                        .get(&location.install_parent_key)
+                        .and_then(Json::as_object)
+                        .is_none()
+                {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "npm package entry {key:?} has unproven install prefix {:?}; the parent package or workspace descriptor is missing",
+                            location.install_parent_key
+                        ),
+                    ));
+                }
+                validate_bun_package_name(&location.name).map_err(|error| {
+                    invalid(
+                        path,
+                        format!("npm package entry {key:?} has an invalid name: {error}"),
+                    )
+                })?;
+
+                let resolved = entry.get("resolved");
+                if let Some(resolved) = resolved
+                    && resolved
+                        .as_str()
+                        .filter(|resolved| !resolved.trim().is_empty())
+                        .is_none()
+                {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "npm package entry {key:?} field \"resolved\" must be a non-empty string"
+                        ),
+                    ));
+                }
+                let resolved = resolved.and_then(Json::as_str);
+                let resolved_source = npm_lock_resolved_source(resolved).map_err(|error| {
+                    invalid(
+                        path,
+                        format!(
+                            "npm package entry {key:?} has an unsupported or malformed resolved source: {error}"
+                        ),
+                    )
+                })?;
+                let declaration = declarations.selected(key);
+                let version_source_locator = entry
                     .get("version")
                     .and_then(Json::as_str)
-                    .filter(|version| !version.is_empty())
-                else {
-                    continue;
+                    .is_some_and(npm_lock_source_locator);
+                if version_source_locator {
+                    let version_source = entry
+                        .get("version")
+                        .and_then(Json::as_str)
+                        .expect("version source locator came from a string version");
+                    npm_lock_resolved_source(Some(version_source)).map_err(|error| {
+                        invalid(
+                            path,
+                            format!(
+                                "npm package entry {key:?} has an unsupported or malformed version source: {error}"
+                            ),
+                        )
+                    })?;
+                }
+                let explicit_nonregistry = resolved_source == NpmResolvedSource::Nonregistry
+                    || version_source_locator
+                    || declaration.is_some_and(|declaration| declaration.nonregistry);
+                let dev = npm_lock_optional_bool(path, key, entry, "dev")?.unwrap_or(false);
+                let package_name = entry.get("name").map_or(Ok(location.name.as_str()), |name| {
+                    name.as_str()
+                        .filter(|name| !name.trim().is_empty())
+                        .ok_or_else(|| {
+                            invalid(
+                                path,
+                                format!(
+                                    "npm package entry {key:?} field \"name\" must be a non-empty string"
+                                ),
+                            )
+                        })
+                })?;
+                validate_bun_package_name(package_name).map_err(|error| {
+                    invalid(
+                        path,
+                        format!("npm package entry {key:?} has an invalid name: {error}"),
+                    )
+                })?;
+                let identity_declared = declaration
+                    .map_or(package_name == location.name, |value| {
+                        value.registry_identity_matches(package_name)
+                    });
+                let identity_must_match = !explicit_nonregistry
+                    || declaration.is_some_and(|value| value.has_registry_declaration());
+                if identity_must_match && !identity_declared {
+                    let registry_identities = declaration.map(|value| &value.registry_identities);
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "npm alias package entry {key:?} has identity {package_name:?}, which is inconsistent with its registry declarations {registry_identities:?}"
+                        ),
+                    ));
+                }
+
+                let publicly_enrichable_origin =
+                    matches!(resolved_source, NpmResolvedSource::PublicRegistry)
+                        && !version_source_locator
+                        && declaration.is_none_or(|value| {
+                            !value.nonregistry
+                                || (value.has_registry_declaration()
+                                    && value.registry_identity_matches(package_name))
+                        });
+
+                let version = match entry.get("version") {
+                    Some(Json::String(version)) if !version.is_empty() => {
+                        if version_source_locator
+                            || (explicit_nonregistry && semver::Version::parse(version).is_err())
+                        {
+                            npm_lock_report_coordinate(version)
+                        } else {
+                            version.clone()
+                        }
+                    }
+                    Some(_) => {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm package entry {key:?} field \"version\" must be a non-empty string"
+                            ),
+                        ));
+                    }
+                    None if explicit_nonregistry => {
+                        npm_lock_report_coordinate(resolved.ok_or_else(|| {
+                            invalid(
+                                path,
+                                format!(
+                                    "npm non-registry package entry {key:?} has neither a version nor a resolved source coordinate"
+                                ),
+                            )
+                        })?)
+                    }
+                    None => {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm package entry {key:?} must have a non-empty string version"
+                            ),
+                        ));
+                    }
+                };
+
+                let enrichable = match semver::Version::parse(&version) {
+                    Ok(_) if publicly_enrichable_origin => {
+                        let resolved = resolved.expect("public npm origin has a resolved URL");
+                        if !npm_public_tarball_matches(resolved, package_name, &version) {
+                            return Err(invalid(
+                                path,
+                                format!(
+                                    "npm package entry {key:?} public registry tarball URL does not match package {package_name:?} version {version:?}"
+                                ),
+                            ));
+                        }
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) if explicit_nonregistry => false,
+                    Err(_) if npm_lock_source_locator(&version) => false,
+                    Err(error) => {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "npm package entry {key:?} has invalid registry SemVer version {version:?}: {error}"
+                            ),
+                        ));
+                    }
                 };
                 let mut package =
-                    Package::new(Ecosystem::Npm, &location.name, version, path.to_path_buf());
+                    Package::new(Ecosystem::Npm, package_name, &version, path.to_path_buf());
                 package.direct =
                     direct.includes_package_at(&location.install_parent, &location.name);
-                package.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
+                package.dev = dev;
+                package.enrichable = enrichable;
                 packages.push(package);
             }
         }
@@ -468,9 +1726,22 @@ fn parse_legacy_npm_tree(
             .and_then(Json::as_str)
             .filter(|version| !version.is_empty())
         {
-            let mut package = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
+            let parsed_version = semver::Version::parse(version);
+            let report_version = if parsed_version.is_err() {
+                npm_lock_report_coordinate(version)
+            } else {
+                version.to_owned()
+            };
+            let mut package =
+                Package::new(Ecosystem::Npm, name, &report_version, path.to_path_buf());
             package.direct = top_level && direct.contains(name);
             package.dev = entry.get("dev").and_then(Json::as_bool).unwrap_or(false);
+            package.enrichable = parsed_version.is_ok()
+                && !npm_lock_source_locator(version)
+                && matches!(
+                    npm_lock_resolved_source(entry.get("resolved").and_then(Json::as_str)),
+                    Ok(NpmResolvedSource::PublicRegistry)
+                );
             out.push(package);
         }
         if let Some(children) = entry.get("dependencies").and_then(Json::as_object) {
@@ -3505,7 +4776,7 @@ fn parse_cargo_toml(path: &Path) -> Result<Vec<Package>, ParseError> {
             .entry(key)
             .and_modify(|existing: &mut Package| {
                 existing.dev &= package.dev;
-                existing.enrichable &= package.enrichable;
+                existing.enrichable |= package.enrichable;
             })
             .or_insert(package);
     }
@@ -3557,6 +4828,13 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    fn parse_npm_value(value: &Json) -> Result<Vec<Package>, ParseError> {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("package-lock.json");
+        fs::write(&lock, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        parse_package_lock(&lock)
     }
 
     #[test]
@@ -3706,6 +4984,1198 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_npm_v2_v3_package_records() {
+        let cases = [
+            (
+                "non-object entry",
+                "node_modules/bad",
+                json!("not an object"),
+                "must be an object",
+            ),
+            (
+                "missing version",
+                "node_modules/bad",
+                json!({"dev": true}),
+                "non-empty string version",
+            ),
+            (
+                "wrong version type",
+                "node_modules/bad",
+                json!({"version": 1}),
+                "field \"version\" must be a non-empty string",
+            ),
+            (
+                "invalid registry version",
+                "node_modules/bad",
+                json!({"version": "^1.0.0"}),
+                "invalid registry SemVer",
+            ),
+            (
+                "malformed scoped location",
+                "node_modules/@scope/too/many",
+                json!({"version": "1.0.0"}),
+                "valid node_modules install location",
+            ),
+            (
+                "parent traversal before node_modules",
+                "../node_modules/bad",
+                json!({"version": "1.0.0"}),
+                "valid node_modules install location",
+            ),
+            (
+                "parent traversal in install prefix",
+                "packages/../node_modules/bad",
+                json!({"version": "1.0.0"}),
+                "valid node_modules install location",
+            ),
+            (
+                "unknown local descriptor",
+                "vendor/bad",
+                json!({"version": "1.0.0"}),
+                "neither a linked local descriptor",
+            ),
+            (
+                "unproven install prefix",
+                "vendor/node_modules/bad",
+                json!({"version": "1.0.0"}),
+                "unproven install prefix",
+            ),
+            (
+                "wrong dev type",
+                "node_modules/bad",
+                json!({"version": "1.0.0", "dev": "true"}),
+                "field \"dev\" must be a boolean",
+            ),
+            (
+                "wrong link type",
+                "node_modules/bad",
+                json!({"version": "1.0.0", "link": 1}),
+                "field \"link\" must be a boolean",
+            ),
+            (
+                "link without target",
+                "node_modules/bad",
+                json!({"link": true}),
+                "non-empty string resolved target",
+            ),
+            (
+                "link with missing descriptor",
+                "node_modules/bad",
+                json!({"link": true, "resolved": "packages/missing"}),
+                "does not name an existing package descriptor object",
+            ),
+            (
+                "wrong resolved type",
+                "node_modules/bad",
+                json!({"version": "1.0.0", "resolved": false}),
+                "field \"resolved\" must be a non-empty string",
+            ),
+            (
+                "garbage resolved source",
+                "node_modules/bad",
+                json!({"version": "1.0.0", "resolved": "not-a-source"}),
+                "unsupported or malformed resolved source",
+            ),
+            (
+                "credential-like bare tarball source",
+                "node_modules/bad",
+                json!({
+                    "version": "1.0.0",
+                    "resolved": "user:password@private.example/path/package.tgz"
+                }),
+                "unsupported or malformed resolved source",
+            ),
+            (
+                "empty file version source",
+                "node_modules/bad",
+                json!({"version": "file:"}),
+                "unsupported or malformed version source",
+            ),
+            (
+                "empty Git version source",
+                "node_modules/bad",
+                json!({"version": "git:"}),
+                "unsupported or malformed version source",
+            ),
+            (
+                "empty HTTPS version source",
+                "node_modules/bad",
+                json!({"version": "https:"}),
+                "unsupported or malformed version source",
+            ),
+            (
+                "empty workspace version source",
+                "node_modules/bad",
+                json!({"version": "workspace:"}),
+                "unsupported or malformed version source",
+            ),
+            (
+                "empty SCP repository source",
+                "node_modules/bad",
+                json!({"version": "git@private.example:"}),
+                "unsupported or malformed version source",
+            ),
+            (
+                "SCP source with only a fragment",
+                "node_modules/bad",
+                json!({"version": "git@private.example:#token"}),
+                "unsupported or malformed version source",
+            ),
+            (
+                "SCP source with only a query",
+                "node_modules/bad",
+                json!({"version": "git@private.example:?token"}),
+                "unsupported or malformed version source",
+            ),
+        ];
+
+        for version in [2, 3] {
+            for (label, location, entry, expected) in &cases {
+                let value = json!({
+                    "name": "strict-fixture",
+                    "lockfileVersion": version,
+                    "packages": {
+                        "": {"name": "strict-fixture", "version": "1.0.0"},
+                        (*location): (*entry).clone(),
+                    }
+                });
+                let error = match parse_npm_value(&value) {
+                    Ok(_) => panic!("npm v{version} accepted {label}"),
+                    Err(error) => error,
+                };
+                let ParseError::Invalid { message, .. } = error else {
+                    panic!("npm v{version} returned I/O error for {label}");
+                };
+                assert!(
+                    message.contains(expected),
+                    "npm v{version} {label} returned unexpected error: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_metadata_cannot_hide_an_installed_npm_package_record() {
+        let packages = parse_npm_value(&json!({
+            "name": "strict-fixture",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "strict-fixture", "version": "1.0.0"},
+                "node_modules/lodash": {
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                },
+                "node_modules/decoy": {
+                    "link": true,
+                    "resolved": "node_modules/lodash"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "lodash");
+        assert_eq!(packages[0].version, "4.17.20");
+        assert!(packages[0].enrichable);
+
+        let error = parse_npm_value(&json!({
+            "name": "strict-fixture",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "strict-fixture", "version": "1.0.0"},
+                "node_modules/@scope": {"version": "1.0.0"},
+                "node_modules/decoy": {
+                    "link": true,
+                    "resolved": "node_modules/@scope"
+                }
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = error else {
+            panic!("malformed installed link target returned an I/O error");
+        };
+        assert!(message.contains("not a valid installed package location"));
+    }
+
+    #[test]
+    fn npm_alias_records_require_the_declared_registry_identity() {
+        for (label, name) in [
+            ("missing name", None),
+            ("mismatched name", Some(json!("underscore"))),
+        ] {
+            let mut entry = serde_json::Map::new();
+            entry.insert("version".to_owned(), json!("4.17.20"));
+            if let Some(name) = name {
+                entry.insert("name".to_owned(), name);
+            }
+            let error = parse_npm_value(&json!({
+                "name": "alias-fixture",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "alias-fixture",
+                        "version": "1.0.0",
+                        "dependencies": {"alias-lodash": "npm:lodash@4.17.20"}
+                    },
+                    "node_modules/alias-lodash": Json::Object(entry)
+                }
+            }))
+            .unwrap_err();
+
+            let ParseError::Invalid { message, .. } = error else {
+                panic!("{label} alias returned an I/O error");
+            };
+            assert!(
+                message.contains("alias package entry")
+                    && message.contains("lodash")
+                    && message.contains("alias-lodash"),
+                "{label} alias returned unexpected context: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_alias_targets_allow_the_npm_default_version() {
+        assert_eq!(npm_alias_target("lodash").unwrap(), "lodash");
+        assert_eq!(npm_alias_target("lodash@latest").unwrap(), "lodash");
+        assert_eq!(
+            npm_alias_target("@scope/package").unwrap(),
+            "@scope/package"
+        );
+        assert_eq!(
+            npm_alias_target("@scope/package@^1.0.0").unwrap(),
+            "@scope/package"
+        );
+        assert_eq!(npm_alias_target("lodash@").unwrap(), "lodash");
+        assert_eq!(
+            npm_alias_target("@scope/package@").unwrap(),
+            "@scope/package"
+        );
+        assert!(npm_alias_target("lodash@file:../package").is_err());
+        assert!(npm_alias_target("lodash@npm:other").is_err());
+
+        let packages = npm_fixture_packages("npm-v3-alias-bare");
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "lodash");
+        assert_eq!(packages[0].version, "4.18.1");
+        assert!(packages[0].direct);
+        assert!(packages[0].enrichable);
+    }
+
+    #[test]
+    fn npm_installed_identity_selects_the_effective_duplicate_group_alias() {
+        let packages = parse_npm_value(&json!({
+            "name": "duplicate-group-alias",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "duplicate-group-alias",
+                    "version": "1.0.0",
+                    "dependencies": {"same": "npm:lodash@4.17.20"},
+                    "devDependencies": {"same": "npm:underscore@1.13.7"}
+                },
+                "node_modules/same": {
+                    "name": "underscore",
+                    "version": "1.13.7",
+                    "resolved": "https://registry.npmjs.org/underscore/-/underscore-1.13.7.tgz",
+                    "dev": true
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "underscore");
+        assert_eq!(packages[0].version, "1.13.7");
+        assert!(packages[0].dev);
+        assert!(packages[0].enrichable);
+    }
+
+    #[test]
+    fn npm_effective_dev_declaration_overrides_a_source_declaration() {
+        let packages = parse_npm_value(&json!({
+            "name": "duplicate-group-source",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "duplicate-group-source",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "same": "https://registry.npmjs.org/underscore/-/underscore-1.13.7.tgz"
+                    },
+                    "devDependencies": {"same": "npm:lodash@4.17.20"}
+                },
+                "node_modules/same": {
+                    "name": "lodash",
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                    "dev": true
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "lodash");
+        assert!(packages[0].dev);
+        assert!(packages[0].enrichable);
+    }
+
+    #[test]
+    fn npm_workspace_patterns_follow_npm_negation_semantics() {
+        fn patterns(values: Json) -> NpmWorkspacePatterns {
+            let document = json!({
+                "": {
+                    "name": "workspace-patterns",
+                    "version": "1.0.0",
+                    "workspaces": values
+                }
+            });
+            npm_lock_workspace_patterns(
+                Path::new("package-lock.json"),
+                document.as_object().unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn is_workspace(location: &str, patterns: &NpmWorkspacePatterns) -> bool {
+            npm_is_workspace_descriptor(Path::new("package-lock.json"), location, patterns).unwrap()
+        }
+
+        let braces = patterns(json!(["/packages/{a,b}/"]));
+        assert!(is_workspace("packages/a", &braces));
+        assert!(is_workspace("packages/b", &braces));
+        assert!(is_workspace(
+            "packages/a",
+            &patterns(json!([".//packages/*"]))
+        ));
+        assert!(!is_workspace(
+            "packages/a",
+            &patterns(json!(["././packages/*"]))
+        ));
+        assert!(!is_workspace(
+            "packages/a",
+            &patterns(json!(["/./packages/*"]))
+        ));
+
+        let negated_before_include = patterns(json!(["!packages/b", "packages/*"]));
+        assert!(is_workspace("packages/a", &negated_before_include));
+        assert!(!is_workspace("packages/b", &negated_before_include));
+
+        let adjacent_negations = patterns(json!(["!packages/*", "!packages/a", "packages/a"]));
+        assert!(!is_workspace("packages/a", &adjacent_negations));
+
+        let double_negation = patterns(json!(["!!packages\\c"]));
+        assert!(is_workspace("packages/c", &double_negation));
+        let exact_extglob = patterns(json!(["packages/@(a|b)"]));
+        assert!(is_workspace("packages/a", &exact_extglob));
+        assert!(is_workspace("packages/b", &exact_extglob));
+        assert!(!is_workspace("packages/c", &exact_extglob));
+
+        let optional_extglob = patterns(json!(["packages/item?(s|z)"]));
+        assert!(is_workspace("packages/item", &optional_extglob));
+        assert!(is_workspace("packages/items", &optional_extglob));
+
+        let literal_dollar = patterns(json!(["packages/$"]));
+        assert!(is_workspace("packages/$", &literal_dollar));
+        assert!(!is_workspace("packages/a", &literal_dollar));
+
+        let negative_extglob = patterns(json!(["packages/!(c)"]));
+        assert!(is_workspace("packages/a", &negative_extglob));
+        assert!(!is_workspace("packages/c", &negative_extglob));
+
+        let numeric_brace = patterns(json!(["packages/{1..3}"]));
+        assert!(is_workspace("packages/2", &numeric_brace));
+        assert!(!is_workspace("packages/4", &numeric_brace));
+
+        let alphabetic_brace = patterns(json!(["packages/{a..e..2}"]));
+        assert!(is_workspace("packages/c", &alphabetic_brace));
+        assert!(!is_workspace("packages/d", &alphabetic_brace));
+
+        let posix_class = patterns(json!(["packages/[[:alpha:]]"]));
+        assert!(is_workspace("packages/a", &posix_class));
+        assert!(!is_workspace("packages/7", &posix_class));
+
+        assert!(!is_workspace(
+            "packages/a",
+            &patterns(json!(["packages/{a}"]))
+        ));
+        assert!(!is_workspace(
+            "packages/.a",
+            &patterns(json!(["packages/*"]))
+        ));
+        assert!(!is_workspace("#a", &patterns(json!(["#*"]))));
+        assert!(!is_workspace("node_modules/c", &patterns(json!(["**"]))));
+    }
+
+    #[test]
+    fn npm_links_require_a_proven_workspace_identity() {
+        let forged = parse_npm_value(&json!({
+            "name": "forged-link",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "forged-link",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "4.17.20"}
+                },
+                "node_modules/lodash": {"link": true, "resolved": "packages/fake"},
+                "packages/fake": {"name": "fake-lodash", "version": "1.0.0"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = forged else {
+            panic!("forged npm link returned an I/O error");
+        };
+        assert!(message.contains("unproven local target"));
+
+        let nameless_forged = parse_npm_value(&json!({
+            "name": "nameless-forged-link",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "nameless-forged-link",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"],
+                    "dependencies": {"lodash": "4.17.20"}
+                },
+                "node_modules/lodash": {"link": true, "resolved": "packages/fake"},
+                "packages/fake": {"version": "1.0.0"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = nameless_forged else {
+            panic!("nameless forged npm link returned an I/O error");
+        };
+        assert!(message.contains("unproven local target"));
+
+        let workspace_shadow = parse_npm_value(&json!({
+            "name": "workspace-shadow",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "workspace-shadow",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"],
+                    "dependencies": {"a": "npm:lodash@4.17.20"}
+                },
+                "node_modules/a": {"link": true, "resolved": "packages/a"},
+                "packages/a": {"version": "1.0.0"}
+            }
+        }))
+        .unwrap();
+        assert!(workspace_shadow.is_empty());
+
+        let conflicting_workspace_alias = parse_npm_value(&json!({
+            "name": "workspace-alias-conflict",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "workspace-alias-conflict",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/b": {"link": true, "resolved": "packages/b"},
+                "packages/a": {
+                    "name": "a",
+                    "version": "1.0.0",
+                    "dependencies": {"b": "npm:lodash@4.17.20"}
+                },
+                "packages/b": {"name": "b", "version": "1.0.0"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = conflicting_workspace_alias else {
+            panic!("conflicting workspace alias returned an I/O error");
+        };
+        assert!(message.contains("unproven local target"));
+
+        let malformed_link_field = parse_npm_value(&json!({
+            "name": "malformed-link-field",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "malformed-link-field",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/a": {
+                    "link": true,
+                    "resolved": "packages/a",
+                    "dev": "yes"
+                },
+                "packages/a": {"name": "a", "version": "1.0.0"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = malformed_link_field else {
+            panic!("malformed link dev field returned an I/O error");
+        };
+        assert!(message.contains("field \"dev\" must be a boolean"));
+
+        let link_with_package_metadata = parse_npm_value(&json!({
+            "name": "link-package-metadata",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "link-package-metadata",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/a": {
+                    "link": true,
+                    "resolved": "packages/a",
+                    "dependencies": {"lodash": "4.17.20"}
+                },
+                "packages/a": {"name": "a", "version": "1.0.0"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = link_with_package_metadata else {
+            panic!("npm link package metadata returned an I/O error");
+        };
+        assert!(message.contains("must not contain package metadata field \"dependencies\""));
+
+        let duplicate_target_identity = parse_npm_value(&json!({
+            "name": "duplicate-target-identity",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "duplicate-target-identity",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/a": {"link": true, "resolved": "packages/a"},
+                "node_modules/b": {"link": true, "resolved": "packages/a"},
+                "packages/a": {"version": "1.0.0"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = duplicate_target_identity else {
+            panic!("duplicate workspace target identity returned an I/O error");
+        };
+        assert!(message.contains("no matching workspace identity"));
+
+        let orphan_external = parse_npm_value(&json!({
+            "name": "orphan-external-link",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "orphan-external-link", "version": "1.0.0"},
+                "node_modules/lodash": {"link": true, "resolved": "../outside"},
+                "../outside": {"name": "lodash", "version": "4.17.20"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = orphan_external else {
+            panic!("orphan external npm link returned an I/O error");
+        };
+        assert!(message.contains("explicit non-registry declaration"));
+
+        let self_link = parse_npm_value(&json!({
+            "name": "self-link",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "self-link", "version": "1.0.0"},
+                "node_modules/hidden": {
+                    "link": true,
+                    "resolved": "node_modules/hidden"
+                }
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = self_link else {
+            panic!("self-referential npm link returned an I/O error");
+        };
+        assert!(message.contains("must not be itself or another link record"));
+
+        let malformed_target_version = parse_npm_value(&json!({
+            "name": "malformed-target-version",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "malformed-target-version",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/a": {"link": true, "resolved": "packages/a"},
+                "packages/a": {"name": "a", "version": 123}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = malformed_target_version else {
+            panic!("malformed npm link target version returned an I/O error");
+        };
+        assert!(message.contains("field \"version\" must be a non-empty string"));
+
+        let unproven_prefix = parse_npm_value(&json!({
+            "name": "unproven-link-prefix",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "unproven-link-prefix",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "vendor/node_modules/a": {"link": true, "resolved": "packages/a"},
+                "packages/a": {"name": "a", "version": "1.0.0"}
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = unproven_prefix else {
+            panic!("unproven npm link prefix returned an I/O error");
+        };
+        assert!(message.contains("unproven install prefix \"vendor\""));
+    }
+
+    #[test]
+    fn npm_external_link_descriptors_do_not_require_uninstalled_edges() {
+        let packages = parse_npm_value(&json!({
+            "name": "external-link",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "external-link",
+                    "version": "1.0.0",
+                    "dependencies": {"outside": "file:../outside"}
+                },
+                "node_modules/outside": {"link": true, "resolved": "../outside"},
+                "../outside": {
+                    "name": "outside",
+                    "version": "1.0.0",
+                    "dependencies": {"not-installed": "1.0.0"},
+                    "devDependencies": {"also-not-installed": "1.0.0"}
+                }
+            }
+        }))
+        .unwrap();
+        assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn npm_non_root_registry_constraints_cannot_fall_back_to_an_incompatible_workspace() {
+        let error = parse_npm_value(&json!({
+            "name": "workspace-range-confusion",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "workspace-range-confusion",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/lodash": {
+                    "link": true,
+                    "resolved": "packages/local-lodash"
+                },
+                "node_modules/y": {"link": true, "resolved": "packages/y"},
+                "packages/local-lodash": {
+                    "name": "lodash",
+                    "version": "1.0.0"
+                },
+                "packages/y": {
+                    "name": "y",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "4.17.21"}
+                }
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = error else {
+            panic!("incompatible workspace fallback returned an I/O error");
+        };
+        assert!(message.contains("does not accept linked workspace version \"1.0.0\""));
+    }
+
+    #[test]
+    fn npm_sources_must_resolve_to_the_selected_link_target() {
+        let valid = parse_npm_value(&json!({
+            "name": "workspace-file-link",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "workspace-file-link",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/a": {"link": true, "resolved": "packages/a"},
+                "node_modules/y": {"link": true, "resolved": "packages/y"},
+                "packages/a": {"name": "a", "version": "1.0.0"},
+                "packages/y": {
+                    "name": "y",
+                    "version": "1.0.0",
+                    "dependencies": {"a": "file:../a"}
+                }
+            }
+        }))
+        .unwrap();
+        assert!(valid.is_empty());
+
+        let error = parse_npm_value(&json!({
+            "name": "workspace-source-confusion",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "workspace-source-confusion",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"]
+                },
+                "node_modules/lodash": {
+                    "link": true,
+                    "resolved": "packages/local-lodash"
+                },
+                "node_modules/y": {"link": true, "resolved": "packages/y"},
+                "packages/local-lodash": {
+                    "name": "lodash",
+                    "version": "1.0.0"
+                },
+                "packages/y": {
+                    "name": "y",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "file:../../external-lodash"}
+                }
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = error else {
+            panic!("mismatched non-root npm source returned an I/O error");
+        };
+        assert!(message.contains("does not resolve to linked target \"packages/local-lodash\""));
+
+        for (name, specification) in [
+            ("url-source", "https://private.example/package.tgz"),
+            ("workspace-source", "workspace:*"),
+        ] {
+            let target = format!("../outside-{name}");
+            let error = parse_npm_value(&json!({
+                "name": "root-source-confusion",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "root-source-confusion",
+                        "version": "1.0.0",
+                        "dependencies": {(name): specification}
+                    },
+                    (format!("node_modules/{name}")): {
+                        "link": true,
+                        "resolved": target.clone()
+                    },
+                    (target.clone()): {"name": name, "version": "1.0.0"}
+                }
+            }))
+            .unwrap_err();
+            let ParseError::Invalid { message, .. } = error else {
+                panic!("root {name} source confusion returned an I/O error");
+            };
+            assert!(
+                message.contains("does not resolve to linked target")
+                    || message.contains("cannot resolve to non-workspace link target"),
+                "root {name} source confusion returned unexpected context: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_registry_declarations_coalesced_at_one_install_must_agree() {
+        let error = parse_npm_value(&json!({
+            "name": "coalesced-identities",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "coalesced-identities",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"],
+                    "dependencies": {"shared": "npm:lodash@4.17.20"}
+                },
+                "node_modules/a": {"link": true, "resolved": "packages/a"},
+                "packages/a": {
+                    "name": "a",
+                    "version": "1.0.0",
+                    "dependencies": {"shared": "1.0.0"}
+                },
+                "node_modules/shared": {
+                    "name": "lodash",
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                }
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = error else {
+            panic!("coalesced npm identities returned an I/O error");
+        };
+        assert!(message.contains("inconsistent with its registry declarations"));
+    }
+
+    #[test]
+    fn npm_workspace_source_provenance_survives_hoisting() {
+        let packages = npm_fixture_packages("npm-v3-hoisted-url");
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "lodash");
+        assert_eq!(packages[0].version, "4.17.20");
+        assert!(packages[0].direct);
+        assert!(!packages[0].enrichable);
+    }
+
+    #[test]
+    fn npm_alias_validation_is_scoped_to_the_declaring_descriptor() {
+        let source_collision = npm_fixture_packages("npm-v3-alias-source-collision")
+            .into_iter()
+            .map(|package| (package.name.clone(), package))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(source_collision.len(), 2);
+        assert!(source_collision["lodash"].enrichable);
+        assert!(!source_collision["underscore"].enrichable);
+
+        let registry_collision = npm_fixture_packages("npm-v3-alias-registry-collision")
+            .into_iter()
+            .map(|package| (package.name.clone(), package))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(registry_collision.len(), 2);
+        assert!(registry_collision["lodash"].enrichable);
+        assert!(registry_collision["is-number"].enrichable);
+    }
+
+    #[test]
+    fn npm_workspace_sources_bind_to_their_concrete_installed_records() {
+        let packages = npm_fixture_packages("npm-v3-workspace-source-collision")
+            .into_iter()
+            .map(|package| (package.name.clone(), package))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages["lodash"].version, "4.17.20");
+        assert!(packages["lodash"].enrichable);
+        assert_eq!(packages["underscore"].version, "1.13.7");
+        assert!(!packages["underscore"].enrichable);
+    }
+
+    #[test]
+    fn npm_dedup_keeps_a_proven_public_occurrence_enrichable() {
+        let packages = parse_npm_value(&json!({
+            "name": "mixed-source-same-coordinate",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "mixed-source-same-coordinate",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "public-lodash": "npm:lodash@4.17.20",
+                        "url-lodash": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                    }
+                },
+                "node_modules/public-lodash": {
+                    "name": "lodash",
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                },
+                "node_modules/url-lodash": {
+                    "name": "lodash",
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "lodash");
+        assert!(packages[0].enrichable);
+    }
+
+    #[test]
+    fn npm_ambiguous_registry_origins_are_visible_but_not_enriched() {
+        let omitted = parse_npm_value(&json!({
+            "name": "omitted-registry-origin",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "omitted-registry-origin",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "4.17.20"}
+                },
+                "node_modules/lodash": {"version": "4.17.20"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(omitted.len(), 1);
+        assert!(!omitted[0].enrichable);
+
+        let configured = parse_npm_value(&json!({
+            "name": "configured-registry-origin",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "configured-registry-origin",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "4.17.20"}
+                },
+                "node_modules/lodash": {
+                    "version": "4.17.20",
+                    "resolved": "registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(configured.len(), 1);
+        assert!(!configured[0].enrichable);
+
+        let public = parse_npm_value(&json!({
+            "name": "public-registry-origin",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "public-registry-origin",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "4.17.20"}
+                },
+                "node_modules/lodash": {
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(public[0].enrichable);
+    }
+
+    #[test]
+    fn npm_public_tarball_paths_must_match_the_package_identity() {
+        assert!(npm_public_tarball_matches(
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+            "lodash",
+            "4.17.20"
+        ));
+        assert!(npm_public_tarball_matches(
+            "https://registry.npmjs.org/%40scope%2Fpackage/-/package-1.2.3.tgz",
+            "@scope/package",
+            "1.2.3"
+        ));
+        assert!(npm_public_tarball_matches(
+            "https://registry.npmjs.org/@scope/package/-/package-1.2.3.tgz",
+            "@scope/package",
+            "1.2.3"
+        ));
+
+        let error = parse_npm_value(&json!({
+            "name": "public-path-confusion",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "public-path-confusion",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "4.17.20"}
+                },
+                "node_modules/lodash": {
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+                }
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = error else {
+            panic!("mismatched public npm tarball returned an I/O error");
+        };
+        assert!(message.contains("does not match package \"lodash\" version \"4.17.20\""));
+    }
+
+    #[test]
+    fn npm_required_dependency_edges_must_resolve_to_installed_records() {
+        let error = parse_npm_value(&json!({
+            "name": "missing-required-edge",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "missing-required-edge",
+                    "version": "1.0.0",
+                    "dependencies": {"lodash": "4.17.20"},
+                    "optionalDependencies": {"optional-package": "1.0.0"},
+                    "peerDependencies": {"peer-package": "1.0.0"}
+                },
+                "node_modules/safe-source": {
+                    "version": "git+https://example.test/safe.git#abc"
+                }
+            }
+        }))
+        .unwrap_err();
+        let ParseError::Invalid { message, .. } = error else {
+            panic!("missing required npm edge returned an I/O error");
+        };
+        assert!(message.contains("required dependency \"lodash\""));
+        assert!(message.contains("no installed package record"));
+    }
+
+    #[test]
+    fn preserves_explicit_npm_nonregistry_records_without_enrichment() {
+        let packages = parse_npm_value(&json!({
+            "name": "strict-fixture",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "strict-fixture",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"],
+                    "dependencies": {
+                        "alias": "npm:actual-package@3.0.0",
+                        "bare-secret-source": "file:../bare-secret-source",
+                        "git-no-version": "git+https://example.test/no-version.git#abc",
+                        "git-nonsemver": "git+file:///tmp/nonsemver#abc",
+                        "git-package": "github:example/repo#abc",
+                        "gitlab-package": "gitlab:example/repo#abc",
+                        "opaque-secret-source": "file:../opaque-secret-source",
+                        "private-package": "6.0.0",
+                        "relative-credential-source": "../user:password@private.example/repository",
+                        "relative-secret-source": "../private#token=secret",
+                        "registry-package": "2.0.0",
+                        "scp-source": "git@private.example:owner/repo.git#token=secret",
+                        "secret-source": "https://user:password@private.example/package.tgz?token=secret#fragment",
+                        "url-package": "https://example.test/package.tgz"
+                    }
+                },
+                "node_modules/workspace-package": {
+                    "resolved": "packages/workspace-package",
+                    "link": true
+                },
+                "packages/workspace-package": {
+                    "name": "workspace-package",
+                    "version": "1.0.0"
+                },
+                "node_modules/registry-package": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/registry-package/-/registry-package-2.0.0.tgz"
+                },
+                "node_modules/alias": {
+                    "name": "actual-package",
+                    "version": "3.0.0",
+                    "resolved": "https://registry.npmjs.org/actual-package/-/actual-package-3.0.0.tgz"
+                },
+                "node_modules/bare-secret-source": {
+                    "version": "folder?token=secret/package.tgz",
+                    "resolved": "file:../bare-secret-source"
+                },
+                "node_modules/git-package": {
+                    "version": "4.0.0",
+                    "resolved": "git+ssh://git@example.test/repo.git#abc"
+                },
+                "node_modules/git-no-version": {
+                    "resolved": "git+https://example.test/no-version.git#abc"
+                },
+                "node_modules/git-nonsemver": {
+                    "version": "dev",
+                    "resolved": "git+file:///tmp/nonsemver#abc"
+                },
+                "node_modules/gitlab-package": {
+                    "version": "branch",
+                    "resolved": "gitlab:example/repo#abc"
+                },
+                "node_modules/opaque-secret-source": {
+                    "version": "user:password@private.example/path/package.tgz",
+                    "resolved": "file:../opaque-secret-source"
+                },
+                "node_modules/private-package": {
+                    "version": "6.0.0",
+                    "resolved": "https://npm.private.example/private-package/-/private-package-6.0.0.tgz"
+                },
+                "node_modules/relative-credential-source": {
+                    "version": "../user:password@private.example/repository"
+                },
+                "node_modules/relative-secret-source": {
+                    "resolved": "../private#token=secret"
+                },
+                "node_modules/scp-source": {
+                    "resolved": "git@private.example:owner/repo.git#token=secret"
+                },
+                "node_modules/secret-source": {
+                    "resolved": "https://user:password@private.example/package.tgz?token=secret#fragment"
+                },
+                "node_modules/url-package": {
+                    "version": "5.0.0",
+                    "resolved": "https://example.test/package.tgz"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(packages.len(), 14);
+        let packages = packages
+            .into_iter()
+            .map(|package| (package.name.clone(), package))
+            .collect::<BTreeMap<_, _>>();
+        assert!(packages["registry-package"].enrichable);
+        assert!(packages["actual-package"].enrichable);
+        assert_eq!(packages["bare-secret-source"].version, "folder");
+        assert!(!packages["bare-secret-source"].enrichable);
+        assert!(!packages["git-package"].enrichable);
+        assert!(!packages["git-no-version"].enrichable);
+        assert!(
+            packages["git-no-version"]
+                .version
+                .starts_with("git+https://")
+        );
+        assert_eq!(packages["git-nonsemver"].version, "dev");
+        assert!(!packages["git-nonsemver"].enrichable);
+        assert_eq!(packages["gitlab-package"].version, "branch");
+        assert!(!packages["gitlab-package"].enrichable);
+        assert_eq!(
+            packages["opaque-secret-source"].version,
+            "[redacted-source]"
+        );
+        assert!(!packages["opaque-secret-source"].enrichable);
+        assert!(!packages["private-package"].enrichable);
+        assert_eq!(
+            packages["relative-credential-source"].version,
+            "[redacted-source]"
+        );
+        assert!(!packages["relative-credential-source"].enrichable);
+        assert_eq!(packages["relative-secret-source"].version, "../private");
+        assert!(!packages["relative-secret-source"].enrichable);
+        assert_eq!(
+            packages["scp-source"].version,
+            "git@private.example:owner/repo.git"
+        );
+        assert!(!packages["scp-source"].enrichable);
+        assert_eq!(
+            packages["secret-source"].version,
+            "https://private.example/package.tgz"
+        );
+        assert!(!packages["secret-source"].enrichable);
+        assert!(!packages["url-package"].enrichable);
+        assert!(!packages.contains_key("workspace-package"));
+        assert!(!packages.contains_key("alias"));
+        assert_eq!(
+            npm_lock_report_coordinate("?token=secret"),
+            "[redacted-source]"
+        );
+        for credential_shaped in [
+            "./user:password@private.example/repository",
+            "../user:password@private.example/repository",
+            "/user:password@private.example/repository",
+            "file:../user:password@private.example/repository",
+            "file:///user:password@private.example/repository",
+            "file:///user%3Apassword%40private.example/repository",
+        ] {
+            assert_eq!(
+                npm_lock_report_coordinate(credential_shaped),
+                "[redacted-source]",
+                "credential-shaped source {credential_shaped:?} was not redacted"
+            );
+        }
+
+        for source in [
+            "bitbucket:example/repo#abc",
+            "gist:example/repo#abc",
+            "gitlab:example/repo#abc",
+            "git+file:///tmp/repo#abc",
+        ] {
+            assert!(npm_lock_source_locator(source));
+            assert_eq!(
+                npm_lock_resolved_source(Some(source)).unwrap(),
+                NpmResolvedSource::Nonregistry
+            );
+        }
+    }
+
+    #[test]
     fn keeps_legacy_npm_v1_nested_packages_best_effort() {
         let packages = npm_fixture_packages("npm-v1-nested");
 
@@ -3762,6 +6232,47 @@ mod tests {
           }
         ]
         "#);
+    }
+
+    #[test]
+    fn legacy_npm_v1_never_enriches_explicit_source_locators() {
+        let packages = parse_npm_value(&json!({
+            "name": "legacy-source-fixture",
+            "lockfileVersion": 1,
+            "dependencies": {
+                "registry-package": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/registry-package/-/registry-package-1.0.0.tgz"
+                },
+                "git-package": {"version": "git+https://example.test/repo.git#abc"},
+                "file-package": {"version": "file:../package"},
+                "raw-source": {
+                    "version": "folder?token=secret/package.tgz",
+                    "resolved": "file:../raw-source"
+                },
+                "invalid-public-version": {
+                    "version": "^1.0.0",
+                    "resolved": "https://registry.npmjs.org/invalid-public-version/-/invalid-public-version-1.0.0.tgz"
+                },
+                "url-package": {"version": "https://user:password@example.test/package.tgz?token=secret#fragment"}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(packages.len(), 6);
+        for package in &packages {
+            assert_eq!(package.enrichable, package.name == "registry-package");
+        }
+        let raw_source = packages
+            .iter()
+            .find(|package| package.name == "raw-source")
+            .expect("legacy raw source package");
+        assert_eq!(raw_source.version, "folder");
+        let url_package = packages
+            .iter()
+            .find(|package| package.name == "url-package")
+            .expect("legacy URL package");
+        assert_eq!(url_package.version, "https://example.test/package.tgz");
     }
 
     #[test]

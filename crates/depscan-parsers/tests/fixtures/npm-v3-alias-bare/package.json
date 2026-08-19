@@ -1,0 +1,9 @@
+{
+  "name": "npm-v3-alias-bare",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "alias-empty": "npm:lodash@",
+    "alias-lodash": "npm:lodash"
+  }
+}

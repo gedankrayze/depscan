@@ -1,0 +1,9 @@
+{
+  "name": "alias-registry-collision",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "is-number": "npm:lodash@4.17.20"
+  }
+}

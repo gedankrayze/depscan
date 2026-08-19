@@ -1,0 +1,7 @@
+{
+  "name": "workspace-b",
+  "version": "1.0.0",
+  "dependencies": {
+    "lodash": "https://registry.npmjs.org/underscore/-/underscore-1.13.7.tgz"
+  }
+}

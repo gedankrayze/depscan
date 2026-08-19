@@ -257,3 +257,24 @@ fn rejects_wrong_missing_malformed_and_future_schemas_as_invalid() {
         }
     }
 }
+
+#[test]
+fn rejects_malformed_npm_v3_package_entry_after_valid_records() {
+    let format = FORMATS
+        .iter()
+        .find(|format| format.directory == "npm")
+        .expect("npm format");
+    let path = schema_fixture(format, "malformed-entry");
+
+    let error = parse(path.clone(), format.kind.clone()).unwrap_err();
+    let ParseError::Invalid {
+        path: error_path,
+        message,
+    } = error
+    else {
+        panic!("malformed npm entry returned an I/O error");
+    };
+    assert_eq!(error_path, path);
+    assert!(message.contains("node_modules/missing-version"));
+    assert!(message.contains("non-empty string version"));
+}

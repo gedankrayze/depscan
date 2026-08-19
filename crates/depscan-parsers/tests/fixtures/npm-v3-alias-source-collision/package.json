@@ -1,0 +1,9 @@
+{
+  "name": "alias-source-collision",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "shared": "npm:lodash@4.17.20"
+  }
+}

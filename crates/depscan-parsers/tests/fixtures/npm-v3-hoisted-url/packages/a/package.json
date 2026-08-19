@@ -1,0 +1,8 @@
+{
+  "name": "workspace-a",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "url-lodash": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+  }
+}
