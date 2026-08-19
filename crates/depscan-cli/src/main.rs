@@ -1,3 +1,5 @@
+mod secure_fs;
+
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::{generate, shells};
@@ -13,9 +15,11 @@ use depscan_providers::{
 };
 use depscan_report::{OutputFormat, render};
 use futures::{StreamExt, stream};
+use secure_fs::{ConfinedOutput, ScanRoot, read_config_nofollow};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashSet},
+    ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -383,7 +387,8 @@ struct PreparedScan {
     fail_on_outdated: OutdatedThreshold,
     configured_ignores: Vec<IgnoreConfig>,
     config_origin: ConfigOrigin,
-    implicit_config_output: bool,
+    implicit_config_output: Option<PathBuf>,
+    confined_output: Option<ConfinedOutput>,
 }
 
 fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
@@ -506,6 +511,7 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         configured_ignores,
         config_origin: _,
         implicit_config_output: _,
+        confined_output,
     } = prepared;
     let generated_at = scan_timestamp()?;
     let max_cache_age = args.max_cache_age.map(|age| age.0);
@@ -632,7 +638,11 @@ async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         && args.output.is_none();
     let content = render(&document, format, use_color)
         .map_err(|e| CliError::usage(format!("rendering report: {e}")))?;
-    if let Some(path) = args.output {
+    if let Some(destination) = confined_output {
+        destination
+            .write(content.as_bytes())
+            .map_err(|error| CliError::usage(error.to_string()))?;
+    } else if let Some(path) = args.output {
         fs::write(&path, content)
             .map_err(|e| CliError::usage(format!("writing {}: {e}", path.display())))?;
     } else {
@@ -740,19 +750,26 @@ where
 }
 
 fn prepare_scan(args: ScanArgs) -> Result<PreparedScan, CliError> {
-    if !args.path.is_dir() {
-        return Err(CliError::usage(format!(
-            "{} is not a directory",
+    let scan_root = ScanRoot::open(&args.path).map_err(|error| {
+        CliError::usage(format!(
+            "{} is not a directory: {error}",
             args.path.display()
-        )));
-    }
-    let loaded = load_config(&args.path, args.config.as_deref())?;
-    let prepared = merge_scan_config(args, loaded)?;
-    validate_output_path(prepared.args.output.as_deref())?;
-    if prepared.implicit_config_output
-        && let Some(output) = prepared.args.output.as_deref()
-    {
-        validate_implicit_config_output(&prepared.args.path, output)?;
+        ))
+    })?;
+    let loaded = load_config(&scan_root, args.config.as_deref())?;
+    let mut prepared = merge_scan_config(args, loaded)?;
+    if let Some(configured) = prepared.implicit_config_output.as_deref() {
+        let output = prepared
+            .args
+            .output
+            .as_deref()
+            .expect("implicit configured output has an effective output path");
+        prepared.confined_output = Some(
+            ConfinedOutput::prepare(scan_root, configured, output)
+                .map_err(|error| CliError::usage(error.to_string()))?,
+        );
+    } else {
+        validate_output_path(prepared.args.output.as_deref())?;
     }
     Ok(prepared)
 }
@@ -822,6 +839,7 @@ fn merge_scan_config(mut args: ScanArgs, loaded: LoadedConfig) -> Result<Prepare
         args.format = configured_format;
     }
     let configured_output_selected = args.output.is_none() && output.is_some();
+    let configured_output = output.clone();
     if args.output.is_none()
         && let Some(configured) = output
     {
@@ -865,54 +883,38 @@ fn merge_scan_config(mut args: ScanArgs, loaded: LoadedConfig) -> Result<Prepare
         fail_on_outdated,
         configured_ignores: ignores,
         config_origin: loaded.origin,
-        implicit_config_output: configured_output_selected && !explicit_config,
+        implicit_config_output: if configured_output_selected && !explicit_config {
+            configured_output
+        } else {
+            None
+        },
+        confined_output: None,
     })
 }
 
-fn load_config(root: &Path, explicit: Option<&Path>) -> Result<LoadedConfig, CliError> {
-    let (path, origin) = explicit.map_or_else(
-        || (root.join("depscan.toml"), "implicit-default"),
-        |path| (path.to_path_buf(), "explicit"),
-    );
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && explicit.is_none() => {
-            return Ok(LoadedConfig {
-                value: Config::default(),
-                origin: ConfigOrigin {
-                    path,
-                    origin,
-                    loaded: false,
-                },
-            });
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(CliError::usage(format!(
-                "config {} does not exist",
-                path.display()
-            )));
-        }
-        Err(error) => {
-            return Err(CliError::usage(format!(
-                "inspecting config {}: {error}",
-                path.display()
-            )));
-        }
+fn load_config(root: &ScanRoot, explicit: Option<&Path>) -> Result<LoadedConfig, CliError> {
+    let (path, origin, text) = if let Some(path) = explicit {
+        let path = path.to_path_buf();
+        let text = read_config_nofollow(&path, false)
+            .map_err(|error| CliError::usage(error.to_string()))?;
+        (path, "explicit", text)
+    } else {
+        let path = root.path().join("depscan.toml");
+        let text = root
+            .read_optional_config(OsStr::new("depscan.toml"), &path)
+            .map_err(|error| CliError::usage(error.to_string()))?;
+        (path, "implicit-default", text)
     };
-    if metadata.file_type().is_symlink() {
-        return Err(CliError::usage(format!(
-            "config {} is a symbolic link; configuration symlinks are not allowed",
-            path.display()
-        )));
-    }
-    if !metadata.is_file() {
-        return Err(CliError::usage(format!(
-            "config {} is not a regular file",
-            path.display()
-        )));
-    }
-    let text = fs::read_to_string(&path)
-        .map_err(|e| CliError::usage(format!("reading config {}: {e}", path.display())))?;
+    let Some(text) = text else {
+        return Ok(LoadedConfig {
+            value: Config::default(),
+            origin: ConfigOrigin {
+                path,
+                origin,
+                loaded: false,
+            },
+        });
+    };
     let config = toml::from_str(&text)
         .map_err(|e| CliError::usage(format!("invalid config {}: {e}", path.display())))?;
     Ok(LoadedConfig {
@@ -1024,44 +1026,6 @@ fn validate_output_path(path: Option<&Path>) -> Result<(), CliError> {
         )));
     }
     Ok(())
-}
-
-fn validate_implicit_config_output(root: &Path, output: &Path) -> Result<(), CliError> {
-    let canonical_root = fs::canonicalize(root).map_err(|error| {
-        CliError::usage(format!(
-            "resolving scan root {} for configured output: {error}",
-            root.display()
-        ))
-    })?;
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
-        CliError::usage(format!(
-            "resolving configured output directory {}: {error}",
-            parent.display()
-        ))
-    })?;
-    if !canonical_parent.starts_with(&canonical_root) {
-        return Err(CliError::usage(format!(
-            "implicit configured output {} escapes scan root {}; use --output or an explicitly selected trusted config to write elsewhere",
-            output.display(),
-            root.display()
-        )));
-    }
-    match fs::symlink_metadata(output) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::usage(format!(
-            "implicit configured output {} is a symbolic link",
-            output.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CliError::usage(format!(
-            "inspecting implicit configured output {}: {error}",
-            output.display()
-        ))),
-    }
 }
 
 fn has_vulnerability_failure(document: &ScanDocument, threshold: VulnerabilityThreshold) -> bool {
