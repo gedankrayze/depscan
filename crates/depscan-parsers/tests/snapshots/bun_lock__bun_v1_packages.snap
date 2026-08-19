@@ -1,0 +1,24 @@
+---
+source: crates/depscan-parsers/tests/bun_lock.rs
+expression: snapshot(&packages)
+---
+[
+  {
+    "dev": true,
+    "direct": true,
+    "display_name": "@types/node",
+    "enrichable": true,
+    "name": "@types/node",
+    "resolved_from_range": false,
+    "version": "22.10.2"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "left-pad",
+    "enrichable": true,
+    "name": "left-pad",
+    "resolved_from_range": false,
+    "version": "1.3.0"
+  }
+]

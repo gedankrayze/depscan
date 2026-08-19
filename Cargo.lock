@@ -488,6 +488,7 @@ dependencies = [
  "depscan-core",
  "insta",
  "quick-xml",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

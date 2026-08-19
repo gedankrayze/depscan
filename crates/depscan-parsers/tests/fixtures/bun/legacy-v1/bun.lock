@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "legacy-root",
+      "dependencies": { "left-pad": "1.3.0" },
+      "devDependencies": { "@types/node": "22.10.2" },
+    },
+  },
+  "packages": {
+    "left-pad": ["left-pad@1.3.0", "", {}, "sha512-left-pad"],
+    "@types/node": ["@types/node@22.10.2", "", {}, "sha512-node"],
+  },
+}

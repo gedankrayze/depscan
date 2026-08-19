@@ -1,0 +1,60 @@
+---
+source: crates/depscan-parsers/tests/bun_lock.rs
+expression: snapshot(&packages)
+---
+[
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "@scope/widget",
+    "enrichable": true,
+    "name": "@scope/widget",
+    "resolved_from_range": false,
+    "version": "1.2.3"
+  },
+  {
+    "dev": true,
+    "direct": true,
+    "display_name": "dev-only",
+    "enrichable": true,
+    "name": "dev-only",
+    "resolved_from_range": false,
+    "version": "3.4.5"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "number-alias",
+    "enrichable": true,
+    "name": "is-number",
+    "resolved_from_range": false,
+    "version": "7.0.0"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "prod-and-dev",
+    "enrichable": true,
+    "name": "prod-and-dev",
+    "resolved_from_range": false,
+    "version": "2.0.0"
+  },
+  {
+    "dev": true,
+    "direct": true,
+    "display_name": "workspace-dev",
+    "enrichable": true,
+    "name": "workspace-dev",
+    "resolved_from_range": false,
+    "version": "6.7.8"
+  },
+  {
+    "dev": false,
+    "direct": true,
+    "display_name": "workspace-prod",
+    "enrichable": true,
+    "name": "workspace-prod",
+    "resolved_from_range": false,
+    "version": "5.6.7"
+  }
+]

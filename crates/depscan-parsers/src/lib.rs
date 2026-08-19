@@ -5,7 +5,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde_json::Value as Json;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -220,60 +220,437 @@ fn parse_legacy_npm_tree(
 
 fn parse_bun_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
-    // Bun's text lockfile is JSONC. Strip comments/trailing commas without pretending strings are comments.
-    let cleaned = strip_jsonc(&text);
+    let cleaned = strip_jsonc(&text).map_err(|error| invalid(path, error))?;
     let value: Json = serde_json::from_str(&cleaned).map_err(|e| invalid(path, e))?;
-    let root = path.parent().unwrap_or(Path::new("."));
-    let direct = node_direct_names(root);
+    let lockfile_version = value
+        .get("lockfileVersion")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| invalid(path, "Bun lockfile is missing an integer lockfileVersion"))?;
+    if lockfile_version > 2 {
+        return Err(invalid(
+            path,
+            format!(
+                "unsupported Bun lockfileVersion {lockfile_version}; supported versions are 0, 1, and 2"
+            ),
+        ));
+    }
+
+    let workspace_metadata = parse_bun_workspaces(path, &value)?;
     let mut output = Vec::new();
-    if let Some(map) = value.get("packages").and_then(Json::as_object) {
-        for (name, entry) in map {
-            let version = entry.get("version").and_then(Json::as_str).or_else(|| {
-                entry
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(Json::as_str)
+    let Some(packages) = value.get("packages") else {
+        return Ok(output);
+    };
+    let packages = packages
+        .as_object()
+        .ok_or_else(|| invalid(path, "Bun packages must be an object"))?;
+
+    for (package_key, entry) in packages {
+        let items = entry.as_array().ok_or_else(|| {
+            invalid(
+                path,
+                format!("Bun package {package_key:?} must be a locator array"),
+            )
+        })?;
+        let locator = items.first().and_then(Json::as_str).ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "Bun package {package_key:?} locator array must start with a string locator"
+                ),
+            )
+        })?;
+        let resolution = parse_bun_locator(locator).map_err(|error| {
+            invalid(
+                path,
+                format!("Bun package {package_key:?} has invalid locator {locator:?}: {error}"),
+            )
+        })?;
+        validate_bun_locator_array(
+            path,
+            package_key,
+            items,
+            resolution,
+            lockfile_version,
+            &workspace_metadata.names,
+        )?;
+
+        if let BunResolution::Registry { name, version } = resolution {
+            let directness = workspace_metadata.direct.get(package_key).or_else(|| {
+                (package_key == name)
+                    .then(|| workspace_metadata.direct.get(name))
+                    .flatten()
             });
-            if let Some(version) = version
-                && !name.starts_with("workspace:")
-            {
-                let mut p = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
-                p.direct = direct.contains(name);
-                output.push(p);
+            let mut package = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
+            if workspace_metadata.direct.contains_key(package_key) && package_key != name {
+                // The packages key is the installed alias while the locator name is the
+                // registry identity that OSV and npm need.
+                package.display_name = package_key.clone();
             }
+            if let Some(directness) = directness {
+                package.direct = true;
+                package.dev = directness.development && !directness.production;
+            }
+            output.push(package);
         }
     }
     Ok(dedup(output))
 }
-fn strip_jsonc(input: &str) -> String {
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BunDirectness {
+    production: bool,
+    development: bool,
+}
+
+struct BunWorkspaceMetadata {
+    direct: HashMap<String, BunDirectness>,
+    names: HashMap<String, String>,
+}
+
+fn parse_bun_workspaces(path: &Path, value: &Json) -> Result<BunWorkspaceMetadata, ParseError> {
+    let workspaces = value
+        .get("workspaces")
+        .and_then(Json::as_object)
+        .ok_or_else(|| invalid(path, "Bun lockfile is missing a workspaces object"))?;
+    if !workspaces.contains_key("") {
+        return Err(invalid(
+            path,
+            "Bun workspaces object is missing the root workspace entry",
+        ));
+    }
+
+    let mut direct = HashMap::<String, BunDirectness>::new();
+    let mut workspace_names = HashMap::new();
+    for (workspace_path, workspace) in workspaces {
+        let workspace = workspace.as_object().ok_or_else(|| {
+            invalid(
+                path,
+                format!("Bun workspace {workspace_path:?} must be an object"),
+            )
+        })?;
+        if !workspace_path.is_empty() {
+            let name = workspace
+                .get("name")
+                .and_then(Json::as_str)
+                .ok_or_else(|| {
+                    invalid(
+                        path,
+                        format!("Bun workspace {workspace_path:?} must have a string name"),
+                    )
+                })?;
+            if let Some(version) = workspace.get("version") {
+                let version = version.as_str().ok_or_else(|| {
+                    invalid(
+                        path,
+                        format!("Bun workspace {workspace_path:?} version must be a string"),
+                    )
+                })?;
+                semver::Version::parse(version).map_err(|error| {
+                    invalid(
+                        path,
+                        format!("Bun workspace {workspace_path:?} has invalid version: {error}"),
+                    )
+                })?;
+            }
+            workspace_names.insert(workspace_path.clone(), name.to_owned());
+        }
+
+        for (group, is_development) in [
+            ("dependencies", false),
+            ("devDependencies", true),
+            ("optionalDependencies", false),
+            ("peerDependencies", false),
+        ] {
+            let Some(dependencies) = workspace.get(group) else {
+                continue;
+            };
+            let dependencies = dependencies.as_object().ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("Bun workspace {workspace_path:?} {group} must be an object"),
+                )
+            })?;
+            for name in dependencies.keys() {
+                let flags = direct.entry(name.clone()).or_default();
+                if is_development {
+                    flags.development = true;
+                } else {
+                    flags.production = true;
+                }
+            }
+        }
+    }
+    Ok(BunWorkspaceMetadata {
+        direct,
+        names: workspace_names,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BunResolution<'a> {
+    Registry { name: &'a str, version: &'a str },
+    Workspace { name: &'a str, path: &'a str },
+    Path,
+    Git,
+    Tarball,
+    Root,
+}
+
+fn parse_bun_locator(locator: &str) -> Result<BunResolution<'_>, String> {
+    if locator == "@root:" {
+        return Ok(BunResolution::Root);
+    }
+
+    let separator = if locator.starts_with('@') {
+        let slash = locator
+            .find('/')
+            .ok_or_else(|| "scoped package name is missing '/'".to_owned())?;
+        locator[slash + 1..]
+            .find('@')
+            .map(|index| slash + 1 + index)
+            .ok_or_else(|| "scoped package locator is missing '@resolution'".to_owned())?
+    } else {
+        locator
+            .find('@')
+            .ok_or_else(|| "package locator is missing '@resolution'".to_owned())?
+    };
+    let name = &locator[..separator];
+    let resolution = &locator[separator + 1..];
+    validate_bun_package_name(name)?;
+    if resolution.is_empty() {
+        return Err("package resolution is empty".to_owned());
+    }
+
+    if let Some(workspace_path) = resolution.strip_prefix("workspace:") {
+        if workspace_path.is_empty() {
+            return Err("workspace resolution path is empty".to_owned());
+        }
+        return Ok(BunResolution::Workspace {
+            name,
+            path: workspace_path,
+        });
+    }
+    if resolution.starts_with("file:") || resolution.starts_with("link:") {
+        if resolution
+            .split_once(':')
+            .is_none_or(|(_, value)| value.is_empty())
+        {
+            return Err("path resolution is empty".to_owned());
+        }
+        return Ok(BunResolution::Path);
+    }
+    if let Some(repository) = resolution
+        .strip_prefix("git+")
+        .or_else(|| resolution.strip_prefix("github:"))
+    {
+        if repository.is_empty() {
+            return Err("git resolution is empty".to_owned());
+        }
+        return Ok(BunResolution::Git);
+    }
+    if resolution.starts_with("http://")
+        || resolution.starts_with("https://")
+        || is_bun_tarball(resolution)
+    {
+        return Ok(BunResolution::Tarball);
+    }
+
+    semver::Version::parse(resolution)
+        .map_err(|error| format!("registry resolution is not valid SemVer: {error}"))?;
+    Ok(BunResolution::Registry {
+        name,
+        version: resolution,
+    })
+}
+
+fn is_bun_tarball(resolution: &str) -> bool {
+    let lowercase = resolution.to_ascii_lowercase();
+    [".tgz", ".tar.gz", ".tar"]
+        .iter()
+        .any(|suffix| lowercase.ends_with(suffix))
+}
+
+fn validate_bun_package_name(name: &str) -> Result<(), String> {
+    let valid = if let Some(scoped) = name.strip_prefix('@') {
+        let mut parts = scoped.split('/');
+        parts.next().is_some_and(|scope| !scope.is_empty())
+            && parts.next().is_some_and(|package| !package.is_empty())
+            && parts.next().is_none()
+    } else {
+        !name.is_empty() && !name.contains('/')
+    };
+    if !valid
+        || name.chars().any(char::is_whitespace)
+        || name.contains('\\')
+        || matches!(name, "." | "..")
+    {
+        return Err("package name is malformed".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_bun_locator_array(
+    path: &Path,
+    package_key: &str,
+    items: &[Json],
+    resolution: BunResolution<'_>,
+    lockfile_version: u64,
+    workspaces: &HashMap<String, String>,
+) -> Result<(), ParseError> {
+    let error = |message: &str| {
+        invalid(
+            path,
+            format!("Bun package {package_key:?} has malformed locator array: {message}"),
+        )
+    };
+    let object_at = |index: usize| items.get(index).is_some_and(Json::is_object);
+    let string_at = |index: usize| items.get(index).is_some_and(Json::is_string);
+
+    match resolution {
+        BunResolution::Registry { .. } => {
+            if items.len() != 4 || !string_at(1) || !object_at(2) || !string_at(3) {
+                return Err(error(
+                    "registry entries must be [locator, registry, info, integrity]",
+                ));
+            }
+        }
+        BunResolution::Workspace {
+            name,
+            path: workspace_path,
+        } => {
+            let valid_shape = if lockfile_version == 0 {
+                items.len() == 2 && object_at(1)
+            } else {
+                items.len() == 1
+            };
+            if !valid_shape {
+                return Err(error(if lockfile_version == 0 {
+                    "version 0 workspace entries must be [locator, info]"
+                } else {
+                    "version 1 and 2 workspace entries must contain only the locator"
+                }));
+            }
+            let Some(workspace_name) = workspaces.get(workspace_path) else {
+                return Err(error(
+                    "workspace locator references an unknown workspace path",
+                ));
+            };
+            if workspace_name != name {
+                return Err(error(
+                    "workspace locator package name does not match the referenced workspace",
+                ));
+            }
+        }
+        BunResolution::Path | BunResolution::Tarball => {
+            if !(items.len() == 2 || items.len() == 3)
+                || !object_at(1)
+                || (items.len() == 3 && !string_at(2))
+            {
+                return Err(error(
+                    "path and tarball entries must be [locator, info] with optional integrity",
+                ));
+            }
+        }
+        BunResolution::Git => {
+            if !(items.len() == 3 || items.len() == 4)
+                || !object_at(1)
+                || !string_at(2)
+                || (items.len() == 4 && !string_at(3))
+            {
+                return Err(error(
+                    "git entries must be [locator, info, resolved] with optional integrity",
+                ));
+            }
+        }
+        BunResolution::Root => {
+            if items.len() != 2 || !object_at(1) {
+                return Err(error("root entries must be [\"@root:\", info]"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn strip_jsonc(input: &str) -> Result<String, String> {
     let mut result = String::new();
     let mut chars = input.chars().peekable();
     let mut quoted = false;
+    let mut escaped = false;
     while let Some(ch) = chars.next() {
-        if ch == '"' {
-            quoted = !quoted;
+        if quoted {
             result.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
             continue;
         }
-        if !quoted && ch == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            for c in chars.by_ref() {
-                if c == '\n' {
+        if ch == '"' {
+            quoted = true;
+            result.push(ch);
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            let _ = chars.next();
+            for comment in chars.by_ref() {
+                if comment == '\n' {
                     result.push('\n');
                     break;
                 }
             }
-            continue;
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            let _ = chars.next();
+            // JSONC comments are whitespace. Preserve a separator so removing a
+            // comment cannot accidentally join two otherwise-invalid tokens.
+            result.push(' ');
+            let mut closed = false;
+            let mut previous = '\0';
+            for comment in chars.by_ref() {
+                if comment == '\n' {
+                    result.push('\n');
+                }
+                if previous == '*' && comment == '/' {
+                    closed = true;
+                    break;
+                }
+                previous = comment;
+            }
+            if !closed {
+                return Err("unterminated block comment in Bun lockfile".to_owned());
+            }
+            result.push(' ');
+        } else {
+            result.push(ch);
         }
-        result.push(ch);
     }
+    if quoted {
+        return Err("unterminated string in Bun lockfile".to_owned());
+    }
+
     let mut out = String::new();
     let mut iter = result.chars().peekable();
+    let mut quoted = false;
+    let mut escaped = false;
     while let Some(ch) = iter.next() {
-        if ch == ',' {
+        if quoted {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if ch == '"' {
+            quoted = true;
+            out.push(ch);
+        } else if ch == ',' {
             let mut spaces = String::new();
             while matches!(iter.peek(), Some(c) if c.is_whitespace()) {
-                spaces.push(iter.next().unwrap());
+                if let Some(space) = iter.next() {
+                    spaces.push(space);
+                }
             }
             if matches!(iter.peek(), Some('}' | ']')) {
                 out.push_str(&spaces);
@@ -285,7 +662,7 @@ fn strip_jsonc(input: &str) -> String {
             out.push(ch);
         }
     }
-    out
+    Ok(out)
 }
 
 fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {

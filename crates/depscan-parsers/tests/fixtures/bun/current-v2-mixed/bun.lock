@@ -1,0 +1,52 @@
+{
+  // Fresh Bun releases write lockfileVersion 2. Existing v1 files remain valid.
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "root // comment markers inside strings stay intact",
+      "dependencies": {
+        "@scope/widget": "1.2.3",
+        "number-alias": "npm:is-number@7.0.0",
+        "prod-and-dev": "2.0.0",
+        "workspace-pkg": "workspace:*",
+        "local-folder": "file:./vendor/local-folder",
+        "local-link": "link:../shared/local-link",
+        "local-tarball": "./vendor/local-package.tgz",
+        "git-package": "github:example/repository#main",
+        "git-ssh": "git+ssh://git@github.com/example/repository.git#main",
+        "remote-tarball": "https://example.invalid/package.tgz",
+      },
+      "devDependencies": {
+        "dev-only": "3.4.5",
+        "prod-and-dev": "2.0.0",
+      },
+    },
+    "packages/workspace-pkg": {
+      "name": "workspace-pkg",
+      "version": "4.5.6",
+      "dependencies": {
+        "workspace-prod": "5.6.7",
+      },
+      "devDependencies": {
+        "workspace-dev": "6.7.8",
+      },
+    },
+  },
+  /* Every supported source locator is represented below. */
+  "packages": {
+    "@scope/widget": ["@scope/widget@1.2.3", "", {}, "sha512-scoped"],
+    "number-alias": ["is-number@7.0.0", "", {}, "sha512-alias"],
+    "prod-and-dev": ["prod-and-dev@2.0.0", "", {}, "sha512-prod"],
+    "dev-only": ["dev-only@3.4.5", "", {}, "sha512-dev"],
+    "workspace-prod": ["workspace-prod@5.6.7", "", {}, "sha512-workspace-prod"],
+    "workspace-dev": ["workspace-dev@6.7.8", "", {}, "sha512-workspace-dev"],
+    "workspace-pkg": ["workspace-pkg@workspace:packages/workspace-pkg"],
+    "local-folder": ["local-folder@file:vendor/local-folder", {}],
+    "local-link": ["local-link@link:../shared/local-link", {}],
+    "local-tarball": ["local-tarball@vendor/local-package.tgz", {}, "sha512-local-tarball"],
+    "git-package": ["git-package@github:example/repository#main", {}, "example-repository-0123456"],
+    "git-ssh": ["git-ssh@git+ssh://git@github.com/example/repository.git#main", {}, "example-repository-abcdef0"],
+    "remote-tarball": ["remote-tarball@https://example.invalid/package.tgz", {}, "sha512-tarball"],
+  },
+}
