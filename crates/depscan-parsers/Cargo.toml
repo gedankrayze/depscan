@@ -1,0 +1,24 @@
+[package]
+name = "depscan-parsers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+depscan-core = { path = "../depscan-core" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+walkdir.workspace = true
+quick-xml.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta = { version = "1.40", features = ["json"] }
+tempfile = "3.12"
+
+[lints]
+workspace = true

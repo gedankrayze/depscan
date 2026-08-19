@@ -1,0 +1,932 @@
+//! Network providers, disk cache, and OSV offline-dump support.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
+use depscan_core::{
+    classify_staleness, compare_versions, osv_fixed_versions, osv_range_matches, Ecosystem,
+    LatestVersions, Package, ProviderError, Severity, VersionProvider, VulnMap, VulnProvider,
+    Vulnerability,
+};
+use directories::ProjectDirs;
+use fs2::FileExt;
+use futures::{stream, StreamExt};
+use rand::Rng;
+use reqwest::{
+    header::{HeaderMap, HeaderValue, ACCEPT, ETAG, RETRY_AFTER},
+    Client, StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration as StdDuration,
+};
+use tokio::{sync::Semaphore, time::sleep};
+use tracing::debug;
+use urlencoding::encode;
+use zip::ZipArchive;
+
+const USER_AGENT_VALUE: &str = concat!(
+    "depscan/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/gedankrayze/depscan)"
+);
+const OSV_QUERY_TTL_SECS: i64 = 60 * 60;
+const REGISTRY_TTL_SECS: i64 = 6 * 60 * 60;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CachePolicy {
+    pub read: bool,
+    pub max_age: Option<Duration>,
+}
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self {
+            read: true,
+            max_age: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheEntry {
+    stored_at: DateTime<Utc>,
+    etag: Option<String>,
+    value: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct Cache {
+    root: PathBuf,
+    policy: CachePolicy,
+}
+impl Cache {
+    pub fn new(policy: CachePolicy) -> Result<Self, ProviderError> {
+        let root = std::env::var_os("DEPSCAN_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                ProjectDirs::from("dev", "depscan", "depscan").map(|d| d.cache_dir().to_path_buf())
+            })
+            .ok_or_else(|| {
+                ProviderError::Cache("could not determine cache directory".to_owned())
+            })?;
+        fs::create_dir_all(&root).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        Ok(Self { root, policy })
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    fn filename(&self, namespace: &str, key: &str) -> PathBuf {
+        let digest = Sha256::digest(key.as_bytes());
+        self.root.join(namespace).join(format!("{:x}.json", digest))
+    }
+    pub fn get(
+        &self,
+        namespace: &str,
+        key: &str,
+        ttl: Duration,
+    ) -> Option<(Value, Option<String>)> {
+        if !self.policy.read {
+            return None;
+        }
+        let path = self.filename(namespace, key);
+        let text = fs::read_to_string(path).ok()?;
+        let entry: CacheEntry = serde_json::from_str(&text).ok()?;
+        let limit = self
+            .policy
+            .max_age
+            .map_or(ttl, |max| std::cmp::min(ttl, max));
+        if Utc::now() - entry.stored_at > limit {
+            return None;
+        }
+        Some((entry.value, entry.etag))
+    }
+    pub fn put(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: &Value,
+        etag: Option<String>,
+    ) -> Result<(), ProviderError> {
+        let path = self.filename(namespace, key);
+        let parent = path.parent().expect("cache filename has parent");
+        fs::create_dir_all(parent).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        let lock_path = parent.join(".lock");
+        let lock = File::create(lock_path).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        lock.lock_exclusive()
+            .map_err(|e| ProviderError::Cache(e.to_string()))?;
+        let entry = CacheEntry {
+            stored_at: Utc::now(),
+            etag,
+            value: value.clone(),
+        };
+        let tmp = path.with_extension("json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_vec(&entry).map_err(|e| ProviderError::Cache(e.to_string()))?,
+        )
+        .map_err(|e| ProviderError::Cache(e.to_string()))?;
+        fs::rename(tmp, path).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        let _ = fs2::FileExt::unlock(&lock);
+        Ok(())
+    }
+    pub fn clear(&self) -> Result<(), ProviderError> {
+        if self.root.exists() {
+            fs::remove_dir_all(&self.root).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        }
+        fs::create_dir_all(&self.root).map_err(|e| ProviderError::Cache(e.to_string()))
+    }
+    pub fn stats(&self) -> Result<CacheStats, ProviderError> {
+        fn visit(path: &Path, stats: &mut CacheStats) -> std::io::Result<()> {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if meta.is_dir() {
+                    visit(&entry.path(), stats)?;
+                } else {
+                    stats.files += 1;
+                    stats.bytes += meta.len();
+                }
+            }
+            Ok(())
+        }
+        let mut stats = CacheStats::default();
+        if self.root.exists() {
+            visit(&self.root, &mut stats).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        }
+        Ok(stats)
+    }
+}
+#[derive(Debug, Default, Serialize)]
+pub struct CacheStats {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone)]
+pub struct HttpClient {
+    inner: Client,
+}
+impl HttpClient {
+    pub fn new() -> Result<Self, ProviderError> {
+        let client = Client::builder()
+            .user_agent(USER_AGENT_VALUE)
+            .timeout(StdDuration::from_secs(10))
+            .connect_timeout(StdDuration::from_secs(10))
+            .gzip(true)
+            .http2_adaptive_window(true)
+            .build()
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        Ok(Self { inner: client })
+    }
+    async fn request_json(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<Value>,
+        headers: HeaderMap,
+    ) -> Result<(Value, Option<String>), ProviderError> {
+        let mut last_error = String::new();
+        for attempt in 0..3 {
+            let mut request = self
+                .inner
+                .request(method.clone(), url)
+                .headers(headers.clone());
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    let etag = response
+                        .headers()
+                        .get(ETAG)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    let value = response
+                        .json::<Value>()
+                        .await
+                        .map_err(|e| ProviderError::InvalidResponse(format!("{url}: {e}")))?;
+                    return Ok((value, etag));
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    last_error = format!("{url}: HTTP {status}");
+                    if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
+                        return Err(ProviderError::Network(last_error));
+                    }
+                    let retry_after = response
+                        .headers()
+                        .get(RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let delay = retry_after
+                        .unwrap_or_else(|| (1u64 << attempt) + rand::thread_rng().gen_range(0..=1));
+                    sleep(StdDuration::from_secs(delay)).await;
+                }
+                Err(error) => {
+                    last_error = format!("{url}: {error}");
+                    if attempt < 2 {
+                        let jitter = rand::thread_rng().gen_range(0..100);
+                        sleep(StdDuration::from_millis((200 * (1u64 << attempt)) + jitter)).await;
+                    }
+                }
+            }
+        }
+        Err(ProviderError::Network(last_error))
+    }
+    pub async fn get_json(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(Value, Option<String>), ProviderError> {
+        self.request_json(reqwest::Method::GET, url, None, headers)
+            .await
+    }
+    pub async fn post_json(&self, url: &str, body: Value) -> Result<Value, ProviderError> {
+        self.request_json(reqwest::Method::POST, url, Some(body), HeaderMap::new())
+            .await
+            .map(|x| x.0)
+    }
+    pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
+        let response = self
+            .inner
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?
+            .error_for_status()
+            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))
+    }
+}
+
+#[derive(Clone)]
+pub struct OsvClient {
+    http: HttpClient,
+    cache: Cache,
+    concurrency: Arc<Semaphore>,
+}
+impl OsvClient {
+    pub fn new(http: HttpClient, cache: Cache) -> Self {
+        Self {
+            http,
+            cache,
+            concurrency: Arc::new(Semaphore::new(16)),
+        }
+    }
+    async fn query_batch(&self, batch: &[Package]) -> Result<Vec<Vec<String>>, ProviderError> {
+        let body = json!({"queries": batch.iter().map(|p| json!({"package":{"name":p.name,"ecosystem":p.ecosystem.osv_name()},"version":p.version})).collect::<Vec<_>>()});
+        let response = self
+            .http
+            .post_json("https://api.osv.dev/v1/querybatch", body)
+            .await?;
+        Ok(response
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|results| {
+                results
+                    .iter()
+                    .map(|r| {
+                        r.get("vulns")
+                            .and_then(Value::as_array)
+                            .map(|v| {
+                                v.iter()
+                                    .filter_map(|item| {
+                                        item.get("id").and_then(Value::as_str).map(str::to_owned)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+    async fn hydrate(&self, id: &str) -> Result<Value, ProviderError> {
+        if let Some((value, _)) = self.cache.get("osv/vuln", id, Duration::hours(24 * 3650)) {
+            return Ok(value);
+        }
+        let _permit = self
+            .concurrency
+            .acquire()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let url = format!("https://api.osv.dev/v1/vulns/{id}");
+        let (value, etag) = self.http.get_json(&url, HeaderMap::new()).await?;
+        self.cache.put("osv/vuln", id, &value, etag)?;
+        Ok(value)
+    }
+}
+#[async_trait]
+impl VulnProvider for OsvClient {
+    async fn query(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
+        let mut map = VulnMap::new();
+        let mut missing = Vec::new();
+        for package in packages
+            .iter()
+            .filter(|p| p.enrichable && !p.resolved_from_range)
+        {
+            if let Some((cached, _)) = self.cache.get(
+                "osv/query",
+                &package.key(),
+                Duration::seconds(OSV_QUERY_TTL_SECS),
+            ) {
+                let ids: Vec<String> = cached
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                map.insert(
+                    package.key(),
+                    ids.into_iter()
+                        .map(|id| Vulnerability {
+                            id,
+                            aliases: vec![],
+                            summary: String::new(),
+                            severity: None,
+                            cvss_score: None,
+                            fixed_in: vec![],
+                            references: vec![],
+                            withdrawn: false,
+                        })
+                        .collect(),
+                );
+            } else {
+                missing.push(package.clone());
+            }
+        }
+        for chunk in missing.chunks(1000) {
+            let lists = self.query_batch(chunk).await?;
+            for (package, ids) in chunk.iter().cloned().zip(lists) {
+                self.cache
+                    .put("osv/query", &package.key(), &json!(ids), None)?;
+                map.insert(
+                    package.key(),
+                    ids.into_iter()
+                        .map(|id| Vulnerability {
+                            id,
+                            aliases: vec![],
+                            summary: String::new(),
+                            severity: None,
+                            cvss_score: None,
+                            fixed_in: vec![],
+                            references: vec![],
+                            withdrawn: false,
+                        })
+                        .collect(),
+                );
+            }
+        }
+        let ids: BTreeSet<String> = map.values().flatten().map(|v| v.id.clone()).collect();
+        let hydrated = stream::iter(ids.into_iter().map(|id| {
+            let client = self.clone();
+            async move {
+                let doc = client.hydrate(&id).await?;
+                Ok::<_, ProviderError>((id, doc))
+            }
+        }))
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<HashMap<_, _>, _>>()?;
+        for (key, vulns) in &mut map {
+            let package = packages.iter().find(|p| p.key() == *key);
+            for vuln in vulns {
+                if let Some(doc) = hydrated.get(&vuln.id) {
+                    *vuln = vulnerability_from_osv(doc, package);
+                }
+            }
+        }
+        Ok(map)
+    }
+}
+
+fn vulnerability_from_osv(doc: &Value, package: Option<&Package>) -> Vulnerability {
+    let score = doc
+        .get("severity")
+        .and_then(Value::as_array)
+        .and_then(|a| {
+            a.iter()
+                .find_map(|s| s.get("score").and_then(Value::as_str))
+        })
+        .and_then(approx_cvss_score);
+    let fixed_in = package
+        .map(|p| {
+            osv_fixed_versions(
+                p.ecosystem,
+                &p.version,
+                doc.get("affected")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+        })
+        .unwrap_or_default();
+    Vulnerability {
+        id: doc
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_owned(),
+        aliases: doc
+            .get("aliases")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        summary: doc
+            .get("summary")
+            .and_then(Value::as_str)
+            .or_else(|| doc.get("details").and_then(Value::as_str))
+            .unwrap_or("No summary supplied")
+            .to_owned(),
+        severity: score.map(Severity::from_cvss),
+        cvss_score: score,
+        fixed_in,
+        references: doc
+            .get("references")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("url").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        withdrawn: doc.get("withdrawn").is_some(),
+    }
+}
+fn approx_cvss_score(vector: &str) -> Option<f32> {
+    if let Ok(n) = vector.parse::<f32>() {
+        return Some(n);
+    }
+    let upper = vector.to_ascii_uppercase();
+    if !upper.starts_with("CVSS:") {
+        return None;
+    }
+    let mut score: f32 = 0.0;
+    if upper.contains("/AV:N") {
+        score += 2.0;
+    } else if upper.contains("/AV:A") {
+        score += 1.0;
+    }
+    if upper.contains("/AC:L") {
+        score += 1.0;
+    }
+    if upper.contains("/PR:N") {
+        score += 1.0;
+    }
+    if upper.contains("/UI:N") {
+        score += 1.0;
+    }
+    for impact in ["/C:H", "/I:H", "/A:H"] {
+        if upper.contains(impact) {
+            score += 1.5;
+        }
+    }
+    for impact in ["/C:L", "/I:L", "/A:L"] {
+        if upper.contains(impact) {
+            score += 0.5;
+        }
+    }
+    Some(score.min(10.0))
+}
+
+#[derive(Clone)]
+pub struct OsvOffline {
+    cache: Cache,
+}
+impl OsvOffline {
+    pub fn new(cache: Cache) -> Self {
+        Self { cache }
+    }
+    fn archive_path(&self, ecosystem: Ecosystem) -> PathBuf {
+        self.cache
+            .root()
+            .join("offline")
+            .join(format!("{}.zip", ecosystem.osv_name().replace('.', "_")))
+    }
+    fn query_blocking(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
+        let mut output = VulnMap::new();
+        for package in packages {
+            output.entry(package.key()).or_default();
+        }
+        for ecosystem in [
+            Ecosystem::Npm,
+            Ecosystem::PyPI,
+            Ecosystem::NuGet,
+            Ecosystem::CratesIo,
+        ] {
+            let scoped: Vec<_> = packages
+                .iter()
+                .filter(|p| p.ecosystem == ecosystem && p.enrichable && !p.resolved_from_range)
+                .collect();
+            if scoped.is_empty() {
+                continue;
+            }
+            let archive_path = self.archive_path(ecosystem);
+            let file = File::open(&archive_path).map_err(|_| {
+                ProviderError::Offline(format!(
+                    "missing OSV dump {}; run `depscan sync --ecosystem {}`",
+                    archive_path.display(),
+                    ecosystem.display_name()
+                ))
+            })?;
+            let mut archive =
+                ZipArchive::new(file).map_err(|e| ProviderError::Offline(e.to_string()))?;
+            for index in 0..archive.len() {
+                let mut entry = archive
+                    .by_index(index)
+                    .map_err(|e| ProviderError::Offline(e.to_string()))?;
+                if !entry.name().ends_with(".json") {
+                    continue;
+                }
+                let mut text = String::new();
+                entry
+                    .read_to_string(&mut text)
+                    .map_err(|e| ProviderError::Offline(e.to_string()))?;
+                let Ok(document) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let affected = document
+                    .get("affected")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for package in &scoped {
+                    let matches = affected.iter().any(|item| {
+                        let identity_matches = item
+                            .get("package")
+                            .and_then(|x| x.get("name"))
+                            .and_then(Value::as_str)
+                            == Some(package.name.as_str())
+                            && item
+                                .get("package")
+                                .and_then(|x| x.get("ecosystem"))
+                                .and_then(Value::as_str)
+                                == Some(package.ecosystem.osv_name());
+                        let range_matches = item
+                            .get("ranges")
+                            .and_then(Value::as_array)
+                            .is_some_and(|ranges| {
+                                ranges.iter().any(|range| {
+                                    range.get("events").and_then(Value::as_array).is_some_and(
+                                        |events| {
+                                            osv_range_matches(
+                                                package.ecosystem,
+                                                &package.version,
+                                                events,
+                                            )
+                                        },
+                                    )
+                                })
+                            });
+                        identity_matches && range_matches
+                    });
+                    if matches {
+                        output
+                            .entry(package.key())
+                            .or_default()
+                            .push(vulnerability_from_osv(&document, Some(package)));
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+#[async_trait]
+impl VulnProvider for OsvOffline {
+    async fn query(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
+        let this = self.clone();
+        let owned = packages.to_vec();
+        tokio::task::spawn_blocking(move || this.query_blocking(&owned))
+            .await
+            .map_err(|e| ProviderError::Offline(e.to_string()))?
+    }
+}
+
+pub async fn sync_osv_dumps(
+    http: &HttpClient,
+    cache: &Cache,
+    ecosystems: &[Ecosystem],
+) -> Result<Vec<PathBuf>, ProviderError> {
+    let list: Vec<Ecosystem> = if ecosystems.is_empty() {
+        vec![
+            Ecosystem::Npm,
+            Ecosystem::PyPI,
+            Ecosystem::NuGet,
+            Ecosystem::CratesIo,
+        ]
+    } else {
+        ecosystems.to_vec()
+    };
+    let dir = cache.root().join("offline");
+    fs::create_dir_all(&dir).map_err(|e| ProviderError::Cache(e.to_string()))?;
+    let mut written = Vec::new();
+    for eco in list {
+        let url = format!(
+            "https://storage.googleapis.com/osv-vulnerabilities/{}/all.zip",
+            eco.osv_name()
+        );
+        debug!(%url, "downloading OSV dump");
+        let bytes = http.get_bytes(&url).await?;
+        let path = dir.join(format!("{}.zip", eco.osv_name().replace('.', "_")));
+        let tmp = path.with_extension("zip.tmp");
+        fs::write(&tmp, bytes).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        fs::rename(tmp, &path).map_err(|e| ProviderError::Cache(e.to_string()))?;
+        fs::write(path.with_extension("synced-at"), Utc::now().to_rfc3339())
+            .map_err(|e| ProviderError::Cache(e.to_string()))?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
+#[derive(Clone)]
+pub struct RegistryClient {
+    http: HttpClient,
+    cache: Cache,
+    limits: Arc<HashMap<Ecosystem, Arc<Semaphore>>>,
+}
+impl RegistryClient {
+    pub fn new(http: HttpClient, cache: Cache) -> Self {
+        let limits = HashMap::from([
+            (Ecosystem::Npm, Arc::new(Semaphore::new(16))),
+            (Ecosystem::PyPI, Arc::new(Semaphore::new(16))),
+            (Ecosystem::NuGet, Arc::new(Semaphore::new(16))),
+            (Ecosystem::CratesIo, Arc::new(Semaphore::new(8))),
+        ]);
+        Self {
+            http,
+            cache,
+            limits: Arc::new(limits),
+        }
+    }
+    async fn metadata(
+        &self,
+        namespace: &str,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<Value, ProviderError> {
+        if let Some((value, _)) =
+            self.cache
+                .get("registry", namespace, Duration::seconds(REGISTRY_TTL_SECS))
+        {
+            return Ok(value);
+        }
+        let (value, etag) = self.http.get_json(url, headers).await?;
+        self.cache.put("registry", namespace, &value, etag)?;
+        Ok(value)
+    }
+    async fn npm(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+        let _permit = self.limits[&Ecosystem::Npm]
+            .acquire()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let url = format!("https://registry.npmjs.org/{}", encode(&p.name));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.npm.install-v1+json"),
+        );
+        let data = self
+            .metadata(&format!("npm:{}", p.name), &url, headers)
+            .await?;
+        let latest = data
+            .get("dist-tags")
+            .and_then(|x| x.get("latest"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!("npm response lacked latest for {}", p.name))
+            })?
+            .to_owned();
+        Ok(version_result(p, latest, false))
+    }
+    async fn pypi(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+        let _permit = self.limits[&Ecosystem::PyPI]
+            .acquire()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let url = format!("https://pypi.org/pypi/{}/json", encode(&p.name));
+        let data = self
+            .metadata(&format!("pypi:{}", p.name), &url, HeaderMap::new())
+            .await?;
+        let releases = data
+            .get("releases")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse("PyPI response lacked releases".to_owned())
+            })?;
+        let installed_prerelease = is_prerelease(Ecosystem::PyPI, &p.version);
+        let mut candidates: Vec<String> = releases
+            .iter()
+            .filter(|(version, files)| {
+                let prerelease_allowed =
+                    installed_prerelease || !is_prerelease(Ecosystem::PyPI, version);
+                let all_yanked = files.as_array().is_some_and(|files| {
+                    !files.is_empty()
+                        && files.iter().all(|file| {
+                            file.get("yanked").and_then(Value::as_bool).unwrap_or(false)
+                        })
+                });
+                prerelease_allowed && !all_yanked
+            })
+            .map(|(version, _)| version.to_owned())
+            .collect();
+        candidates.sort_by(|a, b| compare_versions(Ecosystem::PyPI, a, b));
+        let latest = candidates.pop().ok_or_else(|| {
+            ProviderError::InvalidResponse(format!("PyPI has no suitable release for {}", p.name))
+        })?;
+        let yanked = releases
+            .get(&p.version)
+            .and_then(Value::as_array)
+            .is_some_and(|files| {
+                !files.is_empty()
+                    && files
+                        .iter()
+                        .all(|file| file.get("yanked").and_then(Value::as_bool).unwrap_or(false))
+            });
+        Ok(version_result(p, latest, yanked))
+    }
+    async fn nuget(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+        let _permit = self.limits[&Ecosystem::NuGet]
+            .acquire()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let url = format!(
+            "https://api.nuget.org/v3-flatcontainer/{}/index.json",
+            encode(&p.name)
+        );
+        let data = self
+            .metadata(&format!("nuget:{}", p.name), &url, HeaderMap::new())
+            .await?;
+        let latest = maximum_version(
+            Ecosystem::NuGet,
+            data.get("versions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|v| !is_prerelease(Ecosystem::NuGet, v)),
+        )
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse(format!("NuGet has no stable version for {}", p.name))
+        })?;
+        Ok(version_result(p, latest, false))
+    }
+    async fn crates(&self, p: &Package) -> Result<LatestVersions, ProviderError> {
+        let _permit = self.limits[&Ecosystem::CratesIo]
+            .acquire()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let name = &p.name;
+        let path = match name.len() {
+            1 => format!("1/{name}"),
+            2 => format!("2/{name}"),
+            3 => format!("3/{}/{name}", &name[0..1]),
+            _ => format!("{}/{}/{}", &name[0..2], &name[2..4], name),
+        };
+        let url = format!("https://index.crates.io/{path}");
+        let data = self
+            .crates_metadata_for_index(&format!("crates:{}", name), &url)
+            .await?;
+        let lines = data
+            .get("lines")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut all: Vec<String> = Vec::new();
+        let mut yanked = false;
+        for line in lines {
+            if let Some(version) = line.get("vers").and_then(Value::as_str) {
+                if version == p.version {
+                    yanked = line.get("yanked").and_then(Value::as_bool).unwrap_or(false);
+                }
+                if !line.get("yanked").and_then(Value::as_bool).unwrap_or(false)
+                    && !is_prerelease(Ecosystem::CratesIo, version)
+                {
+                    all.push(version.to_owned());
+                }
+            }
+        }
+        let latest = maximum_version(Ecosystem::CratesIo, all.iter().map(String::as_str))
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "crates.io has no stable version for {}",
+                    p.name
+                ))
+            })?;
+        Ok(version_result(p, latest, yanked))
+    }
+}
+#[async_trait]
+impl VersionProvider for RegistryClient {
+    async fn latest(&self, package: &Package) -> Result<LatestVersions, ProviderError> {
+        match package.ecosystem {
+            Ecosystem::Npm => self.npm(package).await,
+            Ecosystem::PyPI => self.pypi(package).await,
+            Ecosystem::NuGet => self.nuget(package).await,
+            Ecosystem::CratesIo => self.crates(package).await,
+        }
+    }
+}
+
+fn version_result(package: &Package, latest: String, yanked: bool) -> LatestVersions {
+    let staleness = if package.resolved_from_range {
+        depscan_core::Staleness::Unknown
+    } else {
+        classify_staleness(package.ecosystem, &package.version, &latest)
+    };
+    LatestVersions {
+        latest_stable: latest.clone(),
+        latest_matching: package.resolved_from_range.then_some(latest),
+        staleness,
+        yanked,
+    }
+}
+fn maximum_version<'a>(
+    eco: Ecosystem,
+    versions: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    versions
+        .into_iter()
+        .max_by(|a, b| compare_versions(eco, a, b))
+        .map(str::to_owned)
+}
+fn is_prerelease(eco: Ecosystem, version: &str) -> bool {
+    match eco {
+        Ecosystem::Npm | Ecosystem::CratesIo | Ecosystem::NuGet => version.contains('-'),
+        Ecosystem::PyPI => {
+            let lower = version.to_ascii_lowercase();
+            lower.contains("a")
+                || lower.contains("b")
+                || lower.contains("rc")
+                || lower.contains("dev")
+        }
+    }
+}
+
+// crates.io sparse-index entries are newline-delimited JSON. Convert the raw bytes into a JSON
+// envelope before cache storage so the generic cache can retain it without a special format.
+impl RegistryClient {
+    async fn crates_metadata_for_index(
+        &self,
+        key: &str,
+        url: &str,
+    ) -> Result<Value, ProviderError> {
+        if let Some((value, _)) =
+            self.cache
+                .get("registry", key, Duration::seconds(REGISTRY_TTL_SECS))
+        {
+            return Ok(value);
+        }
+        let bytes = self.http.get_bytes(url).await?;
+        let lines: Vec<Value> = String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let value = json!({"lines": lines});
+        self.cache.put("registry", key, &value, None)?;
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn maps_cvss_vector_to_band() {
+        assert_eq!(
+            approx_cvss_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+                .map(Severity::from_cvss),
+            Some(Severity::Critical)
+        );
+    }
+    #[test]
+    fn builds_sparse_paths() {
+        let path = match "serde".len() {
+            1 => "1/serde".to_owned(),
+            2 => "2/serde".to_owned(),
+            3 => "3/s/serde".to_owned(),
+            _ => format!("{}/{}/{}", &"serde"[0..2], &"serde"[2..4], "serde"),
+        };
+        assert_eq!(path, "se/rd/serde");
+    }
+}

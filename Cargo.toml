@@ -1,0 +1,64 @@
+[workspace]
+members = [
+  "crates/depscan-core",
+  "crates/depscan-parsers",
+  "crates/depscan-providers",
+  "crates/depscan-report",
+  "crates/depscan-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gedankrayze/depscan"
+rust-version = "1.75"
+authors = ["depscan contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+directories = "5.0"
+fs2 = "0.4"
+futures = "0.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json", "http2"] }
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+toml = "0.8"
+thiserror = "1.0"
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2.1"
+walkdir = "2.5"
+quick-xml = { version = "0.36", features = ["serialize"] }
+zip = "2.2"
+pep440_rs = "0.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[workspace.metadata.dist]
+dist = true
+ci = "github"
+installers = ["shell", "homebrew", "msi"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
+
+[workspace.metadata.release]
+shared-version = true
+consolidate-commits = true
+pre-release-commit-message = "release: {{version}}"
+tag-message = "{{version}}"
