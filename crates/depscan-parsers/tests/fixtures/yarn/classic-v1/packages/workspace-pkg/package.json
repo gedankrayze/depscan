@@ -1,0 +1,10 @@
+{
+  "name": "workspace-pkg",
+  "version": "1.0.0",
+  "dependencies": {
+    "wrappy": "1.0.2"
+  },
+  "devDependencies": {
+    "balanced-match": "1.0.2"
+  }
+}

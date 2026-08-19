@@ -1,0 +1,15 @@
+{
+  "name": "classic-root",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "@colors/colors": "1.6.0",
+    "@scope/alias": "npm:is-number@^7.0.0",
+    "local-file": "file:vendor/local-file",
+    "wrappy": "^1.0.1",
+    "workspace-pkg": "1.0.0"
+  },
+  "devDependencies": {
+    "is-odd": "3.0.1"
+  }
+}

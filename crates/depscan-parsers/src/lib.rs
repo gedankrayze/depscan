@@ -210,6 +210,46 @@ fn node_direct_names(root: &Path) -> HashSet<String> {
     node_direct_dependencies(root).all
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct YarnDirectness {
+    production: bool,
+    development: bool,
+}
+
+fn yarn_direct_dependencies(root: &Path) -> HashMap<String, YarnDirectness> {
+    let mut direct = HashMap::<String, YarnDirectness>::new();
+    for path in sorted_project_files(root, &["json"])
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json"))
+    {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Json>(&text) else {
+            continue;
+        };
+        for (group, is_development) in [
+            ("dependencies", false),
+            ("devDependencies", true),
+            ("optionalDependencies", false),
+            ("peerDependencies", false),
+        ] {
+            let Some(dependencies) = value.get(group).and_then(Json::as_object) else {
+                continue;
+            };
+            for name in dependencies.keys() {
+                let flags = direct.entry(name.clone()).or_default();
+                if is_development {
+                    flags.development = true;
+                } else {
+                    flags.production = true;
+                }
+            }
+        }
+    }
+    direct
+}
+
 struct NpmPackageLocation {
     name: String,
     install_parent: PathBuf,
@@ -788,50 +828,492 @@ fn parse_pnpm_key(raw: &str) -> Option<(&str, &str)> {
 fn parse_yarn_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
     let root = path.parent().unwrap_or(Path::new("."));
-    let direct = node_direct_names(root);
-    let mut out = Vec::new();
-    let mut selectors: Vec<String> = Vec::new();
-    let mut version: Option<String> = None;
-    let flush = |selectors: &mut Vec<String>,
-                 version: &mut Option<String>,
-                 out: &mut Vec<Package>| {
-        if let Some(v) = version.take() {
-            for s in selectors.drain(..) {
-                let name = yarn_selector_name(&s);
-                if !name.is_empty() {
-                    let mut p = Package::new(Ecosystem::Npm, name, v.clone(), path.to_path_buf());
-                    p.direct = direct.contains(&p.name);
-                    out.push(p);
-                }
+    let direct = yarn_direct_dependencies(root);
+    let has_berry_metadata = text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("__metadata:") || line.starts_with("\"__metadata\":")
+    });
+    if has_berry_metadata {
+        parse_yarn_berry(path, &text, &direct)
+    } else if text.lines().any(|line| line.trim() == "# yarn lockfile v1") {
+        parse_yarn_classic(path, &text, &direct)
+    } else {
+        Err(invalid(
+            path,
+            "unrecognized Yarn lockfile; expected a Yarn Classic '# yarn lockfile v1' header or Berry __metadata",
+        ))
+    }
+}
+
+const YARN_BERRY_MIN_LOCKFILE_VERSION: u64 = 4;
+const YARN_BERRY_MAX_LOCKFILE_VERSION: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YarnSource {
+    Registry,
+    Workspace,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct YarnLocator<'a> {
+    name: &'a str,
+    reference: &'a str,
+}
+
+fn parse_yarn_locator(locator: &str) -> Result<YarnLocator<'_>, String> {
+    let separator = if locator.starts_with('@') {
+        let slash = locator
+            .find('/')
+            .ok_or_else(|| "scoped package name is missing '/'".to_owned())?;
+        locator[slash + 1..]
+            .find('@')
+            .map(|index| slash + 1 + index)
+            .ok_or_else(|| "scoped package locator is missing '@reference'".to_owned())?
+    } else {
+        locator
+            .find('@')
+            .ok_or_else(|| "package locator is missing '@reference'".to_owned())?
+    };
+    let name = &locator[..separator];
+    let reference = &locator[separator + 1..];
+    validate_bun_package_name(name)?;
+    if reference.is_empty() {
+        return Err("package reference is empty".to_owned());
+    }
+    Ok(YarnLocator { name, reference })
+}
+
+fn split_yarn_descriptors(raw: &str) -> Result<Vec<String>, String> {
+    let mut descriptors = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in raw.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if ch == '"' {
+            quoted = true;
+        } else if ch == ',' {
+            descriptors.push(parse_yarn_scalar(&raw[start..index])?);
+            start = index + ch.len_utf8();
+        }
+    }
+    if quoted {
+        return Err("unterminated quote in descriptor list".to_owned());
+    }
+    descriptors.push(parse_yarn_scalar(&raw[start..])?);
+    if descriptors.iter().any(String::is_empty) {
+        return Err("descriptor list contains an empty selector".to_owned());
+    }
+    Ok(descriptors)
+}
+
+fn parse_yarn_scalar(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("value is empty".to_owned());
+    }
+    if value.starts_with('"') {
+        serde_json::from_str::<String>(value).map_err(|error| error.to_string())
+    } else if value.contains('"') || value.chars().any(char::is_whitespace) {
+        Err("unquoted value contains quotes or whitespace".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn yarn_reference_source(reference: &str) -> YarnSource {
+    let reference_without_params = reference.split("::").next().unwrap_or(reference);
+    if reference_without_params.starts_with("workspace:") {
+        YarnSource::Workspace
+    } else if reference_without_params.starts_with("npm:")
+        || (!reference_without_params.contains(':')
+            && semver::Version::parse(reference_without_params).is_ok())
+    {
+        YarnSource::Registry
+    } else if let Some(inner) = reference_without_params
+        .strip_prefix("virtual:")
+        .and_then(|value| value.split_once('#').map(|(_, inner)| inner))
+    {
+        yarn_reference_source(inner)
+    } else if reference_without_params.starts_with("patch:")
+        && reference_without_params
+            .to_ascii_lowercase()
+            .contains("@npm%3a")
+    {
+        YarnSource::Registry
+    } else {
+        YarnSource::Other
+    }
+}
+
+fn yarn_direct_metadata(
+    descriptors: &[String],
+    registry_name: &str,
+    direct: &HashMap<String, YarnDirectness>,
+) -> Result<(bool, bool, Option<String>), String> {
+    let mut flags = YarnDirectness::default();
+    let mut display_alias = None;
+    for descriptor in descriptors {
+        let locator = parse_yarn_locator(descriptor)?;
+        if let Some(directness) = direct.get(locator.name) {
+            flags.production |= directness.production;
+            flags.development |= directness.development;
+            if locator.name != registry_name {
+                display_alias.get_or_insert_with(|| locator.name.to_owned());
             }
         }
-    };
-    for line in text.lines() {
-        if !line.starts_with(' ') && line.ends_with(':') {
-            flush(&mut selectors, &mut version, &mut out);
-            selectors = line
-                .trim_end_matches(':')
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').to_owned())
-                .collect();
-        } else if let Some(v) = line.trim().strip_prefix("version ") {
-            version = Some(v.trim_matches('"').to_owned());
+    }
+    Ok((
+        flags.production || flags.development,
+        flags.development && !flags.production,
+        display_alias,
+    ))
+}
+
+fn validate_yarn_registry_version(
+    version: &str,
+    reference: &str,
+    context: &str,
+) -> Result<(), String> {
+    let parsed_version = semver::Version::parse(version)
+        .map_err(|error| format!("{context} has an invalid npm version {version:?}: {error}"))?;
+    let exact_reference = reference
+        .strip_prefix("npm:")
+        .unwrap_or(reference)
+        .split("::")
+        .next()
+        .unwrap_or(reference);
+    if reference.starts_with("npm:") || !reference.contains(':') {
+        let parsed_reference = semver::Version::parse(exact_reference).map_err(|error| {
+            format!("{context} has an invalid npm resolution {reference:?}: {error}")
+        })?;
+        if parsed_reference != parsed_version {
+            return Err(format!(
+                "{context} version {version:?} does not match npm resolution {reference:?}"
+            ));
         }
     }
-    flush(&mut selectors, &mut version, &mut out);
-    Ok(dedup(out))
+    Ok(())
 }
-fn yarn_selector_name(selector: &str) -> &str {
-    let s = selector.trim_matches('"');
-    if s.starts_with('@') {
-        let slash = s.find('/').unwrap_or(0);
-        s[slash + 1..]
-            .find('@')
-            .map(|i| &s[..slash + 1 + i])
-            .unwrap_or(s)
-    } else {
-        s.find('@').map(|i| &s[..i]).unwrap_or(s)
+
+fn parse_yarn_berry(
+    path: &Path,
+    text: &str,
+    direct: &HashMap<String, YarnDirectness>,
+) -> Result<Vec<Package>, ParseError> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|error| invalid(path, error))?;
+    let entries = value
+        .as_mapping()
+        .ok_or_else(|| invalid(path, "Yarn Berry lockfile root must be a mapping"))?;
+    let metadata = value
+        .get("__metadata")
+        .and_then(serde_yaml::Value::as_mapping)
+        .ok_or_else(|| invalid(path, "Yarn Berry lockfile is missing a __metadata mapping"))?;
+    let lockfile_version = metadata
+        .get("version")
+        .and_then(serde_yaml::Value::as_u64)
+        .ok_or_else(|| invalid(path, "Yarn Berry __metadata is missing an integer version"))?;
+    if !(YARN_BERRY_MIN_LOCKFILE_VERSION..=YARN_BERRY_MAX_LOCKFILE_VERSION)
+        .contains(&lockfile_version)
+    {
+        return Err(invalid(
+            path,
+            format!(
+                "unsupported Yarn Berry lockfile version {lockfile_version}; supported released versions are {YARN_BERRY_MIN_LOCKFILE_VERSION} through {YARN_BERRY_MAX_LOCKFILE_VERSION}"
+            ),
+        ));
     }
+
+    let mut packages = Vec::new();
+    for (raw_key, raw_entry) in entries {
+        let key = raw_key
+            .as_str()
+            .ok_or_else(|| invalid(path, "Yarn Berry lockfile entry keys must be strings"))?;
+        if key == "__metadata" {
+            continue;
+        }
+        let descriptors = split_yarn_descriptors(key).map_err(|error| {
+            invalid(
+                path,
+                format!("invalid Yarn Berry descriptor list {key:?}: {error}"),
+            )
+        })?;
+        for descriptor in &descriptors {
+            parse_yarn_locator(descriptor).map_err(|error| {
+                invalid(
+                    path,
+                    format!("invalid Yarn Berry descriptor {descriptor:?}: {error}"),
+                )
+            })?;
+        }
+        let entry = raw_entry
+            .as_mapping()
+            .ok_or_else(|| invalid(path, format!("Yarn Berry entry {key:?} must be a mapping")))?;
+        let version = entry
+            .get("version")
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("Yarn Berry entry {key:?} is missing a string version"),
+                )
+            })?;
+        let resolution = entry
+            .get("resolution")
+            .and_then(serde_yaml::Value::as_str)
+            .ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("Yarn Berry entry {key:?} is missing a string resolution"),
+                )
+            })?;
+        let locator = parse_yarn_locator(resolution).map_err(|error| {
+            invalid(
+                path,
+                format!("Yarn Berry entry {key:?} has invalid resolution {resolution:?}: {error}"),
+            )
+        })?;
+        let source = yarn_reference_source(locator.reference);
+        if source == YarnSource::Workspace {
+            continue;
+        }
+        if source == YarnSource::Registry {
+            validate_yarn_registry_version(
+                version,
+                locator.reference,
+                &format!("Yarn Berry entry {key:?}"),
+            )
+            .map_err(|error| invalid(path, error))?;
+        }
+        let (is_direct, is_dev, display_alias) =
+            yarn_direct_metadata(&descriptors, locator.name, direct).map_err(|error| {
+                invalid(
+                    path,
+                    format!("Yarn Berry entry {key:?} has invalid descriptor: {error}"),
+                )
+            })?;
+        let mut package = Package::new(Ecosystem::Npm, locator.name, version, path.to_path_buf());
+        package.direct = is_direct;
+        package.dev = is_dev;
+        package.enrichable = source == YarnSource::Registry;
+        if let Some(display_alias) = display_alias {
+            package.display_name = display_alias;
+        }
+        packages.push(package);
+    }
+    Ok(dedup(packages))
+}
+
+#[derive(Debug)]
+struct YarnClassicEntry {
+    key: String,
+    descriptors: Vec<String>,
+    version: Option<String>,
+    resolved: Option<String>,
+}
+
+fn parse_yarn_classic(
+    path: &Path,
+    text: &str,
+    direct: &HashMap<String, YarnDirectness>,
+) -> Result<Vec<Package>, ParseError> {
+    let mut packages = Vec::new();
+    let mut current: Option<YarnClassicEntry> = None;
+    for (line_index, line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            if let Some(entry) = current.take() {
+                push_yarn_classic_entry(path, entry, direct, &mut packages)?;
+            }
+            let key = line.strip_suffix(':').ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("invalid Yarn Classic entry header on line {line_number}"),
+                )
+            })?;
+            let descriptors = split_yarn_descriptors(key).map_err(|error| {
+                invalid(
+                    path,
+                    format!("invalid Yarn Classic descriptor list on line {line_number}: {error}"),
+                )
+            })?;
+            for descriptor in &descriptors {
+                parse_yarn_locator(descriptor).map_err(|error| {
+                    invalid(
+                        path,
+                        format!(
+                            "invalid Yarn Classic descriptor {descriptor:?} on line {line_number}: {error}"
+                        ),
+                    )
+                })?;
+            }
+            current = Some(YarnClassicEntry {
+                key: key.to_owned(),
+                descriptors,
+                version: None,
+                resolved: None,
+            });
+            continue;
+        }
+        if line.starts_with('\t') {
+            return Err(invalid(
+                path,
+                format!("Yarn Classic lockfile uses a tab for indentation on line {line_number}"),
+            ));
+        }
+        let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+        if indentation != 2 {
+            continue;
+        }
+        let entry = current.as_mut().ok_or_else(|| {
+            invalid(
+                path,
+                format!("Yarn Classic field appears before an entry on line {line_number}"),
+            )
+        })?;
+        let field = &line[indentation..];
+        if let Some(raw_version) = field.strip_prefix("version ") {
+            if entry.version.is_some() {
+                return Err(invalid(
+                    path,
+                    format!("Yarn Classic entry {:?} repeats version", entry.key),
+                ));
+            }
+            entry.version = Some(parse_yarn_scalar(raw_version).map_err(|error| {
+                invalid(
+                    path,
+                    format!("invalid Yarn Classic version on line {line_number}: {error}"),
+                )
+            })?);
+        } else if let Some(raw_resolved) = field.strip_prefix("resolved ") {
+            if entry.resolved.is_some() {
+                return Err(invalid(
+                    path,
+                    format!("Yarn Classic entry {:?} repeats resolved", entry.key),
+                ));
+            }
+            entry.resolved = Some(parse_yarn_scalar(raw_resolved).map_err(|error| {
+                invalid(
+                    path,
+                    format!("invalid Yarn Classic resolution on line {line_number}: {error}"),
+                )
+            })?);
+        }
+    }
+    if let Some(entry) = current {
+        push_yarn_classic_entry(path, entry, direct, &mut packages)?;
+    }
+    Ok(dedup(packages))
+}
+
+fn push_yarn_classic_entry(
+    path: &Path,
+    entry: YarnClassicEntry,
+    direct: &HashMap<String, YarnDirectness>,
+    packages: &mut Vec<Package>,
+) -> Result<(), ParseError> {
+    let version = entry.version.ok_or_else(|| {
+        invalid(
+            path,
+            format!("Yarn Classic entry {:?} is missing version", entry.key),
+        )
+    })?;
+    let mut source = None;
+    let mut package_name = None;
+    for descriptor in &entry.descriptors {
+        let locator = parse_yarn_locator(descriptor).map_err(|error| invalid(path, error))?;
+        let (descriptor_name, descriptor_source) = yarn_classic_descriptor_source(locator)
+            .map_err(|error| {
+                invalid(
+                    path,
+                    format!(
+                        "Yarn Classic entry {:?} has invalid source descriptor: {error}",
+                        entry.key
+                    ),
+                )
+            })?;
+        if source.is_some_and(|previous| previous != descriptor_source)
+            || package_name
+                .as_deref()
+                .is_some_and(|previous| previous != descriptor_name)
+        {
+            return Err(invalid(
+                path,
+                format!(
+                    "Yarn Classic entry {:?} mixes package identities or source protocols",
+                    entry.key
+                ),
+            ));
+        }
+        source = Some(descriptor_source);
+        package_name = Some(descriptor_name.to_owned());
+    }
+    let source = source.ok_or_else(|| invalid(path, "Yarn Classic entry has no descriptors"))?;
+    if source == YarnSource::Workspace {
+        return Ok(());
+    }
+    let package_name =
+        package_name.ok_or_else(|| invalid(path, "Yarn Classic entry has no package identity"))?;
+    if source == YarnSource::Registry {
+        semver::Version::parse(&version).map_err(|error| {
+            invalid(
+                path,
+                format!(
+                    "Yarn Classic entry {:?} has an invalid npm version {version:?}: {error}",
+                    entry.key
+                ),
+            )
+        })?;
+    }
+    let (is_direct, is_dev, display_alias) =
+        yarn_direct_metadata(&entry.descriptors, &package_name, direct).map_err(|error| {
+            invalid(
+                path,
+                format!(
+                    "Yarn Classic entry {:?} has invalid descriptor: {error}",
+                    entry.key
+                ),
+            )
+        })?;
+    let mut package = Package::new(Ecosystem::Npm, package_name, version, path.to_path_buf());
+    package.direct = is_direct;
+    package.dev = is_dev;
+    package.enrichable = source == YarnSource::Registry;
+    if let Some(display_alias) = display_alias {
+        package.display_name = display_alias;
+    }
+    packages.push(package);
+    Ok(())
+}
+
+fn yarn_classic_descriptor_source(locator: YarnLocator<'_>) -> Result<(&str, YarnSource), String> {
+    if let Some(alias) = locator.reference.strip_prefix("npm:") {
+        if alias.contains('@') {
+            let target = parse_yarn_locator(alias)?;
+            return Ok((target.name, YarnSource::Registry));
+        }
+        return Ok((locator.name, YarnSource::Registry));
+    }
+    let source = if locator.reference.starts_with("workspace:") {
+        YarnSource::Workspace
+    } else if locator.reference.contains(':') {
+        YarnSource::Other
+    } else {
+        YarnSource::Registry
+    };
+    Ok((locator.name, source))
 }
 
 fn parse_package_json_manifest(path: &Path) -> Result<Vec<Package>, ParseError> {

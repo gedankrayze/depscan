@@ -1,0 +1,16 @@
+{
+  "name": "berry-root",
+  "private": true,
+  "packageManager": "yarn@4.18.0",
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "@colors/colors": "1.6.0",
+    "@scope/alias": "npm:is-number@^7.0.0",
+    "kleur": "4.1.5",
+    "local-file": "file:vendor/local-file",
+    "workspace-pkg": "workspace:*"
+  },
+  "devDependencies": {
+    "is-odd": "3.0.1"
+  }
+}

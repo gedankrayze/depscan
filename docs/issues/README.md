@@ -27,7 +27,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-006](DS-006.md) | P0 | Closed | Remove vulnerable `quick-xml` release |
 | [DS-007](DS-007.md) | P1 | Closed | Parse Bun text-lock locators correctly |
 | [DS-008](DS-008.md) | P1 | Closed | Retain nested npm v2/v3 packages |
-| [DS-009](DS-009.md) | P1 | Open | Support Yarn Berry lockfiles |
+| [DS-009](DS-009.md) | P1 | Closed | Support Yarn Berry lockfiles |
 | [DS-010](DS-010.md) | P1 | Open | Scan all .NET projects and central package versions |
 | [DS-011](DS-011.md) | P1 | Closed | Make Cargo manifest parsing workspace- and rename-aware |
 | [DS-012](DS-012.md) | P1 | Open | Preserve uv/Poetry source, directness, and group provenance |
