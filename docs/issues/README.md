@@ -51,7 +51,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-030](DS-030.md) | P1 | Open | Enforce offline dump age and use cached registry metadata |
 | [DS-031](DS-031.md) | P1 | Open | Implement exact retry and `Retry-After` semantics |
 | [DS-032](DS-032.md) | P1 | Open | Reject malformed offline advisory documents |
-| [DS-033](DS-033.md) | P1 | Open | Reject malformed crates.io sparse-index lines |
+| [DS-033](DS-033.md) | P1 | Closed | Reject malformed crates.io sparse-index lines |
 | [DS-034](DS-034.md) | P1 | Open | Make cache clearing safe for arbitrary configured paths |
 | [DS-035](DS-035.md) | P1 | Open | Isolate partial OSV failures as per-package soft errors |
 | [DS-036](DS-036.md) | P1 | Open | Parse Poetry constraints without inventing packages |

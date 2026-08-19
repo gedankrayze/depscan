@@ -41,6 +41,9 @@ const OSV_QUERY_TTL_SECS: i64 = 60 * 60;
 const REGISTRY_TTL_SECS: i64 = 6 * 60 * 60;
 const CRATES_IO_INDEX_BASE_URL: &str = "https://index.crates.io";
 const CRATES_IO_MAX_NAME_LEN: usize = 64;
+const CRATES_IO_MAX_INDEX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const CRATES_IO_MAX_INDEX_LINE_BYTES: usize = 1024 * 1024;
+const CRATES_IO_INDEX_CACHE_SCHEMA_VERSION: u32 = 1;
 
 fn osv_query_name(package: &Package) -> &str {
     match package.ecosystem {
@@ -311,6 +314,51 @@ impl HttpClient {
             .await
             .map(|b| b.to_vec())
             .map_err(|e| ProviderError::Network(format!("{url}: {e}")))
+    }
+
+    async fn get_bytes_limited(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let mut response = self
+            .inner
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?
+            .error_for_status()
+            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?;
+        let content_length = response.content_length();
+        if content_length.is_some_and(|length| length > max_bytes as u64) {
+            return Err(ProviderError::InvalidResponse(format!(
+                "{url}: response exceeds the {max_bytes}-byte limit"
+            )));
+        }
+
+        let initial_capacity = content_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(max_bytes);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ProviderError::Network(format!("{url}: {e}")))?
+        {
+            let Some(new_len) = bytes.len().checked_add(chunk.len()) else {
+                return Err(ProviderError::InvalidResponse(format!(
+                    "{url}: response size overflowed"
+                )));
+            };
+            if new_len > max_bytes {
+                return Err(ProviderError::InvalidResponse(format!(
+                    "{url}: response exceeds the {max_bytes}-byte limit"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 }
 
@@ -929,26 +977,17 @@ impl RegistryClient {
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         let name = &p.name;
         let url = format!("{}/{path}", self.crates_index_base_url);
-        let data = self
-            .crates_metadata_for_index(&format!("crates:{}", name), &url)
+        let entries = self
+            .crates_metadata_for_index(&format!("crates:{}", name), name, &url)
             .await?;
-        let lines = data
-            .get("lines")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
         let mut all: Vec<String> = Vec::new();
         let mut yanked = false;
-        for line in lines {
-            if let Some(version) = line.get("vers").and_then(Value::as_str) {
-                if version == p.version {
-                    yanked = line.get("yanked").and_then(Value::as_bool).unwrap_or(false);
-                }
-                if !line.get("yanked").and_then(Value::as_bool).unwrap_or(false)
-                    && !is_prerelease(Ecosystem::CratesIo, version)
-                {
-                    all.push(version.to_owned());
-                }
+        for entry in entries {
+            if entry.vers == p.version {
+                yanked = entry.yanked;
+            }
+            if !entry.yanked && !is_prerelease(Ecosystem::CratesIo, &entry.vers) {
+                all.push(entry.vers);
             }
         }
         let latest = maximum_version(Ecosystem::CratesIo, all.iter().map(String::as_str))
@@ -1029,28 +1068,174 @@ fn is_prerelease(eco: Ecosystem, version: &str) -> bool {
     }
 }
 
-// crates.io sparse-index entries are newline-delimited JSON. Convert the raw bytes into a JSON
-// envelope before cache storage so the generic cache can retain it without a special format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CratesIndexEntry {
+    name: String,
+    vers: String,
+    yanked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CratesIndexCache {
+    schema_version: u32,
+    entries: Vec<CratesIndexEntry>,
+}
+
+fn invalid_sparse_index(source: &str, message: impl std::fmt::Display) -> ProviderError {
+    ProviderError::InvalidResponse(format!("{source}: {message}"))
+}
+
+fn invalid_sparse_index_line(
+    source: &str,
+    line_number: usize,
+    message: impl std::fmt::Display,
+) -> ProviderError {
+    invalid_sparse_index(
+        source,
+        format_args!("sparse-index line {line_number}: {message}"),
+    )
+}
+
+fn validate_crates_index_entries<'a>(
+    entries: impl IntoIterator<Item = (usize, &'a CratesIndexEntry)>,
+    expected_name: &str,
+    source: &str,
+) -> Result<(), ProviderError> {
+    let mut seen_versions: HashMap<&'a str, usize> = HashMap::new();
+    let mut entry_count = 0_usize;
+
+    for (line_number, entry) in entries {
+        entry_count += 1;
+        if !entry.name.eq_ignore_ascii_case(expected_name) {
+            return Err(invalid_sparse_index_line(
+                source,
+                line_number,
+                format_args!(
+                    "crate name {:?} does not match requested crate {expected_name:?}",
+                    entry.name
+                ),
+            ));
+        }
+        semver::Version::parse(&entry.vers).map_err(|error| {
+            invalid_sparse_index_line(
+                source,
+                line_number,
+                format_args!("field `vers` is not valid SemVer: {error}"),
+            )
+        })?;
+        if let Some(first_line) = seen_versions.insert(&entry.vers, line_number) {
+            return Err(invalid_sparse_index_line(
+                source,
+                line_number,
+                format_args!(
+                    "duplicate version {:?}; first declared on line {first_line}",
+                    entry.vers
+                ),
+            ));
+        }
+    }
+
+    if entry_count == 0 {
+        return Err(invalid_sparse_index(
+            source,
+            "sparse index contains no version entries",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_crates_index(
+    bytes: &[u8],
+    expected_name: &str,
+    source: &str,
+) -> Result<Vec<CratesIndexEntry>, ProviderError> {
+    if bytes.len() > CRATES_IO_MAX_INDEX_RESPONSE_BYTES {
+        return Err(invalid_sparse_index(
+            source,
+            format_args!("response exceeds the {CRATES_IO_MAX_INDEX_RESPONSE_BYTES}-byte limit"),
+        ));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        let line_number = bytes[..error.valid_up_to()]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count()
+            + 1;
+        invalid_sparse_index_line(source, line_number, "line is not valid UTF-8")
+    })?;
+    let mut parsed = Vec::new();
+
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > CRATES_IO_MAX_INDEX_LINE_BYTES {
+            return Err(invalid_sparse_index_line(
+                source,
+                line_number,
+                format_args!("line exceeds the {CRATES_IO_MAX_INDEX_LINE_BYTES}-byte limit"),
+            ));
+        }
+        let entry = serde_json::from_str::<CratesIndexEntry>(line).map_err(|error| {
+            invalid_sparse_index_line(source, line_number, format_args!("invalid JSON: {error}"))
+        })?;
+        parsed.push((line_number, entry));
+    }
+
+    validate_crates_index_entries(
+        parsed
+            .iter()
+            .map(|(line_number, entry)| (*line_number, entry)),
+        expected_name,
+        source,
+    )?;
+    Ok(parsed.into_iter().map(|(_, entry)| entry).collect())
+}
+
+// crates.io sparse-index entries are newline-delimited JSON. Decode and validate the entire
+// response before writing the versioned cache envelope, so a truncated response cannot be reused.
 impl RegistryClient {
     async fn crates_metadata_for_index(
         &self,
         key: &str,
+        expected_name: &str,
         url: &str,
-    ) -> Result<Value, ProviderError> {
+    ) -> Result<Vec<CratesIndexEntry>, ProviderError> {
         if let Some((value, _)) =
             self.cache
                 .get("registry", key, Duration::seconds(REGISTRY_TTL_SECS))
         {
-            return Ok(value);
+            if let Ok(cached) = serde_json::from_value::<CratesIndexCache>(value)
+                && cached.schema_version == CRATES_IO_INDEX_CACHE_SCHEMA_VERSION
+                && validate_crates_index_entries(
+                    cached
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| (index + 1, entry)),
+                    expected_name,
+                    "cached crates.io sparse index",
+                )
+                .is_ok()
+            {
+                return Ok(cached.entries);
+            }
+            debug!(%key, "ignoring legacy or invalid crates.io sparse-index cache entry");
         }
-        let bytes = self.http.get_bytes(url).await?;
-        let lines: Vec<Value> = String::from_utf8_lossy(&bytes)
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        let value = json!({"lines": lines});
+        let bytes = self
+            .http
+            .get_bytes_limited(url, CRATES_IO_MAX_INDEX_RESPONSE_BYTES)
+            .await?;
+        let entries = decode_crates_index(&bytes, expected_name, url)?;
+        let value = serde_json::to_value(CratesIndexCache {
+            schema_version: CRATES_IO_INDEX_CACHE_SCHEMA_VERSION,
+            entries: entries.clone(),
+        })
+        .map_err(|error| ProviderError::Cache(error.to_string()))?;
         self.cache.put("registry", key, &value, None)?;
-        Ok(value)
+        Ok(entries)
     }
 }
 
@@ -1155,6 +1340,46 @@ mod tests {
             }
             other => panic!("expected a typed package-name error for {name:?}, got {other:?}"),
         }
+    }
+
+    async fn assert_invalid_sparse_response(body: Vec<u8>, expected_fragments: &[&str]) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fi/xt/fixture"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let cache_file = cache.filename("registry", "crates:fixture");
+        let cache_temp_file = cache_file.with_extension("json.tmp");
+        let client = RegistryClient::with_crates_index_base_url(
+            HttpClient::new().unwrap(),
+            cache,
+            server.uri(),
+        );
+
+        let error = client.latest(&crates_package("fixture")).await.unwrap_err();
+        let message = match error {
+            ProviderError::InvalidResponse(message) => message,
+            other => panic!("expected invalid-response error, got {other:?}"),
+        };
+        for fragment in expected_fragments {
+            assert!(
+                message.contains(fragment),
+                "expected {message:?} to contain {fragment:?}"
+            );
+        }
+        assert!(!cache_file.exists(), "invalid response was cached");
+        assert!(
+            !cache_temp_file.exists(),
+            "invalid response left a partial cache file"
+        );
+        server.verify().await;
     }
 
     #[test]
@@ -1425,8 +1650,8 @@ mod tests {
             ("A-B", "/3/a/a-b"),
             ("Serde_JSON", "/se/rd/serde_json"),
         ];
-        let body = "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false}\n";
-        for (_, expected_path) in cases {
+        for (name, expected_path) in cases {
+            let body = format!("{{\"name\":\"{name}\",\"vers\":\"1.0.0\",\"yanked\":false}}\n");
             Mock::given(method("GET"))
                 .and(path(expected_path))
                 .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/plain"))
@@ -1488,6 +1713,163 @@ mod tests {
             }
         }
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn accepts_complete_sparse_ndjson_and_reuses_the_validated_cache() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "\n",
+            "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":true}\r\n",
+            "\n",
+            "{\"name\":\"fixture\",\"vers\":\"2.0.0\",\"yanked\":false}\n",
+        );
+        Mock::given(method("GET"))
+            .and(path("/fi/xt/fixture"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/plain"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let cache_file = cache.filename("registry", "crates:fixture");
+        let client = RegistryClient::with_crates_index_base_url(
+            HttpClient::new().unwrap(),
+            cache,
+            server.uri(),
+        );
+        let package = crates_package("fixture");
+
+        for _ in 0..2 {
+            let latest = client.latest(&package).await.unwrap();
+            assert_eq!(latest.latest_stable, "2.0.0");
+            assert!(latest.yanked);
+        }
+
+        let stored: Value =
+            serde_json::from_str(&fs::read_to_string(&cache_file).unwrap()).unwrap();
+        assert_eq!(
+            stored
+                .pointer("/value/schema_version")
+                .and_then(Value::as_u64),
+            Some(u64::from(CRATES_IO_INDEX_CACHE_SCHEMA_VERSION))
+        );
+        assert_eq!(
+            stored
+                .pointer("/value/entries")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_utf8_with_the_source_line_number() {
+        let mut body = b"{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false}\n".to_vec();
+        body.extend_from_slice(&[0xff, b'\n']);
+
+        assert_invalid_sparse_response(body, &["sparse-index line 2", "not valid UTF-8"]).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_a_malformed_line_between_valid_entries() {
+        let body = concat!(
+            "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+            "{\"name\":\"fixture\",\"vers\":\"1.1.0\"\n",
+            "{\"name\":\"fixture\",\"vers\":\"2.0.0\",\"yanked\":false}\n",
+        );
+
+        assert_invalid_sparse_response(
+            body.as_bytes().to_vec(),
+            &["sparse-index line 2", "invalid JSON"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejects_a_truncated_final_sparse_index_line() {
+        let body = concat!(
+            "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+            "{\"name\":\"fixture\",\"vers\":\"2.0.0\"",
+        );
+
+        assert_invalid_sparse_response(
+            body.as_bytes().to_vec(),
+            &["sparse-index line 2", "invalid JSON"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_wrong_or_invalid_selection_fields() {
+        let cases = [
+            (
+                "{\"vers\":\"1.0.0\",\"yanked\":false}\n",
+                vec!["sparse-index line 1", "missing field `name`"],
+            ),
+            (
+                "{\"name\":7,\"vers\":\"1.0.0\",\"yanked\":false}\n",
+                vec!["sparse-index line 1", "invalid type"],
+            ),
+            (
+                "{\"name\":\"fixture\",\"yanked\":false}\n",
+                vec!["sparse-index line 1", "missing field `vers`"],
+            ),
+            (
+                "{\"name\":\"fixture\",\"vers\":false,\"yanked\":false}\n",
+                vec!["sparse-index line 1", "invalid type"],
+            ),
+            (
+                "{\"name\":\"fixture\",\"vers\":\"not-semver\",\"yanked\":false}\n",
+                vec!["sparse-index line 1", "field `vers` is not valid SemVer"],
+            ),
+            (
+                "{\"name\":\"fixture\",\"vers\":\"1.0.0\"}\n",
+                vec!["sparse-index line 1", "missing field `yanked`"],
+            ),
+            (
+                "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":\"no\"}\n",
+                vec!["sparse-index line 1", "invalid type"],
+            ),
+            (
+                "{\"name\":\"different\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+                vec!["sparse-index line 1", "does not match requested crate"],
+            ),
+            ("", vec!["contains no version entries"]),
+        ];
+
+        for (body, expected_fragments) in cases {
+            assert_invalid_sparse_response(body.as_bytes().to_vec(), &expected_fragments).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_or_conflicting_version_records() {
+        let body = concat!(
+            "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+            "{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":true}\n",
+        );
+
+        assert_invalid_sparse_response(
+            body.as_bytes().to_vec(),
+            &["sparse-index line 2", "duplicate version", "line 1"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_sparse_index_lines() {
+        let padding = "x".repeat(CRATES_IO_MAX_INDEX_LINE_BYTES);
+        let body = format!(
+            "{{\"name\":\"fixture\",\"vers\":\"1.0.0\",\"yanked\":false,\"padding\":\"{padding}\"}}\n"
+        );
+
+        assert_invalid_sparse_response(body.into_bytes(), &["sparse-index line 1", "line exceeds"])
+            .await;
     }
 
     #[test]

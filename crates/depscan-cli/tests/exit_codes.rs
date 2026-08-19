@@ -73,7 +73,7 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
             "registry",
             REGISTRY_DIGEST,
             &format!(
-                r#"{{"lines":[{{"vers":"1.0.0","yanked":false}},{{"vers":"{latest}","yanked":false}}]}}"#
+                r#"{{"schema_version":1,"entries":[{{"name":"demo","vers":"1.0.0","yanked":false}},{{"name":"demo","vers":"{latest}","yanked":false}}]}}"#
             ),
         );
     }
