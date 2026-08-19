@@ -17,6 +17,7 @@ include = ["src/**", "tests/**", "LICENSE"]
 depscan-core.workspace = true
 glob.workspace = true
 pep440_rs.workspace = true
+pep508_rs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 noyalib.workspace = true
@@ -25,6 +26,7 @@ toml.workspace = true
 walkdir.workspace = true
 quick-xml.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["json"] }

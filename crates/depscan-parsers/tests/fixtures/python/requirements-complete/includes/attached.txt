@@ -1,0 +1,1 @@
+Attached_Pkg==3.0 --config-settings=build=fast -Ceditable_mode=compat

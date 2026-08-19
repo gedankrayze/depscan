@@ -1,0 +1,3 @@
+Public_Looking==1.0
+range-package>=2
+--extra-index-url=https://packages.example.invalid/simple

@@ -1,0 +1,2 @@
+-c conflict.txt
+safe==1.0

@@ -1,0 +1,3 @@
+constraint-only<3
+urllib3<2.8
+Requests==2.32.5

@@ -1,10 +1,16 @@
 use super::{dedup, invalid};
-use depscan_core::{Ecosystem, Package, ParseError};
+use depscan_core::{Ecosystem, Package, ParseError, normalize_name};
+use pep440_rs::{Version as Pep440Version, VersionSpecifiers};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
 };
+
+mod syntax;
+
+use syntax::{ConstraintSpec, GlobalOption, IncludeKind, ParsedLine};
 
 const MAX_INCLUDE_DEPTH: usize = 32;
 const MAX_REQUIREMENTS_FILES: usize = 256;
@@ -29,6 +35,12 @@ impl Default for RequirementsLimits {
 
 pub(crate) fn parse(path: &Path) -> Result<Vec<Package>, ParseError> {
     parse_with_limits(path, RequirementsLimits::default())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileRole {
+    Requirement,
+    Constraint,
 }
 
 fn parse_with_limits(path: &Path, limits: RequirementsLimits) -> Result<Vec<Package>, ParseError> {
@@ -61,8 +73,24 @@ fn parse_with_limits(path: &Path, limits: RequirementsLimits) -> Result<Vec<Pack
         active: Vec::new(),
         files_read: 0,
         bytes_read: 0,
+        registry_origin_ambiguous: false,
+        range_resolution_ambiguous: false,
+        constraints: BTreeMap::new(),
     };
-    parser.parse_file(path).map(dedup)
+    let mut packages = parser.parse_file(path, FileRole::Requirement)?;
+    apply_constraints(path, &mut packages, &parser.constraints)?;
+    if parser.registry_origin_ambiguous {
+        for package in &mut packages {
+            package.enrichable = false;
+        }
+    } else if parser.range_resolution_ambiguous {
+        for package in &mut packages {
+            if package.resolved_from_range {
+                package.enrichable = false;
+            }
+        }
+    }
+    Ok(dedup(packages))
 }
 
 struct RequirementsParser {
@@ -71,10 +99,90 @@ struct RequirementsParser {
     active: Vec<PathBuf>,
     files_read: usize,
     bytes_read: u64,
+    registry_origin_ambiguous: bool,
+    range_resolution_ambiguous: bool,
+    constraints: BTreeMap<String, Vec<ConstraintSpec>>,
+}
+
+fn apply_constraints(
+    root: &Path,
+    packages: &mut [Package],
+    constraints: &BTreeMap<String, Vec<ConstraintSpec>>,
+) -> Result<(), ParseError> {
+    for package in packages {
+        let Some(additional) = constraints.get(&package.name) else {
+            continue;
+        };
+        if let Some(declared) = package.manifest_constraint.take() {
+            let raw = std::iter::once(declared.raw())
+                .chain(additional.iter().map(|constraint| constraint.raw.as_str()))
+                .filter(|constraint| *constraint != "*")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let normalized = std::iter::once(declared.normalized())
+                .chain(
+                    additional
+                        .iter()
+                        .map(|constraint| constraint.normalized.as_str()),
+                )
+                .collect::<Vec<_>>()
+                .join(",");
+            let normalized = normalized
+                .parse::<VersionSpecifiers>()
+                .map_err(|error| {
+                    invalid(
+                        root,
+                        format!(
+                            "combined constraint for {:?} is invalid: {error}",
+                            package.display_name
+                        ),
+                    )
+                })?
+                .to_string();
+            package.set_normalized_manifest_constraint(
+                if raw.is_empty() { "*" } else { &raw },
+                normalized,
+            );
+        } else if !package.resolved_from_range {
+            let normalized = additional
+                .iter()
+                .map(|constraint| constraint.normalized.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let specifiers = normalized.parse::<VersionSpecifiers>().map_err(|error| {
+                invalid(
+                    root,
+                    format!(
+                        "constraint for {:?} is invalid: {error}",
+                        package.display_name
+                    ),
+                )
+            })?;
+            let version = package.version.parse::<Pep440Version>().map_err(|error| {
+                invalid(
+                    root,
+                    format!(
+                        "pinned version for {:?} is invalid: {error}",
+                        package.display_name
+                    ),
+                )
+            })?;
+            if !specifiers.contains(&version) {
+                return Err(invalid(
+                    root,
+                    format!(
+                        "pinned requirement {:?}=={} conflicts with its constraints",
+                        package.display_name, package.version
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl RequirementsParser {
-    fn parse_file(&mut self, requested: &Path) -> Result<Vec<Package>, ParseError> {
+    fn parse_file(&mut self, requested: &Path, role: FileRole) -> Result<Vec<Package>, ParseError> {
         let depth = self.active.len();
         if depth > self.limits.include_depth {
             return Err(self.rejected(
@@ -131,12 +239,16 @@ impl RequirementsParser {
         }
 
         self.active.push(canonical.clone());
-        let result = self.read_and_parse(&canonical);
+        let result = self.read_and_parse(&canonical, role);
         self.active.pop();
         result
     }
 
-    fn read_and_parse(&mut self, canonical: &Path) -> Result<Vec<Package>, ParseError> {
+    fn read_and_parse(
+        &mut self,
+        canonical: &Path,
+        role: FileRole,
+    ) -> Result<Vec<Package>, ParseError> {
         let file = File::open(canonical).map_err(|error| {
             self.current_error(canonical, format!("cannot open requirements file: {error}"))
         })?;
@@ -186,61 +298,122 @@ impl RequirementsParser {
                 format!("requirements file is not valid UTF-8: {error}"),
             )
         })?;
-        self.parse_text(canonical, &text)
+        self.parse_text(canonical, &text, role)
     }
 
-    fn parse_text(&mut self, canonical: &Path, text: &str) -> Result<Vec<Package>, ParseError> {
+    fn parse_text(
+        &mut self,
+        canonical: &Path,
+        text: &str,
+        role: FileRole,
+    ) -> Result<Vec<Package>, ParseError> {
         let mut packages = Vec::new();
-        for raw in text.lines() {
-            let line = raw.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(include) = include_target(line) {
-                if include.is_empty() {
-                    return Err(
-                        self.current_error(canonical, "requirements include target is empty")
+        let logical_lines = syntax::logical_lines(text).map_err(|error| {
+            self.current_error(
+                canonical,
+                format!("invalid requirements syntax: {}", error.message()),
+            )
+        })?;
+        let base = canonical.parent().unwrap_or(&self.root).to_path_buf();
+        for logical in logical_lines {
+            let parsed = syntax::parse_line(&logical.text, &base).map_err(|error| {
+                self.current_error(
+                    canonical,
+                    format!(
+                        "invalid requirements syntax at line {}: {}",
+                        logical.number,
+                        error.message()
+                    ),
+                )
+            })?;
+            match parsed {
+                ParsedLine::Empty | ParsedLine::Global(GlobalOption::Ignored) => {}
+                ParsedLine::Global(GlobalOption::AmbiguousRegistry) => {
+                    self.registry_origin_ambiguous = true;
+                }
+                ParsedLine::Global(GlobalOption::AmbiguousRangeResolution) => {
+                    self.range_resolution_ambiguous = true;
+                    tracing::warn!(
+                        source_file = %canonical.display(),
+                        line = logical.number,
+                        "requirements option changes release selection; range freshness is disabled"
                     );
                 }
-                let include_path = Path::new(include);
-                let requested = if include_path.is_absolute() {
-                    include_path.to_path_buf()
-                } else {
-                    canonical.parent().unwrap_or(&self.root).join(include_path)
-                };
-                packages.extend(self.parse_file(&requested)?);
-                continue;
-            }
-            if line.starts_with("--hash") || line.starts_with("--") {
-                continue;
-            }
-            let requirement = line.split(';').next().unwrap_or(line).trim();
-            let operator = requirement.find(['<', '>', '~', '!', '=']);
-            let name_end = operator.unwrap_or(requirement.len());
-            let name_with_extras = requirement[..name_end].trim();
-            let name = name_with_extras
-                .split_once('[')
-                .map_or(name_with_extras, |(name, _)| name)
-                .trim();
-            let constraint = operator.map_or("", |index| requirement[index..].trim());
-            if let Some(version) = constraint.strip_prefix("==")
-                && !version.contains('*')
-                && !name.is_empty()
-            {
-                let mut package = Package::new(
-                    Ecosystem::PyPI,
-                    name,
-                    version.trim(),
-                    canonical.to_path_buf(),
-                );
-                package.direct = true;
-                packages.push(package);
-            } else if !name.is_empty() && !constraint.is_empty() {
-                let mut package =
-                    Package::new(Ecosystem::PyPI, name, constraint, canonical.to_path_buf());
-                package.direct = true;
-                package.set_manifest_constraint(constraint);
-                packages.push(package);
+                ParsedLine::Include { kind, target } => {
+                    if target.contains("://") {
+                        return Err(self.current_error(
+                            canonical,
+                            format!(
+                                "remote requirements include at line {} is not supported; includes must remain inside the scan root",
+                                logical.number
+                            ),
+                        ));
+                    }
+                    let include_path = Path::new(&target);
+                    let requested = if include_path.is_absolute() {
+                        include_path.to_path_buf()
+                    } else {
+                        base.join(include_path)
+                    };
+                    let include_role = match kind {
+                        IncludeKind::Requirement => role,
+                        IncludeKind::Constraint => FileRole::Constraint,
+                    };
+                    packages.extend(self.parse_file(&requested, include_role)?);
+                }
+                ParsedLine::Package(spec) => {
+                    if spec.has_marker {
+                        tracing::warn!(
+                            source_file = %canonical.display(),
+                            line = logical.number,
+                            "requirements environment marker is assumed true"
+                        );
+                    }
+                    if role == FileRole::Constraint {
+                        if !spec.constraint_compatible {
+                            return Err(self.current_error(
+                                canonical,
+                                format!(
+                                    "invalid constraint at line {}: constraints must be named, non-editable requirements without extras or direct URLs",
+                                    logical.number
+                                ),
+                            ));
+                        }
+                        let constraint = spec.registry_constraint.ok_or_else(|| {
+                            self.current_error(
+                                canonical,
+                                format!(
+                                    "invalid constraint at line {}: constraint has no registry version expression",
+                                    logical.number
+                                ),
+                            )
+                        })?;
+                        self.constraints
+                            .entry(normalize_name(Ecosystem::PyPI, &spec.display_name))
+                            .or_default()
+                            .push(constraint);
+                        continue;
+                    }
+                    let mut package = Package::new(
+                        Ecosystem::PyPI,
+                        spec.display_name,
+                        spec.version,
+                        canonical.to_path_buf(),
+                    );
+                    package.direct = true;
+                    package.dev_known = false;
+                    package.enrichable = spec.enrichable;
+                    package.resolved_from_range = spec.resolved_from_range;
+                    if spec.resolved_from_range
+                        && let Some(constraint) = spec.registry_constraint
+                    {
+                        package.set_normalized_manifest_constraint(
+                            constraint.raw,
+                            constraint.normalized,
+                        );
+                    }
+                    packages.push(package);
+                }
             }
         }
         Ok(packages)
@@ -276,16 +449,6 @@ impl RequirementsParser {
             .collect::<Vec<_>>()
             .join(" -> ")
     }
-}
-
-fn include_target(line: &str) -> Option<&str> {
-    ["-r", "--requirement"].into_iter().find_map(|prefix| {
-        let rest = line.strip_prefix(prefix)?;
-        rest.chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-            .then(|| rest.trim())
-    })
 }
 
 #[cfg(test)]
@@ -362,7 +525,7 @@ mod tests {
         assert_eq!(packages[0].version, ">=1.0,<2.0,!=1.5");
         let constraint = packages[0].manifest_constraint.as_ref().unwrap();
         assert_eq!(constraint.raw(), ">=1.0,<2.0,!=1.5");
-        assert_eq!(constraint.normalized(), constraint.raw());
+        assert_eq!(constraint.normalized(), ">=1.0, !=1.5, <2.0");
     }
 
     #[test]

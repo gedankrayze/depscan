@@ -56,6 +56,7 @@ walkdir = "2.5.0"
 quick-xml = { version = "0.41.0", features = ["serialize"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 pep440_rs = "0.7.3"
+pep508_rs = "0.9.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

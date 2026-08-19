@@ -56,7 +56,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-035](DS-035.md) | P1 | Open | Isolate partial OSV failures as per-package soft errors |
 | [DS-036](DS-036.md) | P1 | Open | Parse Poetry constraints without inventing packages |
 | [DS-037](DS-037.md) | P1 | Closed | Distinguish direct and transitive Pipfile.lock packages |
-| [DS-038](DS-038.md) | P1 | Open | Parse requirements options, includes, and extras correctly |
+| [DS-038](DS-038.md) | P1 | Closed | Parse requirements options, includes, and extras correctly |
 | [DS-039](DS-039.md) | P1 | Closed | Implement NuGet prerelease precedence correctly |
 | [DS-040](DS-040.md) | P1 | Open | Reject malformed or unsupported lockfile schemas instead of returning empty |
 | [DS-041](DS-041.md) | P1 | Closed | Error when an explicitly requested config file is missing |

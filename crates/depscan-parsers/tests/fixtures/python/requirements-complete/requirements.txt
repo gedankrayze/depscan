@@ -1,0 +1,23 @@
+# Supported global options must not become package names.
+--require-hashes
+--pre
+--no-binary :none:
+--only-binary=:none:
+--trusted-host pypi.org
+--use-feature=fast-deps
+
+# Both separated and attached include forms are intentional.
+--requirement includes/base.txt
+-rincludes/attached.txt
+--requirement=includes/equal.txt
+-c constraints.txt
+
+Requests[Security, socks] == 2.32.5 ; python_version >= "3.9" \
+    --hash=sha256:aaaa \
+    --hash sha256:bbbb
+urllib3 >= 2, < 3 ; sys_platform == "linux"
+UnPinned_Name[PDF]
+Named_URL[Extra] @ https://example.invalid/archive.zip ; python_version >= "3.10"
+-e git+https://example.invalid/repo.git@main#egg=Editable_Pkg[dev]
+https://example.invalid/files/Archive_Pkg-4.2.0.tar.gz#sha256=cccc
+./vendor/Local_Wheel-5.0-py3-none-any.whl[feature]
