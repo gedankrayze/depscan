@@ -180,6 +180,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-065 | exact all-target Clippy, focused CLI secure-filesystem and exit-code harnesses, and native Windows strict-Clippy jobs `96352453674` / `96352465577` |
 | DS-066 | platform-specific exact help snapshots, canonical cache-path assertion, complete CLI exit-code harness, and native Windows quality rerun |
 | DS-067 | canonical-root Cargo source snapshots, complete `cargo_manifest` integration harness, exact Clippy, and native Windows quality rerun |
+| DS-068 | actionlint, immutable-pin inventory, official Node 24 runtime metadata, and protected CI/static/release reruns |
 
 ## Platform and external evidence boundary
 
