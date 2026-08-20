@@ -21,6 +21,8 @@ jobs:
         run: scripts/verify-release-workflow.sh
       - name: Verify composite-action metadata and invocation
         run: bash scripts/verify-github-action.sh
+      - name: Verify Rust module boundaries
+        run: bash scripts/check-rust-architecture.sh
       - name: Check formatting
         run: cargo +1.97.1 fmt --all -- --check
       - name: Test every target

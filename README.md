@@ -232,7 +232,13 @@ The workspace is divided at its architectural boundaries:
 | `depscan-report` | Table, JSON, SARIF 2.1.0, and summary renderers. |
 | `depscan-cli` | CLI, config, orchestration, filters, and exit policy. |
 
+Rust modules have a hard 400-line ceiling. Production responsibilities should be extracted before
+they reach that boundary, and executable tests live in dedicated `tests.rs` or `tests/` modules
+rather than alongside production implementations. The architecture check runs in pull-request and
+release quality gates without an exception list.
+
 ```bash
+bash scripts/check-rust-architecture.sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace --all-targets
