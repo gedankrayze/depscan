@@ -23,6 +23,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
         with:
           components: rustfmt, clippy
+      - name: Verify Rust module boundaries
+        if: runner.os == 'Linux'
+        run: bash scripts/check-rust-architecture.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint

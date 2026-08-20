@@ -164,7 +164,7 @@ expected_args="$probe_root/expected.args"
 printf '%s\n' \
   scan \
   --ecosystem npm \
-  --format json \
+  --format markdown \
   --output "$output_path" \
   --fail-on high \
   --fail-on-outdated minor \
@@ -177,7 +177,7 @@ printf '%s\n' \
 installed_capture="$probe_root/installed.args"
 installed_marker="$probe_root/installed-started"
 PATH="$decoy_directory:$PATH" \
-  run_driver "" "$trusted_binary" json "$installed_capture" "$installed_marker" 0
+  run_driver "" "$trusted_binary" markdown "$installed_capture" "$installed_marker" 0
 diff -u "$expected_args" "$installed_capture"
 test -f "$installed_marker"
 test ! -e "$decoy_marker"
@@ -190,7 +190,7 @@ override_marker="$probe_root/override-started"
   run_driver \
     "override bin/depscan-local" \
     "$decoy_binary" \
-    json \
+    markdown \
     "$override_capture" \
     "$override_marker" \
     0

@@ -4,9 +4,11 @@ set -euo pipefail
 release_workflow=.github/workflows/release.yml
 quality_workflow=.github/workflows/release-quality.yml
 acceptance_workflow=.github/workflows/release-acceptance.yml
+ci_workflow=.github/workflows/ci.yml
 asset_contract=.github/release-assets.txt
 asset_verifier=scripts/verify-release-assets.sh
 static_verifier=scripts/verify-static-linux.sh
+architecture_verifier=scripts/check-rust-architecture.sh
 installer_action=.github/actions/install-cargo-dist/action.yml
 installer_unix=.github/actions/install-cargo-dist/install-cargo-dist.sh
 installer_windows=.github/actions/install-cargo-dist/install-cargo-dist.ps1
@@ -16,9 +18,11 @@ for required_file in \
   "$release_workflow" \
   "$quality_workflow" \
   "$acceptance_workflow" \
+  "$ci_workflow" \
   "$asset_contract" \
   "$asset_verifier" \
   "$static_verifier" \
+  "$architecture_verifier" \
   "$installer_action" \
   "$installer_unix" \
   "$installer_windows" \
@@ -28,6 +32,12 @@ for required_file in \
     exit 1
   fi
 done
+
+if [[ $(grep -Fc 'run: bash scripts/check-rust-architecture.sh' "$ci_workflow") -ne 1 ]] ||
+  [[ $(grep -Fc 'run: bash scripts/check-rust-architecture.sh' "$quality_workflow") -ne 1 ]]; then
+  echo "CI and release quality must enforce the Rust architecture check exactly once" >&2
+  exit 1
+fi
 
 unpinned_actions=$(
   grep -hE '^[[:space:]-]*uses:' "$release_workflow" "$quality_workflow" "$acceptance_workflow" \
@@ -231,7 +241,7 @@ for mapping in \
     exit 1
   fi
 done
-grep -Fq '          ref: v1.1.0' "$acceptance_workflow"
+grep -Fq '          ref: v1.2.0' "$acceptance_workflow"
 grep -Fq '          persist-credentials: false' "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '[[ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]' "$acceptance_workflow"
@@ -258,7 +268,7 @@ if [[ $(grep -Fc 'uses: ./release-source' "$acceptance_workflow") -ne 1 ]] \
   echo "release acceptance must use the immutable local tag checkout once without a binary override" >&2
   exit 1
 fi
-grep -Fq '          version: v1.1.0' "$acceptance_workflow"
+grep -Fq '          version: v1.2.0' "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '          output: ${{ runner.temp }}/depscan-published-action-summary.txt' "$acceptance_workflow"
 grep -Fq '          offline: "true"' "$acceptance_workflow"

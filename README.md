@@ -2,8 +2,8 @@
 
 `depscan` is a Rust CLI that scans resolved project dependencies for **known vulnerabilities** through [OSV.dev](https://osv.dev) and for **available updates** through the corresponding native package registries. It is designed for local development and CI: reports are deterministic, diagnostics are sent to standard error, and the scanner returns documented exit codes.
 
-> This repository implements the version 0.1 development direction. The command is intentionally report-only; it never rewrites lockfiles or upgrades dependencies.
-> Normative corrections to that draft are recorded in the [development specification errata](docs/specification-errata.md).
+> DepScan is intentionally report-only; it never rewrites lockfiles or upgrades dependencies.
+> Normative corrections to the original development specification are recorded in the [development specification errata](docs/specification-errata.md).
 
 ## Supported sources
 
@@ -88,7 +88,7 @@ Cargo-dist 0.32.0 generates the release plan and MSI definition. The checked-in 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v1.1.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v1.2.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
@@ -120,9 +120,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v1.1.0
+    uses: gedankrayze/depscan@v1.2.0
     with:
-      version: v1.1.0
+      version: v1.2.0
       path: .
       format: sarif
       output: depscan.sarif
@@ -133,7 +133,11 @@ The `report` action output contains the configured report path. The action suppo
 
 `--direct-only` removes packages confirmed to be transitive, and `--no-dev` removes packages confirmed to be development-only. When a lockfile cannot prove one of those classifications—for example, a Poetry lock without its sibling manifest—the package is retained. JSON reports distinguish that conservative result with `direct_known` and `dev_known`; the corresponding `direct` or `dev` value must only be interpreted when its `*_known` field is true.
 
-The supported report formats are `table`, `json`, `sarif`, and `summary`. When no format is specified, terminal output uses a table and redirected output uses a one-line summary. A file extension of `.json`, `.sarif`, `.txt`, or `.log` selects a matching format unless `--format` overrides it.
+The supported report formats are `table`, `markdown`, `json`, `sarif`, and `summary`. Markdown reports identify the producing DepScan version and repository, followed by an audit summary plus vulnerability, dependency-status, suppression, and soft-failure tables; all provider-controlled cell content is escaped before rendering. When no format is specified, terminal output uses a table and redirected output uses a one-line summary. A file extension of `.md`, `.markdown`, `.json`, `.sarif`, `.txt`, or `.log` selects a matching format unless `--format` overrides it.
+
+```bash
+depscan scan --format markdown --output depscan.md .
+```
 
 JSON reports contain one RFC 3339 UTC `generated_at` timestamp captured by the scan orchestration. By default it is the real scan time. For byte-reproducible CI evidence, set the standard `SOURCE_DATE_EPOCH` environment variable to an integer number of seconds since the Unix epoch:
 
@@ -232,7 +236,13 @@ The workspace is divided at its architectural boundaries:
 | `depscan-report` | Table, JSON, SARIF 2.1.0, and summary renderers. |
 | `depscan-cli` | CLI, config, orchestration, filters, and exit policy. |
 
+Rust modules have a hard 400-line ceiling. Production responsibilities should be extracted before
+they reach that boundary, and executable tests live in dedicated `tests.rs` or `tests/` modules
+rather than alongside production implementations. The architecture check runs in pull-request and
+release quality gates without an exception list.
+
 ```bash
+bash scripts/check-rust-architecture.sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace --all-targets
@@ -240,7 +250,7 @@ cargo test --workspace --all-targets
 
 The checked-in [verification matrix](docs/test-matrix.md) maps the development specification and every audit issue to parser fixtures, version tables, provider mocks, process-level E2E tests, platform CI, live probes, or artifact gates. Pull requests dogfood an offline scan of this workspace on Linux, macOS, and Windows; public API checks remain an explicitly enabled scheduled/manual job.
 
-## Known v0.1 limitations
+## Known limitations
 
 The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` resolved-version extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above; without it, `bun.lockb` scans visibly degrade to manifest constraints. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
 
