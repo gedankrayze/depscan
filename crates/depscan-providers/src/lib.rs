@@ -22,6 +22,7 @@ use futures::{StreamExt, stream};
 use osv_document::{
     ValidatedOsvDocument, affected_entry_is_evaluable, valid_osv_id, validate_osv_document,
 };
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, PercentEncode, utf8_percent_encode};
 use rand::RngExt;
 use reqwest::{
     Client, StatusCode, Url,
@@ -42,7 +43,6 @@ use std::{
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, warn};
-use urlencoding::encode;
 use zip::ZipArchive;
 
 const USER_AGENT_VALUE: &str = concat!(
@@ -85,6 +85,15 @@ const OSV_DUMP_MAX_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
 const OSV_DUMP_PROGRESS_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
 const OSV_DUMP_TEMP_SUFFIXES: [&str; 3] = [".zip.tmp", ".synced-at.tmp", ".zip.rollback.tmp"];
 const OSV_DUMP_DEFAULT_WARNING_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+const RFC3986_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+fn encode_path_segment(segment: &str) -> PercentEncode<'_> {
+    utf8_percent_encode(segment, RFC3986_PATH_SEGMENT_ENCODE_SET)
+}
 
 fn osv_query_name(package: &Package) -> &str {
     match package.ecosystem {
@@ -311,7 +320,11 @@ fn nuget_registry_url(package: &Package) -> String {
 }
 
 fn nuget_registry_url_with_base(base_url: &str, package: &Package) -> String {
-    format!("{}/{}/index.json", base_url, encode(&package.name))
+    format!(
+        "{}/{}/index.json",
+        base_url,
+        encode_path_segment(&package.name)
+    )
 }
 
 fn nuget_registration_cache_key(package: &Package) -> String {
@@ -319,7 +332,11 @@ fn nuget_registration_cache_key(package: &Package) -> String {
 }
 
 fn nuget_registration_url_with_base(base_url: &str, package: &Package) -> String {
-    format!("{}/{}/index.json", base_url, encode(&package.name))
+    format!(
+        "{}/{}/index.json",
+        base_url,
+        encode_path_segment(&package.name)
+    )
 }
 
 fn nuget_registration_page_cache_key(package: &Package, lower: &str, upper: &str) -> String {
@@ -449,7 +466,7 @@ fn validated_nuget_registration_page_url(
     let package_prefix = format!(
         "{}/{}/",
         base.path().trim_end_matches('/'),
-        encode(&package.name)
+        encode_path_segment(&package.name)
     );
     if !page.path().starts_with(&package_prefix) {
         return Err(invalid_nuget_registration(format_args!(
@@ -4170,7 +4187,7 @@ impl RegistryClient {
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = format!("{}/{}", self.npm_base_url, encode(&p.name));
+        let url = format!("{}/{}", self.npm_base_url, encode_path_segment(&p.name));
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
@@ -4186,7 +4203,11 @@ impl RegistryClient {
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
-        let url = format!("{}/{}/json", self.pypi_base_url, encode(&p.name));
+        let url = format!(
+            "{}/{}/json",
+            self.pypi_base_url,
+            encode_path_segment(&p.name)
+        );
         let data = self
             .metadata(&format!("pypi:{}", p.name), &url, HeaderMap::new())
             .await?;
@@ -7823,6 +7844,117 @@ mod tests {
         serde_json::from_str(include_str!("../tests/fixtures/registry-ranges.json")).unwrap()
     }
 
+    #[test]
+    fn registry_path_segment_encoding_preserves_only_rfc3986_unreserved_bytes() {
+        let cases = [
+            ("AZaz09-._~", "AZaz09-._~"),
+            ("@scope/package", "%40scope%2Fpackage"),
+            ("% /?#", "%25%20%2F%3F%23"),
+            ("café/λ", "caf%C3%A9%2F%CE%BB"),
+            ("\0\n\u{7f}", "%00%0A%7F"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                encode_path_segment(input).to_string(),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_request_paths_encode_scoped_npm_and_pypi_names_exactly() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/npm/%40scope%2Fpackage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"dist-tags": {"latest": "2.0.0"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/caf%C3%A9%20%2F%25/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "releases": {
+                    "1.0.0": [{"yanked": false}],
+                    "2.0.0": [{"yanked": false}]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let client = nuget_registry_client(&server, cache);
+
+        for package in [npm_package("@scope/package"), pypi_package("Café /%")] {
+            assert_eq!(
+                client.latest(&package).await.unwrap().latest.latest_stable,
+                "2.0.0"
+            );
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn nuget_flat_and_registration_request_paths_encode_package_names_exactly() {
+        let server = MockServer::start().await;
+        let package = nuget_package("Contoso.Tools/@Edge %");
+        let encoded_name = "contoso.tools%2F%40edge%20%25";
+        let flat_path = format!("/nuget/{encoded_name}/index.json");
+        let registration_path = format!("/registration/{encoded_name}/index.json");
+        Mock::given(method("GET"))
+            .and(path(flat_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "versions": ["12.0.1", "13.0.3"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(registration_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(nuget_registration_index(
+                    "Contoso.Tools/@Edge %",
+                    &["12.0.1", "13.0.3"],
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            nuget_registry_url_with_base("https://api.nuget.test/v3-flatcontainer", &package),
+            format!("https://api.nuget.test/v3-flatcontainer/{encoded_name}/index.json")
+        );
+        assert_eq!(
+            nuget_registration_url_with_base("https://api.nuget.test/v3/registration", &package),
+            format!("https://api.nuget.test/v3/registration/{encoded_name}/index.json")
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache {
+            root: cache_dir.path().to_path_buf(),
+            policy: CachePolicy::default(),
+        };
+        let enrichment = nuget_registry_client(&server, cache)
+            .latest(&package)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            enrichment.canonical_name.as_deref(),
+            Some("Contoso.Tools/@Edge %")
+        );
+        server.verify().await;
+    }
+
     #[tokio::test]
     async fn native_registry_http_mocks_cover_every_endpoint_and_header_contract() {
         let server = MockServer::start().await;
@@ -8101,6 +8233,30 @@ mod tests {
             assert!(
                 validated_nuget_registration_page_url(base, &package, invalid).is_err(),
                 "accepted unconfined registration page {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_registration_page_prefix_encodes_the_package_segment_exactly() {
+        let package = nuget_package("Contoso.Tools/@Edge %");
+        let base = "https://api.nuget.test/v3/registration";
+        let valid = concat!(
+            "https://api.nuget.test/v3/registration/",
+            "contoso.tools%2F%40edge%20%25/page/1/2.json"
+        );
+
+        assert_eq!(
+            validated_nuget_registration_page_url(base, &package, valid).unwrap(),
+            valid
+        );
+        for invalid in [
+            "https://api.nuget.test/v3/registration/contoso.tools/@edge%20%25/page/1/2.json",
+            "https://api.nuget.test/v3/registration/contoso.tools%2F%40other%20%25/page/1/2.json",
+        ] {
+            assert!(
+                validated_nuget_registration_page_url(base, &package, invalid).is_err(),
+                "accepted mismatched encoded prefix {invalid:?}"
             );
         }
     }

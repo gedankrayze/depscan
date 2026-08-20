@@ -558,6 +558,7 @@ dependencies = [
  "fs2",
  "futures",
  "httpdate",
+ "percent-encoding",
  "rand 0.10.2",
  "reqwest",
  "semver",
@@ -568,7 +569,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "urlencoding",
  "wiremock",
  "zip",
 ]
