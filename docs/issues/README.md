@@ -90,3 +90,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-069](DS-069.md) | P1 | Closed | Classify Windows capability-lock swap denials exactly |
 | [DS-070](DS-070.md) | P1 | Closed | Make transport retry tests platform-semantic |
 | [DS-071](DS-071.md) | P1 | Closed | Synchronize dump streaming at the client-write boundary |
+| [DS-072](DS-072.md) | P2 | Closed | Modularize provider architecture and isolate test suites |
