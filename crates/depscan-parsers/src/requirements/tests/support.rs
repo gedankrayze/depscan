@@ -3,7 +3,7 @@ use super::*;
 #[cfg(unix)]
 use std::os::unix::fs::symlink as symlink_path;
 #[cfg(windows)]
-use std::os::windows::fs::{symlink_dir, symlink_file};
+use std::os::windows::fs::{symlink_dir, symlink_file as symlink_file_impl};
 
 pub(super) fn write(path: &Path, text: impl AsRef<[u8]>) {
     if let Some(parent) = path.parent() {
@@ -15,6 +15,11 @@ pub(super) fn write(path: &Path, text: impl AsRef<[u8]>) {
 #[cfg(unix)]
 pub(super) fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
     symlink_path(original, link)
+}
+
+#[cfg(windows)]
+pub(super) fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+    symlink_file_impl(original, link)
 }
 
 #[cfg(unix)]
