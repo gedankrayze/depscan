@@ -1,0 +1,333 @@
+name: Release acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  preflight:
+    name: immutable release preflight
+    runs-on: ubuntu-22.04
+    outputs:
+      release-commit: ${{ steps.release.outputs.commit }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_REPOSITORY: gedankrayze/depscan
+      RELEASE_TAG: v1.1.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: v1.1.0
+          path: release-source
+      - id: release
+        name: Verify immutable tag ancestry and public inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]; then
+            echo "release acceptance must be dispatched from the immutable release tag" >&2
+            exit 1
+          fi
+          cd release-source
+          release_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main; then
+            echo "release tag commit is not contained by protected main" >&2
+            exit 1
+          fi
+
+          release_json=$(gh api "repos/$RELEASE_REPOSITORY/releases/tags/$RELEASE_TAG")
+          if [[ $(jq -r '.draft' <<<"$release_json") != false ]] \
+            || [[ $(jq -r '.prerelease' <<<"$release_json") != false ]] \
+            || [[ $(jq -r '.immutable' <<<"$release_json") != true ]] \
+            || [[ $(jq -r '.target_commitish' <<<"$release_json") != "$release_commit" ]]; then
+            echo "release is not a final immutable publication of the tagged commit" >&2
+            jq '{draft,prerelease,immutable,target_commitish}' <<<"$release_json" >&2
+            exit 1
+          fi
+
+          expected="$RUNNER_TEMP/expected-release-assets.txt"
+          actual="$RUNNER_TEMP/actual-release-assets.txt"
+          LC_ALL=C sort -u .github/release-assets.txt > "$expected"
+          if ! cmp -s .github/release-assets.txt "$expected" \
+            || [[ $(wc -l < "$expected") -ne 16 ]]; then
+            echo "tagged release asset contract is not the reviewed sorted 16-file set" >&2
+            exit 1
+          fi
+          jq -r '.assets[].name' <<<"$release_json" | LC_ALL=C sort -u > "$actual"
+          if ! diff -u "$expected" "$actual"; then
+            echo "published release inventory differs from the reviewed 16-file contract" >&2
+            exit 1
+          fi
+
+          artifact_dir="$RUNNER_TEMP/depscan-release-inventory"
+          attestation_dir="$RUNNER_TEMP/depscan-release-attestations"
+          mkdir -p "$artifact_dir" "$attestation_dir"
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --dir "$artifact_dir"
+          scripts/verify-release-assets.sh "$artifact_dir" .github/release-assets.txt
+          cd "$artifact_dir"
+          while IFS= read -r asset; do
+            output="$attestation_dir/$asset.json"
+            gh attestation verify "$asset" \
+              --repo "$RELEASE_REPOSITORY" \
+              --signer-workflow github.com/gedankrayze/depscan/.github/workflows/release.yml \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --source-digest "$release_commit" \
+              --deny-self-hosted-runners \
+              --format json > "$output"
+            jq -e 'length > 0' "$output" >/dev/null
+          done < "$expected"
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
+
+  archives:
+    name: archive (${{ matrix.target }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            asset: depscan-cli-x86_64-unknown-linux-musl.tar.xz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            asset: depscan-cli-aarch64-unknown-linux-musl.tar.xz
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            asset: depscan-cli-x86_64-apple-darwin.tar.xz
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            asset: depscan-cli-aarch64-apple-darwin.tar.xz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            asset: depscan-cli-x86_64-pc-windows-msvc.zip
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_ASSET: ${{ matrix.asset }}
+      RELEASE_COMMIT: ${{ needs.preflight.outputs.release-commit }}
+      RELEASE_REPOSITORY: gedankrayze/depscan
+      RELEASE_TAG: v1.1.0
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: v1.1.0
+          path: release-source
+      - name: Download, authenticate, and extract the Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/depscan-release-artifact"
+          mkdir -p "$artifact_dir"
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
+            --pattern "$RELEASE_ASSET" --pattern "$RELEASE_ASSET.sha256" \
+            --dir "$artifact_dir"
+          cd "$artifact_dir"
+
+          checksum_file="$RELEASE_ASSET.sha256"
+          if [[ $(awk 'NF { count++ } END { print count + 0 }' "$checksum_file") -ne 1 ]]; then
+            echo "release checksum must contain exactly one nonblank record" >&2
+            exit 1
+          fi
+          read -r expected checksum_name unexpected < <(awk 'NF { print; exit }' "$checksum_file")
+          checksum_name=${checksum_name#\*}
+          if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]] \
+            || [[ -n "${unexpected:-}" ]] \
+            || [[ "$checksum_name" != "$RELEASE_ASSET" ]]; then
+            echo "release checksum record is malformed or names the wrong archive" >&2
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$RELEASE_ASSET" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "$RELEASE_ASSET" | awk '{print $1}')
+          fi
+          if [[ "$actual" != "$expected" ]]; then
+            echo "release archive checksum mismatch" >&2
+            exit 1
+          fi
+
+          gh attestation verify "$RELEASE_ASSET" \
+            --repo "$RELEASE_REPOSITORY" \
+            --signer-workflow github.com/gedankrayze/depscan/.github/workflows/release.yml \
+            --source-ref "refs/tags/$RELEASE_TAG" \
+            --source-digest "$RELEASE_COMMIT" \
+            --deny-self-hosted-runners \
+            --format json > "$RUNNER_TEMP/depscan-release-attestation.json"
+          jq -e 'length > 0' "$RUNNER_TEMP/depscan-release-attestation.json" >/dev/null
+
+          tar -xJf "$RELEASE_ASSET"
+          binary="$artifact_dir/${RELEASE_ASSET%.tar.xz}/depscan"
+          if [[ ! -x "$binary" ]]; then
+            echo "verified release archive lacks the expected executable" >&2
+            exit 1
+          fi
+          printf 'ACCEPTANCE_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
+          printf 'RELEASE_SHA256=%s\n' "$actual" >> "$GITHUB_ENV"
+      - name: Download, authenticate, and extract the Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifactDir = Join-Path $env:RUNNER_TEMP "depscan-release-artifact"
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:RELEASE_REPOSITORY `
+            --pattern $env:RELEASE_ASSET --pattern "$($env:RELEASE_ASSET).sha256" `
+            --dir $artifactDir
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to download the release archive and checksum"
+          }
+
+          $archive = Join-Path $artifactDir $env:RELEASE_ASSET
+          $checksumFile = "$archive.sha256"
+          $checksumLines = @(
+              Get-Content -LiteralPath $checksumFile |
+                  Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          )
+          if ($checksumLines.Count -ne 1) {
+              throw "Release checksum must contain exactly one nonblank record"
+          }
+          $parts = @($checksumLines[0] -split '\s+' | Where-Object { $_ -ne "" })
+          if ($parts.Count -ne 2 -or $parts[0] -notmatch '^[0-9a-f]{64}$') {
+              throw "Release checksum record is malformed"
+          }
+          $checksumName = $parts[1].TrimStart('*')
+          if ($checksumName -ne $env:RELEASE_ASSET) {
+              throw "Release checksum names $checksumName instead of $($env:RELEASE_ASSET)"
+          }
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $parts[0]) {
+              throw "Release archive checksum mismatch"
+          }
+
+          $attestation = Join-Path $env:RUNNER_TEMP "depscan-release-attestation.json"
+          gh attestation verify $archive `
+            --repo $env:RELEASE_REPOSITORY `
+            --signer-workflow github.com/gedankrayze/depscan/.github/workflows/release.yml `
+            --source-ref "refs/tags/$($env:RELEASE_TAG)" `
+            --source-digest $env:RELEASE_COMMIT `
+            --deny-self-hosted-runners `
+            --format json | Set-Content -LiteralPath $attestation -Encoding utf8
+          if ($LASTEXITCODE -ne 0) {
+              throw "Release provenance verification failed"
+          }
+          if (@(Get-Content -LiteralPath $attestation -Raw | ConvertFrom-Json).Count -eq 0) {
+              throw "Release provenance verification returned no attestations"
+          }
+
+          Expand-Archive -LiteralPath $archive -DestinationPath $artifactDir
+          $binary = Join-Path $artifactDir "depscan.exe"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+              throw "Verified release archive lacks the expected executable"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "ACCEPTANCE_BINARY=$binary" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RELEASE_SHA256=$actual" -Encoding utf8
+      - name: Prepare the Unix offline fixture cache
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TEMP/depscan-release-cache"
+          python3 - "$cache" <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import sys
+          import zipfile
+
+          root = pathlib.Path(sys.argv[1])
+          (root / "offline").mkdir(parents=True)
+          (root / ".depscan-cache.json").write_text(
+              json.dumps({"schema_version": 1, "owner": "depscan"}) + "\n",
+              encoding="utf-8",
+          )
+          with zipfile.ZipFile(
+              root / "offline" / "crates_io.zip",
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+          ):
+              pass
+          stamp = (
+              datetime.datetime.now(datetime.timezone.utc)
+              .replace(microsecond=0)
+              .isoformat()
+              .replace("+00:00", "Z")
+          )
+          (root / "offline" / "crates_io.synced-at").write_text(
+              stamp + "\n",
+              encoding="utf-8",
+          )
+          PY
+          printf 'DEPSCAN_CACHE_DIR=%s\n' "$cache" >> "$GITHUB_ENV"
+      - name: Prepare the Windows offline fixture cache
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cache = Join-Path $env:RUNNER_TEMP "depscan-release-cache"
+          $offline = Join-Path $cache "offline"
+          New-Item -ItemType Directory -Path $offline -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $cache ".depscan-cache.json") `
+            -Value '{"schema_version":1,"owner":"depscan"}' -Encoding utf8
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::Open(
+              (Join-Path $offline "crates_io.zip"),
+              [System.IO.Compression.ZipArchiveMode]::Create
+          )
+          $archive.Dispose()
+          $stamp = (Get-Date).ToUniversalTime().ToString(
+              "yyyy-MM-ddTHH:mm:ssZ",
+              [Globalization.CultureInfo]::InvariantCulture
+          )
+          Set-Content -LiteralPath (Join-Path $offline "crates_io.synced-at") `
+            -Value $stamp -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "DEPSCAN_CACHE_DIR=$cache" -Encoding utf8
+      - name: Smoke the downloaded Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$($ACCEPTANCE_BINARY --version)" == "depscan ${RELEASE_TAG#v}" ]]
+          "$ACCEPTANCE_BINARY" --help >/dev/null
+          summary=$(
+            "$ACCEPTANCE_BINARY" scan --offline --format summary \
+              --fail-on never --fail-on-outdated never \
+              release-source/fixtures/e2e/cargo
+          )
+          printf '%s\n' "$summary"
+          grep -Fq 'depscan: 4 packages | 0 vulns' <<<"$summary"
+          printf 'release target=%s sha256=%s\n' "$RELEASE_TARGET" "$RELEASE_SHA256"
+      - name: Smoke the downloaded Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (& $env:ACCEPTANCE_BINARY --version) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $version.Trim() -ne "depscan $($env:RELEASE_TAG.Substring(1))") {
+              throw "Downloaded release binary has the wrong version: $version"
+          }
+          & $env:ACCEPTANCE_BINARY --help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              throw "Downloaded release binary failed to print help"
+          }
+          $summary = & $env:ACCEPTANCE_BINARY scan --offline --format summary `
+            --fail-on never --fail-on-outdated never `
+            "release-source/fixtures/e2e/cargo"
+          if ($LASTEXITCODE -ne 0) {
+              throw "Downloaded release binary failed its offline fixture scan"
+          }
+          $summaryText = ($summary -join "`n").Trim()
+          Write-Output $summaryText
+          if ($summaryText -notmatch '^depscan: 4 packages \| 0 vulns') {
+              throw "Downloaded release binary returned an unexpected summary"
+          }
+          Write-Output "release target=$($env:RELEASE_TARGET) sha256=$($env:RELEASE_SHA256)"
