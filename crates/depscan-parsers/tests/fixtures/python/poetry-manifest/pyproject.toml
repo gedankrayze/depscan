@@ -48,7 +48,7 @@ legacy-dev = "^1.0"
 prod-group = "1.0.*"
 
 [tool.poetry.group.test.dependencies.pytest]
-version = "~8.1"
+version = "~8.4.0"
 markers = "python_version >= '3.9'"
 
 [tool.poetry.group.docs]
