@@ -19,7 +19,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 
 | ID | Priority | Status | Finding |
 |---|---|---|---|
-| [DS-001](DS-001.md) | P1 | In progress | Repository hygiene and branch governance |
+| [DS-001](DS-001.md) | P1 | Closed | Repository hygiene and branch governance |
 | [DS-002](DS-002.md) | P0 | Closed | Replace approximate CVSS scoring |
 | [DS-003](DS-003.md) | P0 | Closed | Preserve canonical NuGet names for OSV |
 | [DS-004](DS-004.md) | P0 | Closed | Use standards-compliant PEP 440 ordering |
@@ -46,7 +46,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-025](DS-025.md) | P1 | Closed | Modernize the Rust toolchain, edition, resolver, and MSRV policy |
 | [DS-026](DS-026.md) | P1 | Closed | Upgrade direct dependencies to current stable releases |
 | [DS-027](DS-027.md) | P1 | Closed | Replace unmaintained `serde_yaml` |
-| [DS-028](DS-028.md) | P1 | In progress | Build the required fixture, provider, version, and E2E test matrix |
+| [DS-028](DS-028.md) | P1 | Closed | Build the required fixture, provider, version, and E2E test matrix |
 | [DS-029](DS-029.md) | P1 | Closed | Resolve manifest ranges for `latest_matching` |
 | [DS-030](DS-030.md) | P1 | Closed | Enforce offline dump age and use cached registry metadata |
 | [DS-031](DS-031.md) | P1 | Closed | Implement exact retry and `Retry-After` semantics |
@@ -65,8 +65,8 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-044](DS-044.md) | P1 | Closed | Strengthen CLI help and typed value parsing |
 | [DS-045](DS-045.md) | P2 | In progress | Generate release automation and complete the target matrix |
 | [DS-046](DS-046.md) | P2 | In progress | Deliver and verify genuinely static Linux artifacts |
-| [DS-047](DS-047.md) | P1 | In progress | Make offline sync publication capability-safe during directory swaps |
-| [DS-048](DS-048.md) | P1 | In progress | Make configuration and report file access capability-safe |
+| [DS-047](DS-047.md) | P1 | Closed | Make offline sync publication capability-safe during directory swaps |
+| [DS-048](DS-048.md) | P1 | Closed | Make configuration and report file access capability-safe |
 | [DS-049](DS-049.md) | P2 | In progress | Deliver the M6 composite GitHub Action |
 | [DS-050](DS-050.md) | P1 | Closed | Scan registry-resolved manifest dependencies for vulnerabilities |
 | [DS-051](DS-051.md) | P1 | Closed | Reject malformed OSV advisory shapes without false-clean results |
@@ -78,8 +78,15 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-057](DS-057.md) | P1 | Closed | Reject malformed npm v2/v3 package records |
 | [DS-058](DS-058.md) | P1 | Closed | Do not classify unproven Node dependencies as known transitive |
 | [DS-059](DS-059.md) | P1 | Closed | Bind Cargo direct and development metadata to exact locked identities |
-| [DS-060](DS-060.md) | P1 | In progress | Make requirements include reads capability-safe |
-| [DS-061](DS-061.md) | P1 | In progress | Preserve the verified GitHub Action executable identity |
+| [DS-060](DS-060.md) | P1 | Closed | Make requirements include reads capability-safe |
+| [DS-061](DS-061.md) | P1 | Closed | Preserve the verified GitHub Action executable identity |
 | [DS-062](DS-062.md) | P2 | Closed | Remove direct use of maintenance-seeking `urlencoding` |
 | [DS-063](DS-063.md) | P1 | Closed | Support suffix-aware npm extglobs safely |
-| [DS-064](DS-064.md) | P1 | In progress | Use full-width held-handle identity at filesystem trust boundaries |
+| [DS-064](DS-064.md) | P1 | Closed | Use full-width held-handle identity at filesystem trust boundaries |
+| [DS-065](DS-065.md) | P1 | Closed | Keep platform-gated CLI tests warning-free on Windows |
+| [DS-066](DS-066.md) | P1 | Closed | Make CLI contract tests exact across native path conventions |
+| [DS-067](DS-067.md) | P1 | Closed | Compare Cargo fixture provenance under one canonical root |
+| [DS-068](DS-068.md) | P2 | Closed | Run pinned GitHub Actions on supported Node 24 runtimes |
+| [DS-069](DS-069.md) | P1 | Closed | Classify Windows capability-lock swap denials exactly |
+| [DS-070](DS-070.md) | P1 | Closed | Make transport retry tests platform-semantic |
+| [DS-071](DS-071.md) | P1 | Closed | Synchronize dump streaming at the client-write boundary |

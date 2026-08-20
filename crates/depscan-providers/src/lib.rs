@@ -2582,6 +2582,8 @@ struct OsvSyncConfig {
     force_rollback_staging_error: bool,
     #[cfg(test)]
     observed_max_chunk_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    stream_progress: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl OsvSyncConfig {
@@ -2607,6 +2609,8 @@ impl OsvSyncConfig {
             force_rollback_staging_error: false,
             #[cfg(test)]
             observed_max_chunk_bytes: None,
+            #[cfg(test)]
+            stream_progress: None,
         })
     }
 
@@ -2685,6 +2689,10 @@ where
             .write_all(bytes)
             .await
             .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
+        #[cfg(test)]
+        if let Some(progress) = &config.stream_progress {
+            progress.send_replace(downloaded);
+        }
         if downloaded >= next_progress {
             debug!(%url, downloaded, "streaming OSV dump");
             next_progress = downloaded.saturating_add(OSV_DUMP_PROGRESS_INTERVAL_BYTES);
@@ -6137,22 +6145,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_and_timeout_failures_retry_but_builder_failures_do_not() {
+    async fn unavailable_endpoint_retries_with_platform_semantic_transport_detail() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable = listener.local_addr().unwrap();
         drop(listener);
         let connect_runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
         let connect_client =
             test_http_client(connect_runtime.clone(), StdDuration::from_millis(50));
+        let url = format!("http://alice:connect-secret@{unavailable}/metadata?token=query-secret");
 
         let connect_error = connect_client
-            .get_json(&format!("http://{unavailable}/metadata"), HeaderMap::new())
+            .get_json(&url, HeaderMap::new())
             .await
             .unwrap_err();
-        assert_eq!(connect_runtime.sleeps().len(), HTTP_MAX_RETRIES);
-        assert!(connect_error.to_string().contains("connection failed"));
-        assert!(connect_error.to_string().contains("attempt 4/4"));
+        let ProviderError::Network(message) = connect_error else {
+            panic!("retryable transport failure did not return a network error")
+        };
+        assert_eq!(
+            connect_runtime.sleeps(),
+            vec![
+                StdDuration::from_millis(200),
+                StdDuration::from_millis(400),
+                StdDuration::from_millis(800),
+            ]
+        );
+        assert!(
+            message.contains("connection failed") || message.contains("request timed out"),
+            "retryable transport detail was not normalized: {message}"
+        );
+        assert!(message.contains("attempt 4/4"));
+        assert!(message.starts_with(&request_context(&reqwest::Method::GET, &url)));
+        for secret in ["alice", "connect-secret", "query-secret"] {
+            assert!(
+                !message.contains(secret),
+                "error leaked {secret:?}: {message}"
+            );
+        }
+    }
 
+    #[tokio::test]
+    async fn request_timeout_retries_every_attempt() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/slow"))
@@ -6171,11 +6203,21 @@ mod tests {
             .get_json(&format!("{}/slow", server.uri()), HeaderMap::new())
             .await
             .unwrap_err();
-        assert_eq!(timeout_runtime.sleeps().len(), HTTP_MAX_RETRIES);
+        assert_eq!(
+            timeout_runtime.sleeps(),
+            vec![
+                StdDuration::from_millis(200),
+                StdDuration::from_millis(400),
+                StdDuration::from_millis(800),
+            ]
+        );
         assert!(timeout_error.to_string().contains("timed out"));
         assert!(timeout_error.to_string().contains("attempt 4/4"));
         server.verify().await;
+    }
 
+    #[tokio::test]
+    async fn request_builder_failure_is_immediate_and_redacted() {
         let builder_runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
         let builder_client = test_http_client(builder_runtime.clone(), StdDuration::from_secs(1));
         let builder_error = builder_client
@@ -6263,26 +6305,113 @@ mod tests {
     #[derive(Debug)]
     enum NamespaceSwap {
         NotAttempted,
-        Denied(std::io::ErrorKind),
+        Denied(NamespaceSwapDenial),
         Swapped { original: PathBuf, moved: PathBuf },
     }
 
     #[cfg(any(unix, windows))]
     #[derive(Debug)]
     enum FileNamespaceSwap {
-        Denied(std::io::ErrorKind),
+        Denied(NamespaceSwapDenial),
         Swapped { original: PathBuf, moved: PathBuf },
     }
 
     #[cfg(any(unix, windows))]
     #[derive(Debug)]
     enum RegularNamespaceSwap {
-        Denied(std::io::ErrorKind),
+        Denied(NamespaceSwapDenial),
         Swapped {
             original: PathBuf,
             moved: PathBuf,
             replacement: PathBuf,
         },
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NamespaceSwapStage {
+        RenameOriginal,
+        CreateSymlink,
+        InstallReplacement,
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug)]
+    struct NamespaceSwapDenial {
+        stage: NamespaceSwapStage,
+        error: std::io::Error,
+    }
+
+    #[cfg(any(unix, windows))]
+    fn expected_windows_namespace_swap_denial(
+        stage: NamespaceSwapStage,
+        raw_os_error: Option<i32>,
+    ) -> bool {
+        // Win32 errors returned by MoveFileExW/CreateSymbolicLinkW at the exact stages above.
+        // Keep this phase-specific: an unexpected path/setup error must not masquerade as a
+        // successful capability-lock test.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        matches!(
+            (stage, raw_os_error),
+            (
+                NamespaceSwapStage::RenameOriginal,
+                Some(ERROR_ACCESS_DENIED) | Some(ERROR_SHARING_VIOLATION)
+            ) | (
+                NamespaceSwapStage::CreateSymlink,
+                Some(ERROR_ACCESS_DENIED) | Some(ERROR_PRIVILEGE_NOT_HELD)
+            )
+        )
+    }
+
+    #[cfg(windows)]
+    fn restore_expected_windows_denial(denial: NamespaceSwapDenial, operation: &str) -> bool {
+        assert!(
+            expected_windows_namespace_swap_denial(denial.stage, denial.error.raw_os_error()),
+            "unexpected Windows {operation} denial at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+            denial.stage,
+            denial.error.kind(),
+            denial.error.raw_os_error(),
+            denial.error
+        );
+        false
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn windows_namespace_swap_denials_are_stage_and_code_specific() {
+        for (stage, raw_os_error) in [
+            (NamespaceSwapStage::RenameOriginal, 5),
+            (NamespaceSwapStage::RenameOriginal, 32),
+            (NamespaceSwapStage::CreateSymlink, 5),
+            (NamespaceSwapStage::CreateSymlink, 1314),
+        ] {
+            assert!(expected_windows_namespace_swap_denial(
+                stage,
+                Some(raw_os_error)
+            ));
+        }
+
+        for (stage, raw_os_error) in [
+            (NamespaceSwapStage::RenameOriginal, 3),
+            (NamespaceSwapStage::RenameOriginal, 33),
+            (NamespaceSwapStage::RenameOriginal, 12345),
+            (NamespaceSwapStage::CreateSymlink, 32),
+            (NamespaceSwapStage::InstallReplacement, 5),
+            (NamespaceSwapStage::InstallReplacement, 32),
+            (NamespaceSwapStage::InstallReplacement, 1314),
+        ] {
+            assert!(!expected_windows_namespace_swap_denial(
+                stage,
+                Some(raw_os_error)
+            ));
+        }
+        assert!(!expected_windows_namespace_swap_denial(
+            NamespaceSwapStage::RenameOriginal,
+            None
+        ));
     }
 
     #[cfg(any(unix, windows))]
@@ -6355,10 +6484,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore namespace after symlink denial");
-                    NamespaceSwap::Denied(error.kind())
+                    NamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::CreateSymlink,
+                        error,
+                    })
                 }
             },
-            Err(error) => NamespaceSwap::Denied(error.kind()),
+            Err(error) => NamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6371,21 +6506,18 @@ mod tests {
                 true
             }
             #[cfg(unix)]
-            NamespaceSwap::Denied(kind) => {
-                panic!("directory swap unexpectedly failed on Unix: {kind:?}")
+            NamespaceSwap::Denied(denial) => {
+                panic!(
+                    "directory swap unexpectedly failed on Unix at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+                    denial.stage,
+                    denial.error.kind(),
+                    denial.error.raw_os_error(),
+                    denial.error
+                )
             }
             #[cfg(windows)]
-            NamespaceSwap::Denied(kind) => {
-                assert!(
-                    matches!(
-                        kind,
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::Unsupported
-                            | std::io::ErrorKind::Other
-                    ),
-                    "unexpected Windows directory-swap error: {kind:?}"
-                );
-                false
+            NamespaceSwap::Denied(denial) => {
+                restore_expected_windows_denial(denial, "directory-swap")
             }
             NamespaceSwap::NotAttempted => panic!("the requested sync boundary was not reached"),
         }
@@ -6405,10 +6537,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore file after symlink denial");
-                    FileNamespaceSwap::Denied(error.kind())
+                    FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::CreateSymlink,
+                        error,
+                    })
                 }
             },
-            Err(error) => FileNamespaceSwap::Denied(error.kind()),
+            Err(error) => FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6426,10 +6564,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore file after replacement denial");
-                    FileNamespaceSwap::Denied(error.kind())
+                    FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::InstallReplacement,
+                        error,
+                    })
                 }
             },
-            Err(error) => FileNamespaceSwap::Denied(error.kind()),
+            Err(error) => FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6442,21 +6586,18 @@ mod tests {
                 true
             }
             #[cfg(unix)]
-            FileNamespaceSwap::Denied(kind) => {
-                panic!("file swap unexpectedly failed on Unix: {kind:?}")
+            FileNamespaceSwap::Denied(denial) => {
+                panic!(
+                    "file swap unexpectedly failed on Unix at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+                    denial.stage,
+                    denial.error.kind(),
+                    denial.error.raw_os_error(),
+                    denial.error
+                )
             }
             #[cfg(windows)]
-            FileNamespaceSwap::Denied(kind) => {
-                assert!(
-                    matches!(
-                        kind,
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::Unsupported
-                            | std::io::ErrorKind::Other
-                    ),
-                    "unexpected Windows file-swap error: {kind:?}"
-                );
-                false
+            FileNamespaceSwap::Denied(denial) => {
+                restore_expected_windows_denial(denial, "file-swap")
             }
         }
     }
@@ -6476,10 +6617,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore object after replacement denial");
-                    RegularNamespaceSwap::Denied(error.kind())
+                    RegularNamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::InstallReplacement,
+                        error,
+                    })
                 }
             },
-            Err(error) => RegularNamespaceSwap::Denied(error.kind()),
+            Err(error) => RegularNamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6496,21 +6643,18 @@ mod tests {
                 true
             }
             #[cfg(unix)]
-            RegularNamespaceSwap::Denied(kind) => {
-                panic!("regular namespace swap unexpectedly failed on Unix: {kind:?}")
+            RegularNamespaceSwap::Denied(denial) => {
+                panic!(
+                    "regular namespace swap unexpectedly failed on Unix at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+                    denial.stage,
+                    denial.error.kind(),
+                    denial.error.raw_os_error(),
+                    denial.error
+                )
             }
             #[cfg(windows)]
-            RegularNamespaceSwap::Denied(kind) => {
-                assert!(
-                    matches!(
-                        kind,
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::Unsupported
-                            | std::io::ErrorKind::Other
-                    ),
-                    "unexpected Windows regular namespace-swap error: {kind:?}"
-                );
-                false
+            RegularNamespaceSwap::Denied(denial) => {
+                restore_expected_windows_denial(denial, "regular namespace-swap")
             }
         }
     }
@@ -6670,6 +6814,7 @@ mod tests {
         boundary: OsvSyncBoundary,
         response: Vec<u8>,
     ) {
+        let expected_response = response.clone();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/npm/all.zip"))
@@ -6706,14 +6851,39 @@ mod tests {
         let swapped = restore_namespace_swap(outcome);
 
         if swapped {
-            assert!(matches!(result, Err(ProviderError::Cache(_))));
+            assert!(
+                matches!(&result, Err(ProviderError::Cache(_))),
+                "a successful swap at {boundary:?} must fail capability revalidation: {result:?}"
+            );
+        } else if boundary == OsvSyncBoundary::BeforeHandledErrorCleanup {
+            assert!(
+                matches!(
+                    &result,
+                    Err(ProviderError::InvalidResponse(message))
+                        if message.starts_with("OSV dump for npm is invalid: ")
+                ),
+                "a denied Windows swap at {boundary:?} must preserve the invalid dump result: {result:?}"
+            );
+        } else {
+            result
+                .as_ref()
+                .expect("a denied Windows swap must preserve a valid sync");
+        }
+
+        if swapped || boundary == OsvSyncBoundary::BeforeHandledErrorCleanup {
             assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), previous);
             assert_eq!(
                 fs::read_to_string(sync_paths(&cache).1).unwrap(),
                 previous_marker
             );
-            assert_no_sync_temps(&cache);
+        } else {
+            assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), expected_response);
+            assert_ne!(
+                fs::read_to_string(sync_paths(&cache).1).unwrap(),
+                previous_marker
+            );
         }
+        assert_no_sync_temps(&cache);
         assert_external_sync_namespace_unchanged(external.path());
     }
 
@@ -6947,10 +7117,11 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn capability_relative_sync_confines_a_cache_root_swap() {
+        let replacement = dump_archive_bytes(1024);
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/npm/all.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(dump_archive_bytes(1024)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(replacement.clone()))
             .mount(&server)
             .await;
         let cache_root = tempfile::tempdir().unwrap();
@@ -6987,6 +7158,10 @@ mod tests {
         if swapped {
             assert!(matches!(result, Err(ProviderError::Cache(_))));
             assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), previous);
+            assert_no_sync_temps(&cache);
+        } else {
+            result.expect("a denied Windows root swap must preserve a valid sync");
+            assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), replacement);
             assert_no_sync_temps(&cache);
         }
         assert_external_sync_namespace_unchanged(external.path());
@@ -7046,6 +7221,10 @@ mod tests {
 
             if swapped {
                 assert!(matches!(result, Err(ProviderError::Cache(_))));
+            } else {
+                let (_, lock) =
+                    result.expect("a denied Windows namespace swap must preserve lock acquisition");
+                fs2::FileExt::unlock(&lock).unwrap();
             }
             if boundary == Boundary::Cleanup {
                 assert!(
@@ -7082,6 +7261,9 @@ mod tests {
 
         if swapped {
             assert!(matches!(result, Err(ProviderError::Cache(_))));
+        } else {
+            result.expect("a denied Windows root swap must preserve capability acquisition");
+            assert!(original.join("offline").is_dir());
         }
         assert!(
             fs::read_dir(external.path()).unwrap().next().is_none(),
@@ -7257,52 +7439,52 @@ mod tests {
         let previous_marker = "2000-01-01T00:00:00Z";
         seed_sync_files(&cache, &previous, previous_marker);
         let client =
-            HttpClient::with_timeouts(StdDuration::from_millis(50), StdDuration::from_secs(1))
+            HttpClient::with_timeouts(StdDuration::from_secs(30), StdDuration::from_secs(30))
                 .unwrap();
         let observed_chunk_bytes = Arc::new(AtomicUsize::new(0));
+        let (stream_progress, mut streamed_bytes) = tokio::sync::watch::channel(0u64);
         let mut config = test_sync_config(base_url);
+        config.transfer_timeout = StdDuration::from_secs(30);
         config.observed_max_chunk_bytes = Some(observed_chunk_bytes.clone());
+        config.stream_progress = Some(stream_progress);
         let sync_cache = cache.clone();
         let sync = tokio::spawn(async move {
             sync_osv_dumps_with_config(&client, &sync_cache, &[Ecosystem::Npm], &config).await
         });
 
-        tokio::time::timeout(StdDuration::from_secs(2), paused.notified())
-            .await
-            .expect("slow response did not reach its pause");
-        let (archive_path, marker_path) = sync_paths(&cache);
-        assert_eq!(fs::read(&archive_path).unwrap(), previous);
-        assert_eq!(fs::read_to_string(&marker_path).unwrap(), previous_marker);
-
-        let partial_size = tokio::time::timeout(StdDuration::from_secs(1), async {
-            loop {
-                let partial = fs::read_dir(cache.root().join("offline"))
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            paused.notified().await;
+            streamed_bytes
+                .wait_for(|bytes| *bytes > 0)
+                .await
+                .expect("stream progress sender closed before the first write");
+            let (archive_path, marker_path) = sync_paths(&cache);
+            assert_eq!(fs::read(&archive_path).unwrap(), previous);
+            assert_eq!(fs::read_to_string(&marker_path).unwrap(), previous_marker);
+            let partial_size = *streamed_bytes.borrow_and_update();
+            assert!(partial_size > 0);
+            assert!(partial_size < replacement.len() as u64);
+            assert!(
+                fs::read_dir(cache.root().join("offline"))
                     .unwrap()
                     .filter_map(Result::ok)
-                    .find(|entry| entry.file_name().to_string_lossy().ends_with(".zip.tmp"))
-                    .and_then(|entry| entry.metadata().ok())
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-                if partial > 0 {
-                    break partial;
-                }
-                sleep(StdDuration::from_millis(5)).await;
-            }
+                    .any(|entry| entry.file_name().to_string_lossy().ends_with(".zip.tmp")),
+                "the client write did not target the held temporary file"
+            );
+
+            resume.notify_one();
+            let paths = sync.await.unwrap().unwrap();
+            server.await.unwrap();
+            assert_eq!(paths, vec![archive_path.clone()]);
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert!(observed_chunk_bytes.load(Ordering::SeqCst) > 0);
+            assert!(observed_chunk_bytes.load(Ordering::SeqCst) < replacement.len());
+            assert_eq!(fs::read(&archive_path).unwrap(), replacement);
+            assert_ne!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+            assert_no_sync_temps(&cache);
         })
         .await
-        .expect("streamed bytes were not written to the temporary file");
-        assert!(partial_size < replacement.len() as u64);
-
-        resume.notify_one();
-        let paths = sync.await.unwrap().unwrap();
-        server.await.unwrap();
-        assert_eq!(paths, vec![archive_path.clone()]);
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert!(observed_chunk_bytes.load(Ordering::SeqCst) > 0);
-        assert!(observed_chunk_bytes.load(Ordering::SeqCst) < replacement.len());
-        assert_eq!(fs::read(&archive_path).unwrap(), replacement);
-        assert_ne!(fs::read_to_string(marker_path).unwrap(), previous_marker);
-        assert_no_sync_temps(&cache);
+        .expect("slow stream did not complete the server/client/write/publication sequence");
     }
 
     #[tokio::test]
