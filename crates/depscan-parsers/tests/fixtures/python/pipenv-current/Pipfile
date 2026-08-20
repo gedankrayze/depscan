@@ -5,7 +5,7 @@ name = "pypi"
 
 [packages]
 requests = { version = "*", extras = ["socks", "security"] }
-"Zope.Interface" = "==6.0"
+"Zope.Interface" = "==6.4.post2"
 
 [dev-packages]
 Py_Test = { version = "*", extras = ["testing"] }
