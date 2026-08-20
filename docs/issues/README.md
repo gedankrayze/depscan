@@ -82,7 +82,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-061](DS-061.md) | P1 | Closed | Preserve the verified GitHub Action executable identity |
 | [DS-062](DS-062.md) | P2 | Closed | Remove direct use of maintenance-seeking `urlencoding` |
 | [DS-063](DS-063.md) | P1 | Closed | Support suffix-aware npm extglobs safely |
-| [DS-064](DS-064.md) | P1 | In progress | Use full-width held-handle identity at filesystem trust boundaries |
+| [DS-064](DS-064.md) | P1 | Closed | Use full-width held-handle identity at filesystem trust boundaries |
 | [DS-065](DS-065.md) | P1 | Closed | Keep platform-gated CLI tests warning-free on Windows |
 | [DS-066](DS-066.md) | P1 | In progress | Make CLI contract tests exact across native path conventions |
 | [DS-067](DS-067.md) | P1 | In progress | Compare Cargo fixture provenance under one canonical root |
