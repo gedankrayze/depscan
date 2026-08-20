@@ -21,7 +21,7 @@ shared = ["shared-tool==1.0"]
 [tool.poetry.dependencies]
 python = "^3.12"
 requests = "^2.31.0"
-attrs = "~23.1"
+attrs = "~23.2.0"
 django = "5.*"
 exact = "1.2.3"
 anything = "*"
