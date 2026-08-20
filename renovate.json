@@ -2,7 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "baseBranches": ["develop"],
-  "ignorePaths": ["fixtures/**"],
+  "ignorePaths": [
+    "fixtures/**",
+    "crates/**/tests/fixtures/**",
+    ".github/workflows/release.yml",
+    ".github/workflows/release-quality.yml"
+  ],
   "vulnerabilityAlerts": {
     "enabled": false
   }
