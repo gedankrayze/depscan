@@ -6850,23 +6850,40 @@ mod tests {
         let outcome = std::mem::replace(&mut *swap.lock().unwrap(), NamespaceSwap::NotAttempted);
         let swapped = restore_namespace_swap(outcome);
 
+        if swapped {
+            assert!(
+                matches!(&result, Err(ProviderError::Cache(_))),
+                "a successful swap at {boundary:?} must fail capability revalidation: {result:?}"
+            );
+        } else if boundary == OsvSyncBoundary::BeforeHandledErrorCleanup {
+            assert!(
+                matches!(
+                    &result,
+                    Err(ProviderError::InvalidResponse(message))
+                        if message.starts_with("OSV dump for npm is invalid: ")
+                ),
+                "a denied Windows swap at {boundary:?} must preserve the invalid dump result: {result:?}"
+            );
+        } else {
+            result
+                .as_ref()
+                .expect("a denied Windows swap must preserve a valid sync");
+        }
+
         if swapped || boundary == OsvSyncBoundary::BeforeHandledErrorCleanup {
-            assert!(matches!(result, Err(ProviderError::Cache(_))));
             assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), previous);
             assert_eq!(
                 fs::read_to_string(sync_paths(&cache).1).unwrap(),
                 previous_marker
             );
-            assert_no_sync_temps(&cache);
         } else {
-            result.expect("a denied Windows swap must preserve a valid sync");
             assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), expected_response);
             assert_ne!(
                 fs::read_to_string(sync_paths(&cache).1).unwrap(),
                 previous_marker
             );
-            assert_no_sync_temps(&cache);
         }
+        assert_no_sync_temps(&cache);
         assert_external_sync_namespace_unchanged(external.path());
     }
 
