@@ -6263,26 +6263,113 @@ mod tests {
     #[derive(Debug)]
     enum NamespaceSwap {
         NotAttempted,
-        Denied(std::io::ErrorKind),
+        Denied(NamespaceSwapDenial),
         Swapped { original: PathBuf, moved: PathBuf },
     }
 
     #[cfg(any(unix, windows))]
     #[derive(Debug)]
     enum FileNamespaceSwap {
-        Denied(std::io::ErrorKind),
+        Denied(NamespaceSwapDenial),
         Swapped { original: PathBuf, moved: PathBuf },
     }
 
     #[cfg(any(unix, windows))]
     #[derive(Debug)]
     enum RegularNamespaceSwap {
-        Denied(std::io::ErrorKind),
+        Denied(NamespaceSwapDenial),
         Swapped {
             original: PathBuf,
             moved: PathBuf,
             replacement: PathBuf,
         },
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NamespaceSwapStage {
+        RenameOriginal,
+        CreateSymlink,
+        InstallReplacement,
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Debug)]
+    struct NamespaceSwapDenial {
+        stage: NamespaceSwapStage,
+        error: std::io::Error,
+    }
+
+    #[cfg(any(unix, windows))]
+    fn expected_windows_namespace_swap_denial(
+        stage: NamespaceSwapStage,
+        raw_os_error: Option<i32>,
+    ) -> bool {
+        // Win32 errors returned by MoveFileExW/CreateSymbolicLinkW at the exact stages above.
+        // Keep this phase-specific: an unexpected path/setup error must not masquerade as a
+        // successful capability-lock test.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        matches!(
+            (stage, raw_os_error),
+            (
+                NamespaceSwapStage::RenameOriginal,
+                Some(ERROR_ACCESS_DENIED) | Some(ERROR_SHARING_VIOLATION)
+            ) | (
+                NamespaceSwapStage::CreateSymlink,
+                Some(ERROR_ACCESS_DENIED) | Some(ERROR_PRIVILEGE_NOT_HELD)
+            )
+        )
+    }
+
+    #[cfg(windows)]
+    fn restore_expected_windows_denial(denial: NamespaceSwapDenial, operation: &str) -> bool {
+        assert!(
+            expected_windows_namespace_swap_denial(denial.stage, denial.error.raw_os_error()),
+            "unexpected Windows {operation} denial at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+            denial.stage,
+            denial.error.kind(),
+            denial.error.raw_os_error(),
+            denial.error
+        );
+        false
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn windows_namespace_swap_denials_are_stage_and_code_specific() {
+        for (stage, raw_os_error) in [
+            (NamespaceSwapStage::RenameOriginal, 5),
+            (NamespaceSwapStage::RenameOriginal, 32),
+            (NamespaceSwapStage::CreateSymlink, 5),
+            (NamespaceSwapStage::CreateSymlink, 1314),
+        ] {
+            assert!(expected_windows_namespace_swap_denial(
+                stage,
+                Some(raw_os_error)
+            ));
+        }
+
+        for (stage, raw_os_error) in [
+            (NamespaceSwapStage::RenameOriginal, 3),
+            (NamespaceSwapStage::RenameOriginal, 33),
+            (NamespaceSwapStage::RenameOriginal, 12345),
+            (NamespaceSwapStage::CreateSymlink, 32),
+            (NamespaceSwapStage::InstallReplacement, 5),
+            (NamespaceSwapStage::InstallReplacement, 32),
+            (NamespaceSwapStage::InstallReplacement, 1314),
+        ] {
+            assert!(!expected_windows_namespace_swap_denial(
+                stage,
+                Some(raw_os_error)
+            ));
+        }
+        assert!(!expected_windows_namespace_swap_denial(
+            NamespaceSwapStage::RenameOriginal,
+            None
+        ));
     }
 
     #[cfg(any(unix, windows))]
@@ -6355,10 +6442,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore namespace after symlink denial");
-                    NamespaceSwap::Denied(error.kind())
+                    NamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::CreateSymlink,
+                        error,
+                    })
                 }
             },
-            Err(error) => NamespaceSwap::Denied(error.kind()),
+            Err(error) => NamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6371,21 +6464,18 @@ mod tests {
                 true
             }
             #[cfg(unix)]
-            NamespaceSwap::Denied(kind) => {
-                panic!("directory swap unexpectedly failed on Unix: {kind:?}")
+            NamespaceSwap::Denied(denial) => {
+                panic!(
+                    "directory swap unexpectedly failed on Unix at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+                    denial.stage,
+                    denial.error.kind(),
+                    denial.error.raw_os_error(),
+                    denial.error
+                )
             }
             #[cfg(windows)]
-            NamespaceSwap::Denied(kind) => {
-                assert!(
-                    matches!(
-                        kind,
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::Unsupported
-                            | std::io::ErrorKind::Other
-                    ),
-                    "unexpected Windows directory-swap error: {kind:?}"
-                );
-                false
+            NamespaceSwap::Denied(denial) => {
+                restore_expected_windows_denial(denial, "directory-swap")
             }
             NamespaceSwap::NotAttempted => panic!("the requested sync boundary was not reached"),
         }
@@ -6405,10 +6495,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore file after symlink denial");
-                    FileNamespaceSwap::Denied(error.kind())
+                    FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::CreateSymlink,
+                        error,
+                    })
                 }
             },
-            Err(error) => FileNamespaceSwap::Denied(error.kind()),
+            Err(error) => FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6426,10 +6522,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore file after replacement denial");
-                    FileNamespaceSwap::Denied(error.kind())
+                    FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::InstallReplacement,
+                        error,
+                    })
                 }
             },
-            Err(error) => FileNamespaceSwap::Denied(error.kind()),
+            Err(error) => FileNamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6442,21 +6544,18 @@ mod tests {
                 true
             }
             #[cfg(unix)]
-            FileNamespaceSwap::Denied(kind) => {
-                panic!("file swap unexpectedly failed on Unix: {kind:?}")
+            FileNamespaceSwap::Denied(denial) => {
+                panic!(
+                    "file swap unexpectedly failed on Unix at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+                    denial.stage,
+                    denial.error.kind(),
+                    denial.error.raw_os_error(),
+                    denial.error
+                )
             }
             #[cfg(windows)]
-            FileNamespaceSwap::Denied(kind) => {
-                assert!(
-                    matches!(
-                        kind,
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::Unsupported
-                            | std::io::ErrorKind::Other
-                    ),
-                    "unexpected Windows file-swap error: {kind:?}"
-                );
-                false
+            FileNamespaceSwap::Denied(denial) => {
+                restore_expected_windows_denial(denial, "file-swap")
             }
         }
     }
@@ -6476,10 +6575,16 @@ mod tests {
                 },
                 Err(error) => {
                     fs::rename(moved, original).expect("restore object after replacement denial");
-                    RegularNamespaceSwap::Denied(error.kind())
+                    RegularNamespaceSwap::Denied(NamespaceSwapDenial {
+                        stage: NamespaceSwapStage::InstallReplacement,
+                        error,
+                    })
                 }
             },
-            Err(error) => RegularNamespaceSwap::Denied(error.kind()),
+            Err(error) => RegularNamespaceSwap::Denied(NamespaceSwapDenial {
+                stage: NamespaceSwapStage::RenameOriginal,
+                error,
+            }),
         }
     }
 
@@ -6496,21 +6601,18 @@ mod tests {
                 true
             }
             #[cfg(unix)]
-            RegularNamespaceSwap::Denied(kind) => {
-                panic!("regular namespace swap unexpectedly failed on Unix: {kind:?}")
+            RegularNamespaceSwap::Denied(denial) => {
+                panic!(
+                    "regular namespace swap unexpectedly failed on Unix at {:?}: kind={:?}, raw_os_error={:?}, error={}",
+                    denial.stage,
+                    denial.error.kind(),
+                    denial.error.raw_os_error(),
+                    denial.error
+                )
             }
             #[cfg(windows)]
-            RegularNamespaceSwap::Denied(kind) => {
-                assert!(
-                    matches!(
-                        kind,
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::Unsupported
-                            | std::io::ErrorKind::Other
-                    ),
-                    "unexpected Windows regular namespace-swap error: {kind:?}"
-                );
-                false
+            RegularNamespaceSwap::Denied(denial) => {
+                restore_expected_windows_denial(denial, "regular namespace-swap")
             }
         }
     }
@@ -6670,6 +6772,7 @@ mod tests {
         boundary: OsvSyncBoundary,
         response: Vec<u8>,
     ) {
+        let expected_response = response.clone();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/npm/all.zip"))
@@ -6705,10 +6808,18 @@ mod tests {
         let outcome = std::mem::replace(&mut *swap.lock().unwrap(), NamespaceSwap::NotAttempted);
         let swapped = restore_namespace_swap(outcome);
 
-        if swapped {
+        if swapped || boundary == OsvSyncBoundary::BeforeHandledErrorCleanup {
             assert!(matches!(result, Err(ProviderError::Cache(_))));
             assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), previous);
             assert_eq!(
+                fs::read_to_string(sync_paths(&cache).1).unwrap(),
+                previous_marker
+            );
+            assert_no_sync_temps(&cache);
+        } else {
+            result.expect("a denied Windows swap must preserve a valid sync");
+            assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), expected_response);
+            assert_ne!(
                 fs::read_to_string(sync_paths(&cache).1).unwrap(),
                 previous_marker
             );
@@ -6947,10 +7058,11 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn capability_relative_sync_confines_a_cache_root_swap() {
+        let replacement = dump_archive_bytes(1024);
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/npm/all.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(dump_archive_bytes(1024)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(replacement.clone()))
             .mount(&server)
             .await;
         let cache_root = tempfile::tempdir().unwrap();
@@ -6987,6 +7099,10 @@ mod tests {
         if swapped {
             assert!(matches!(result, Err(ProviderError::Cache(_))));
             assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), previous);
+            assert_no_sync_temps(&cache);
+        } else {
+            result.expect("a denied Windows root swap must preserve a valid sync");
+            assert_eq!(fs::read(sync_paths(&cache).0).unwrap(), replacement);
             assert_no_sync_temps(&cache);
         }
         assert_external_sync_namespace_unchanged(external.path());
@@ -7046,6 +7162,10 @@ mod tests {
 
             if swapped {
                 assert!(matches!(result, Err(ProviderError::Cache(_))));
+            } else {
+                let (_, lock) =
+                    result.expect("a denied Windows namespace swap must preserve lock acquisition");
+                fs2::FileExt::unlock(&lock).unwrap();
             }
             if boundary == Boundary::Cleanup {
                 assert!(
@@ -7082,6 +7202,9 @@ mod tests {
 
         if swapped {
             assert!(matches!(result, Err(ProviderError::Cache(_))));
+        } else {
+            result.expect("a denied Windows root swap must preserve capability acquisition");
+            assert!(original.join("offline").is_dir());
         }
         assert!(
             fs::read_dir(external.path()).unwrap().next().is_none(),
