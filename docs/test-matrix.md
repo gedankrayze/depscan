@@ -182,6 +182,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-067 | canonical-root and component-normalized Cargo source snapshots, complete `cargo_manifest` integration harness, exact Clippy, and native Windows quality rerun |
 | DS-068 | actionlint, immutable-pin inventory, official Node 24 metadata, zero-warning CI/static/live runs, and release-quality rerun |
 | DS-069 | phase/raw-code Windows swap-denial classifier plus provider capability acquisition, lock, cleanup, sync-publication, and offline-read race tests; native Windows quality rerun |
+| DS-070 | independent unavailable-endpoint, delayed-timeout, and invalid-builder retry/redaction contracts plus native Windows quality rerun |
 
 ## Platform and external evidence boundary
 

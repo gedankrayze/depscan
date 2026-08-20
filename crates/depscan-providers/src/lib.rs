@@ -6137,22 +6137,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_and_timeout_failures_retry_but_builder_failures_do_not() {
+    async fn unavailable_endpoint_retries_with_platform_semantic_transport_detail() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable = listener.local_addr().unwrap();
         drop(listener);
         let connect_runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
         let connect_client =
             test_http_client(connect_runtime.clone(), StdDuration::from_millis(50));
+        let url = format!("http://alice:connect-secret@{unavailable}/metadata?token=query-secret");
 
         let connect_error = connect_client
-            .get_json(&format!("http://{unavailable}/metadata"), HeaderMap::new())
+            .get_json(&url, HeaderMap::new())
             .await
             .unwrap_err();
-        assert_eq!(connect_runtime.sleeps().len(), HTTP_MAX_RETRIES);
-        assert!(connect_error.to_string().contains("connection failed"));
-        assert!(connect_error.to_string().contains("attempt 4/4"));
+        let ProviderError::Network(message) = connect_error else {
+            panic!("retryable transport failure did not return a network error")
+        };
+        assert_eq!(
+            connect_runtime.sleeps(),
+            vec![
+                StdDuration::from_millis(200),
+                StdDuration::from_millis(400),
+                StdDuration::from_millis(800),
+            ]
+        );
+        assert!(
+            message.contains("connection failed") || message.contains("request timed out"),
+            "retryable transport detail was not normalized: {message}"
+        );
+        assert!(message.contains("attempt 4/4"));
+        assert!(message.starts_with(&request_context(&reqwest::Method::GET, &url)));
+        for secret in ["alice", "connect-secret", "query-secret"] {
+            assert!(
+                !message.contains(secret),
+                "error leaked {secret:?}: {message}"
+            );
+        }
+    }
 
+    #[tokio::test]
+    async fn request_timeout_retries_every_attempt() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/slow"))
@@ -6171,11 +6195,21 @@ mod tests {
             .get_json(&format!("{}/slow", server.uri()), HeaderMap::new())
             .await
             .unwrap_err();
-        assert_eq!(timeout_runtime.sleeps().len(), HTTP_MAX_RETRIES);
+        assert_eq!(
+            timeout_runtime.sleeps(),
+            vec![
+                StdDuration::from_millis(200),
+                StdDuration::from_millis(400),
+                StdDuration::from_millis(800),
+            ]
+        );
         assert!(timeout_error.to_string().contains("timed out"));
         assert!(timeout_error.to_string().contains("attempt 4/4"));
         server.verify().await;
+    }
 
+    #[tokio::test]
+    async fn request_builder_failure_is_immediate_and_redacted() {
         let builder_runtime = Arc::new(RecordingRetryRuntime::new(SystemTime::UNIX_EPOCH));
         let builder_client = test_http_client(builder_runtime.clone(), StdDuration::from_secs(1));
         let builder_error = builder_client

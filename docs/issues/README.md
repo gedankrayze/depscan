@@ -88,3 +88,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-067](DS-067.md) | P1 | In progress | Compare Cargo fixture provenance under one canonical root |
 | [DS-068](DS-068.md) | P2 | Closed | Run pinned GitHub Actions on supported Node 24 runtimes |
 | [DS-069](DS-069.md) | P1 | In progress | Classify Windows capability-lock swap denials exactly |
+| [DS-070](DS-070.md) | P1 | In progress | Make transport retry tests platform-semantic |
