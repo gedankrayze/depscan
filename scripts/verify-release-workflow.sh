@@ -119,5 +119,9 @@ if [[ $(grep -Fc 'uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6'
 fi
 grep -Fq 'uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6' <<<"$host_job"
 grep -Fq '            artifacts/*' <<<"$host_job"
+grep -Fq 'plan_manifest=artifacts/plan-dist-manifest.json' <<<"$host_job"
+grep -Fq 'rm -f artifacts/*-dist-manifest.json artifacts/dist-manifest.json' <<<"$host_job"
+grep -Fq 'release plan must contain exactly the 17 reviewed public assets' <<<"$host_job"
+grep -Fq 'release staging does not match the reviewed cargo-dist plan' <<<"$host_job"
 
 echo "release workflow pins, verified bootstrap, and permissions verified"

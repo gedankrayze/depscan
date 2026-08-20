@@ -272,10 +272,40 @@ jobs:
           pattern: artifacts-*
           path: artifacts
           merge-multiple: true
-      - name: Cleanup
+      - name: Validate release asset inventory
+        shell: bash
         run: |
-          # Remove the granular manifests
-          rm -f artifacts/*-dist-manifest.json
+          set -euo pipefail
+          plan_manifest=artifacts/plan-dist-manifest.json
+          if [[ ! -f "$plan_manifest" ]]; then
+            echo "release plan manifest is missing from the downloaded build artifacts" >&2
+            exit 1
+          fi
+
+          expected_assets="$RUNNER_TEMP/expected-release-assets.txt"
+          actual_assets="$RUNNER_TEMP/actual-release-assets.txt"
+          jq -r '.releases[] | select(.display == true) | .artifacts[]' "$plan_manifest" \
+            | LC_ALL=C sort -u > "$expected_assets"
+          if [[ $(wc -l < "$expected_assets") -ne 17 ]]; then
+            echo "release plan must contain exactly the 17 reviewed public assets" >&2
+            cat "$expected_assets" >&2
+            exit 1
+          fi
+
+          # This project publishes only the 17 deliverables enumerated by the reviewed plan.
+          # Phase manifests remain workflow evidence; the host phase uses the plain spelling.
+          rm -f artifacts/*-dist-manifest.json artifacts/dist-manifest.json
+          if find artifacts -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+            echo "release staging contains an unexpected non-file entry" >&2
+            find artifacts -mindepth 1 -maxdepth 1 ! -type f -print >&2
+            exit 1
+          fi
+          find artifacts -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+            | LC_ALL=C sort -u > "$actual_assets"
+          if ! diff -u "$expected_assets" "$actual_assets"; then
+            echo "release staging does not match the reviewed cargo-dist plan" >&2
+            exit 1
+          fi
       - name: Attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
