@@ -241,7 +241,7 @@ for mapping in \
     exit 1
   fi
 done
-grep -Fq '          ref: v1.1.0' "$acceptance_workflow"
+grep -Fq '          ref: v1.2.0' "$acceptance_workflow"
 grep -Fq '          persist-credentials: false' "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '[[ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]' "$acceptance_workflow"
@@ -268,7 +268,7 @@ if [[ $(grep -Fc 'uses: ./release-source' "$acceptance_workflow") -ne 1 ]] \
   echo "release acceptance must use the immutable local tag checkout once without a binary override" >&2
   exit 1
 fi
-grep -Fq '          version: v1.1.0' "$acceptance_workflow"
+grep -Fq '          version: v1.2.0' "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '          output: ${{ runner.temp }}/depscan-published-action-summary.txt' "$acceptance_workflow"
 grep -Fq '          offline: "true"' "$acceptance_workflow"
