@@ -30,7 +30,7 @@ try {
     }
 
     Expand-Archive -LiteralPath $archive -DestinationPath $downloadDir
-    $sourceBinary = Join-Path $downloadDir "cargo-dist-x86_64-pc-windows-msvc/dist.exe"
+    $sourceBinary = Join-Path $downloadDir "dist.exe"
     if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
         throw "Verified cargo-dist archive did not contain the expected executable"
     }

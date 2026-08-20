@@ -157,11 +157,11 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-042 | controlled clock/canonical ordering plus repeated byte-identical process JSON |
 | DS-043 | yanked-current/outdated/partial-file renderer and process matrices |
 | DS-044 | typed-value/conflict/repeat/inference process tests plus help/completion byte snapshots |
-| DS-045 | release-plan/dry-run, tag ancestry, per-target artifact/checksum/provenance/download/startup/scan acceptance in the issue; this cannot be replaced by a unit test |
-| DS-046 | `verify-static-linux.sh`, native musl artifact matrix, scratch-container offline smoke, and runner-owned binary/checksum staging |
+| DS-045 | release-plan/dry-run, exact current-main tag target, prepublication 16-file/paired-plus-aggregate checksum verification with internal manifests excluded, required no-bypass `v*` tag-rule plus host re-peel controls, immutable-ready draft publication, and the five-native-runner `release-acceptance.yml` provenance/download/startup/scan matrix; this cannot be replaced by a unit test |
+| DS-046 | `verify-static-linux.sh`, native musl build-artifact matrix, runner-owned binary/checksum staging, and tag-bound downloaded-archive ELF plus networkless/read-only `scratch` acceptance on both Linux architectures |
 | DS-047 | capability-relative sync race tests at acquisition, lock, cleanup, staging, archive/marker publication, rollback and error boundaries |
 | DS-048 | `secure_fs.rs` config/root/parent/final swap, symlink, atomic creation/replacement and permission-preservation tests plus CLI process checks |
-| DS-049 | `verify-github-action.sh`, typed argument-vector probes, and the Linux `uses: ./` CI smoke; real per-runner release download remains recorded in the issue |
+| DS-049 | `verify-github-action.sh`, typed argument-vector/exit probes, Linux local-binary `uses: ./` CI smoke, and immutable-tag `uses: ./release-source` no-override downloads with exact version/report/byte-identity/provider-exit checks on all five native runners |
 | DS-050 | online cached-registry and offline-dump manifest-to-OSV process tests, including exact/ranged constraints, shared-coordinate mapping, vulnerability exit `1`, and unresolved-cache errors |
 | DS-051 | consumed-field document validator, query-hit match/evaluability tests, hydration cache bypass/non-publication, offline shape parity, and CLI hard/soft malformed-record tests |
 | DS-052 | strict root/workspace manifest fallback fixtures plus unauthorized, missing-executable, provenance, and post-start hard-failure process tests |

@@ -74,6 +74,14 @@ for installer in \
     exit 1
   fi
 done
+# shellcheck disable=SC2016
+grep -Fq '$sourceBinary = Join-Path $downloadDir "depscan.exe"' \
+  scripts/github-action/install-depscan.ps1
+# shellcheck disable=SC2016
+if grep -Fq 'depscan-cli-$target/depscan.exe' scripts/github-action/install-depscan.ps1; then
+  echo "Windows action installer must use cargo-dist's flat ZIP layout" >&2
+  exit 1
+fi
 grep -Fq 'setting("DEPSCAN_ACTION_INSTALLED_BINARY")' \
   scripts/github-action/run-depscan.mjs
 if grep -Eq "['\"]depscan(\\.exe)?['\"]" scripts/github-action/run-depscan.mjs; then

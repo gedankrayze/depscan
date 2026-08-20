@@ -18,6 +18,10 @@ name: Release
 permissions:
   "contents": "read"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 # This task runs when a pushed tag looks version-like. Before any artifact or
 # publishing job, local hardening accepts only vMAJOR.MINOR.PATCH with an
 # optional SemVer prerelease suffix; package-qualified and arbitrary prefix tags
@@ -44,12 +48,14 @@ jobs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
       publishing: ${{ !github.event.pull_request }}
+      release-commit: ${{ steps.release-boundary.outputs.commit }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_TAG: ${{ !github.event.pull_request && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          fetch-depth: 0
           persist-credentials: false
           submodules: recursive
       - name: Install dist
@@ -62,6 +68,25 @@ jobs:
             echo "release tag must be an exact semantic version such as v1.1.0" >&2
             exit 1
           fi
+      - id: release-boundary
+        name: Require the release tag to belong to protected main
+        if: ${{ !github.event.pull_request }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          release_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+          main_commit=$(git rev-parse refs/remotes/origin/main)
+          if [[ "$release_commit" != "$event_commit" ]]; then
+            echo "release tag and tag-push event resolve to different commits" >&2
+            exit 1
+          fi
+          if [[ "$release_commit" != "$main_commit" ]]; then
+            echo "release tag commit must equal the current protected main tip" >&2
+            exit 1
+          fi
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
       # sure would be cool if github gave us proper conditionals...
       # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
       # functionality based on whether this is a pull_request, and whether it's from a fork.
@@ -272,10 +297,36 @@ jobs:
           pattern: artifacts-*
           path: artifacts
           merge-multiple: true
-      - name: Cleanup
+      - name: Validate release asset inventory
+        shell: bash
         run: |
-          # Remove the granular manifests
-          rm -f artifacts/*-dist-manifest.json
+          set -euo pipefail
+          plan_manifest=artifacts/plan-dist-manifest.json
+          if [[ ! -f "$plan_manifest" ]]; then
+            echo "release plan manifest is missing from the downloaded build artifacts" >&2
+            exit 1
+          fi
+
+          expected_assets="$RUNNER_TEMP/expected-release-assets.txt"
+          planned_assets="$RUNNER_TEMP/planned-release-assets.txt"
+          LC_ALL=C sort -u .github/release-assets.txt > "$expected_assets"
+          if ! cmp -s .github/release-assets.txt "$expected_assets" \
+            || [[ $(wc -l < "$expected_assets") -ne 16 ]]; then
+            echo "checked-in release asset contract must contain 16 sorted unique filenames" >&2
+            cat "$expected_assets" >&2
+            exit 1
+          fi
+          jq -r '.releases[] | select(.display == true) | .artifacts[]' "$plan_manifest" \
+            | LC_ALL=C sort -u > "$planned_assets"
+          if ! diff -u "$expected_assets" "$planned_assets"; then
+            echo "cargo-dist plan differs from the checked-in release asset contract" >&2
+            exit 1
+          fi
+
+          # This project publishes only the 16 deliverables enumerated by the reviewed plan.
+          # Phase manifests remain workflow evidence; the host phase uses the plain spelling.
+          rm -f artifacts/*-dist-manifest.json artifacts/dist-manifest.json
+          scripts/verify-release-assets.sh artifacts .github/release-assets.txt
       - name: Attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
@@ -286,17 +337,36 @@ jobs:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_COMMIT: "${{ needs.plan.outputs.release-commit }}"
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
+          set -euo pipefail
           # Write and read notes from a file to avoid quoting breaking things
           printf '%s\n' "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
-          release_args=(--target "$RELEASE_COMMIT" --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt")
+          verify_remote_tag() {
+            remote_commit=$(
+              git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk 'NR == 1 { print $1 }'
+            )
+            if [[ -z "$remote_commit" ]]; then
+              remote_commit=$(
+                git ls-remote origin "refs/tags/$RELEASE_TAG" | awk 'NR == 1 { print $1 }'
+              )
+            fi
+            if [[ "$remote_commit" != "$RELEASE_COMMIT" ]]; then
+              echo "remote release tag no longer resolves to the attested commit" >&2
+              exit 1
+            fi
+          }
+
+          release_args=(--draft --verify-tag --target "$RELEASE_COMMIT" --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt")
           if [[ -n "$PRERELEASE_FLAG" ]]; then
             release_args+=("$PRERELEASE_FLAG")
           fi
+          verify_remote_tag
           gh release create "$RELEASE_TAG" "${release_args[@]}" artifacts/*
+          verify_remote_tag
+          gh release edit "$RELEASE_TAG" --draft=false
 
   announce:
     needs:

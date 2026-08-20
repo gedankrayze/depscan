@@ -53,7 +53,7 @@ try {
     }
 
     Expand-Archive -LiteralPath $archive -DestinationPath $downloadDir
-    $sourceBinary = Join-Path $downloadDir "depscan-cli-$target/depscan.exe"
+    $sourceBinary = Join-Path $downloadDir "depscan.exe"
     if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
         throw "Verified depscan archive did not contain the expected executable"
     }

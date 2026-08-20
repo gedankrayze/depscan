@@ -1,0 +1,16 @@
+depscan-cli-aarch64-apple-darwin.tar.xz
+depscan-cli-aarch64-apple-darwin.tar.xz.sha256
+depscan-cli-aarch64-unknown-linux-musl.tar.xz
+depscan-cli-aarch64-unknown-linux-musl.tar.xz.sha256
+depscan-cli-installer.sh
+depscan-cli-x86_64-apple-darwin.tar.xz
+depscan-cli-x86_64-apple-darwin.tar.xz.sha256
+depscan-cli-x86_64-pc-windows-msvc.msi
+depscan-cli-x86_64-pc-windows-msvc.msi.sha256
+depscan-cli-x86_64-pc-windows-msvc.zip
+depscan-cli-x86_64-pc-windows-msvc.zip.sha256
+depscan-cli-x86_64-unknown-linux-musl.tar.xz
+depscan-cli-x86_64-unknown-linux-musl.tar.xz.sha256
+sha256.sum
+source.tar.gz
+source.tar.gz.sha256
