@@ -56,4 +56,4 @@ optional = true
 include-groups = ["test"]
 
 [tool.poetry.group.docs.dependencies]
-sphinx = { version = "^7.2", extras = ["docs"] }
+sphinx = { version = "^9.0.0", extras = ["docs"] }
