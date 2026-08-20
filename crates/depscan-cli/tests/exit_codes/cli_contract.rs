@@ -149,7 +149,7 @@ fn output_format_inference_and_explicit_precedence_are_stable() {
     project.seed_clean("1.0.0");
     let root = project.directory.path().to_str().expect("UTF-8 path");
 
-    for extension in ["json", "sarif", "txt", "log"] {
+    for extension in ["json", "sarif", "md", "markdown", "txt", "log"] {
         let report = project.directory.path().join(format!("report.{extension}"));
         let output = project.run(&[
             "scan",
@@ -169,6 +169,10 @@ fn output_format_inference_and_explicit_precedence_are_stable() {
             "sarif" => {
                 let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
                 assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("2.1.0"));
+            }
+            "md" | "markdown" => {
+                assert!(contents.starts_with("# depscan report"));
+                assert!(contents.contains("## Summary"));
             }
             "txt" | "log" => {
                 assert!(contents.starts_with("depscan:"));
@@ -228,13 +232,13 @@ fn help_and_subcommand_contracts_match_byte_snapshots() {
     let cases = [
         (
             &["--help"][..],
-            "10bc330d746d85597e467f2d4b74001007d5b5398d2ffa9ec7cf1488f3092025",
-            "9d06a647ad5d52a3848a1beef180180f9f194a9fb0bfd3080e09d11db031b756",
+            "8af470202fa4d8877e364c7fe6c44576434a0cad6511d5e0ee8bb1b3f11912d7",
+            "e27fe16727d77ad313e85c9d92ec1e281286055afd193950f21459d185a2439e",
         ),
         (
             &["scan", "--help"][..],
-            "04da79771018066416cff2365e532a9e3264040d88604482fb82bbc154a09553",
-            "e1126e87cbbeac7607240226f1b53bec1ffb23e9a63b50f0a4e59ae30eb15b36",
+            "b035ad1c147b36f73fc769da5edb552d280070bdc60f5f2345578e34f700e3de",
+            "2f06da4fd1ac0be0c6e6b1c7bbb56d13317aff1de25b86e77b54617fd691eb4a",
         ),
         (
             &["sync", "--help"][..],
@@ -272,11 +276,11 @@ fn generated_completions_match_byte_snapshots_and_advertise_typed_values() {
     for (shell, expected_sha256) in [
         (
             "bash",
-            "e9e469922e7cffb61efeffe0382827ba91caa129effdd824dee5c70aa292285c",
+            "8fd17ded9bb6b334b14b02adc3fdb182461972f529a848c5b86924d2966095f4",
         ),
         (
             "fish",
-            "317f193fba80acbbd95765f23ca7f82c4647605b494b874b6c33474a92fc5756",
+            "6b980ad80615fa0b2581e1a3aa5965fe0b3f652db6919861a0e920a667c5e1d5",
         ),
     ] {
         let output = command(&directory.path().join("cache"))
@@ -286,8 +290,8 @@ fn generated_completions_match_byte_snapshots_and_advertise_typed_values() {
         assert_stdout_snapshot(&output, expected_sha256);
         let script = String::from_utf8_lossy(&output.stdout);
         for value in [
-            "npm", "pypi", "nuget", "cargo", "table", "json", "sarif", "summary", "critical",
-            "high", "medium", "low", "any", "never", "major", "minor", "patch",
+            "npm", "pypi", "nuget", "cargo", "table", "markdown", "json", "sarif", "summary",
+            "critical", "high", "medium", "low", "any", "never", "major", "minor", "patch",
         ] {
             assert!(
                 script.contains(value),

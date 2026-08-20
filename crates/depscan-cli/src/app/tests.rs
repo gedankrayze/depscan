@@ -177,6 +177,13 @@ fn implicit_configuration_cannot_self_authorize_external_tools() {
 
 #[test]
 fn format_output_precedence_and_empty_ecosystem_policy_are_explicit() {
+    let markdown_output = merge_scan_config(
+        scan_args(&["scan-root"]),
+        loaded_config("output = \"report.md\"", false),
+    )
+    .expect("infer Markdown format from configured output");
+    assert_eq!(markdown_output.format, OutputFormat::Markdown);
+
     let configured_output = merge_scan_config(
         scan_args(&["scan-root"]),
         loaded_config("ecosystem = []\noutput = \"report.sarif\"", false),

@@ -20,6 +20,14 @@ fn offline_ecosystem_output_matrix() {
         assert!(table.starts_with("depscan: "));
         assert!(table.contains(&format!("\n{} (", case.display_name)));
 
+        let markdown = run_offline(&cache, *case, "markdown");
+        assert_clean(&markdown, &format!("{} Markdown E2E", case.fixture));
+        let markdown = String::from_utf8(markdown.stdout).expect("UTF-8 Markdown report");
+        assert!(markdown.starts_with("# depscan report"));
+        assert!(markdown.contains("## Summary"));
+        assert!(markdown.contains("## Soft failures"));
+        assert!(markdown.contains(&format!("| Packages | {} |", case.packages.len())));
+
         let summary = run_offline(&cache, *case, "summary");
         assert_clean(&summary, &format!("{} summary E2E", case.fixture));
         let summary = String::from_utf8(summary.stdout).expect("UTF-8 summary report");

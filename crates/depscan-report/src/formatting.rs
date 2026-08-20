@@ -68,7 +68,7 @@ pub(crate) fn paint(input: &str, code: u8, enabled: bool) -> String {
     }
 }
 
-fn suppression_source_label(source: SuppressionSource) -> &'static str {
+pub(crate) fn suppression_source_label(source: SuppressionSource) -> &'static str {
     match source {
         SuppressionSource::Cli => "cli",
         SuppressionSource::Config => "config",

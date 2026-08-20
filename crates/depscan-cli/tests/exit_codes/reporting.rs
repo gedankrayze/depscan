@@ -229,6 +229,7 @@ fn include_withdrawn_controls_rendering_counts_and_exit_in_every_format() {
     let root = project.directory.path().to_str().expect("UTF-8 path");
     let cases = [
         ("table", "RUSTSEC-TEST [WITHDRAWN]"),
+        ("markdown", "| Withdrawn | process-test vulnerability |"),
         ("json", "\"withdrawn\": true"),
         ("sarif", "withdrawn advisory"),
         ("summary", "1 withdrawn"),
@@ -280,6 +281,7 @@ fn yanked_current_is_reported_in_every_format_and_obeys_failure_policy() {
     let root = project.directory.path().to_str().expect("UTF-8 path");
     let cases = [
         ("table", "YANKED"),
+        ("markdown", "Yanked"),
         ("json", "\"yanked\": true"),
         ("sarif", "DEPSCAN-YANKED"),
         ("summary", "1 yanked"),

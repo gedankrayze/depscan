@@ -348,7 +348,7 @@ fn determine_format(args: &ScanArgs) -> Result<OutputFormat, String> {
     if let Some(path) = args.output.as_deref() {
         return OutputFormat::infer(path).ok_or_else(|| {
             format!(
-                "could not infer output format from {}; use --format table|json|sarif|summary",
+                "could not infer output format from {}; use --format table|markdown|json|sarif|summary",
                 path.display()
             )
         });

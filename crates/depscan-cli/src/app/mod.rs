@@ -147,6 +147,7 @@ impl From<EcosystemArg> for Ecosystem {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ReportFormat {
     Table,
+    Markdown,
     Json,
     Sarif,
     Summary,
@@ -156,6 +157,7 @@ impl From<ReportFormat> for OutputFormat {
     fn from(value: ReportFormat) -> Self {
         match value {
             ReportFormat::Table => Self::Table,
+            ReportFormat::Markdown => Self::Markdown,
             ReportFormat::Json => Self::Json,
             ReportFormat::Sarif => Self::Sarif,
             ReportFormat::Summary => Self::Summary,

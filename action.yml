@@ -6,7 +6,7 @@ inputs:
   version:
     description: Exact depscan release tag to download
     required: false
-    default: v1.1.0
+    default: v1.2.0
   binary:
     description: Optional trusted preinstalled depscan executable path; resolved absolutely for local action testing
     required: false
@@ -20,7 +20,7 @@ inputs:
     required: false
     default: auto
   format:
-    description: Report format (table, json, sarif, or summary)
+    description: Report format (table, markdown, json, sarif, or summary)
     required: false
     default: sarif
   output:

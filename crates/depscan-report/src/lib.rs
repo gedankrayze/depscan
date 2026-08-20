@@ -1,11 +1,13 @@
 //! Stable report renderers for human terminals and CI integrations.
 
 mod formatting;
+mod markdown;
 mod sarif;
 mod summary;
 mod table;
 mod totals;
 
+pub use markdown::render_markdown;
 pub use sarif::render_sarif;
 pub use summary::render_summary;
 pub use table::render_table;
@@ -17,6 +19,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Table,
+    Markdown,
     Json,
     Sarif,
     Summary,
@@ -26,6 +29,7 @@ impl OutputFormat {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "table" => Some(Self::Table),
+            "markdown" => Some(Self::Markdown),
             "json" => Some(Self::Json),
             "sarif" => Some(Self::Sarif),
             "summary" => Some(Self::Summary),
@@ -35,6 +39,7 @@ impl OutputFormat {
 
     pub fn infer(path: &Path) -> Option<Self> {
         match path.extension().and_then(|extension| extension.to_str()) {
+            Some("md" | "markdown") => Some(Self::Markdown),
             Some("json") => Some(Self::Json),
             Some("sarif") => Some(Self::Sarif),
             Some("txt" | "log") => Some(Self::Summary),
@@ -50,6 +55,7 @@ pub fn render(
 ) -> Result<String, serde_json::Error> {
     match format {
         OutputFormat::Table => Ok(render_table(document, color)),
+        OutputFormat::Markdown => Ok(render_markdown(document)),
         OutputFormat::Json => serde_json::to_string_pretty(document),
         OutputFormat::Sarif => serde_json::to_string_pretty(&render_sarif(document)),
         OutputFormat::Summary => Ok(render_summary(document)),

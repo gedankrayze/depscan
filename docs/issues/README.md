@@ -94,3 +94,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-073](DS-073.md) | P2 | Closed | Modularize parser architecture and isolate parser tests |
 | [DS-074](DS-074.md) | P2 | Closed | Modularize CLI architecture and isolate CLI tests |
 | [DS-075](DS-075.md) | P2 | Closed | Enforce repository-wide Rust module boundaries |
+| [DS-076](DS-076.md) | P2 | Closed | Add an auditable Markdown report format |

@@ -97,7 +97,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 
 | Contract | Process evidence |
 |---|---|
-| Every ecosystem × table/JSON/SARIF/summary | `e2e_matrix::offline_ecosystem_output_matrix` |
+| Every ecosystem × table/Markdown/JSON/SARIF/summary | `e2e_matrix::offline_ecosystem_output_matrix`; Markdown renderer and process inference tests |
 | Real workspace dogfood without network | `e2e_matrix::offline_workspace_self_scan`, explicitly rerun by every `quality` OS job |
 | Live OSV plus every registry | ignored `live_provider_matrix_for_every_ecosystem`, weekly/manual workflow only |
 | Exit `0` | `clean_scan_exits_zero_and_writes_report_to_stdout` and E2E matrix |
@@ -188,6 +188,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-073 | parser public-API preservation, 74-unit plus complete integration suite, workspace/all-target suite, exact Clippy, stable Cargo snapshots, and an audited 400-line Rust-file ceiling |
 | DS-074 | CLI command/security-boundary modularization, 22 unit and 88 non-live integration tests, exact process/snapshot preservation, workspace/all-target suite, exact Clippy, and an audited 400-line Rust-file ceiling |
 | DS-075 | core/report public-API preservation, 30 core and 10 report tests, repository-wide 400-line and dedicated-test-module enforcement, CI/release-quality wiring guard, workspace/all-target suite, and exact Clippy |
+| DS-076 | Markdown renderer structure/escaping/unresolved-metadata tests; `.md`/`.markdown` inference; withdrawn/yanked process matrices; GitHub Action typed-format probe |
 
 ## Platform and external evidence boundary
 

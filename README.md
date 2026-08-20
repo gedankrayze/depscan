@@ -88,7 +88,7 @@ Cargo-dist 0.32.0 generates the release plan and MSI definition. The checked-in 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v1.1.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v1.2.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
@@ -120,9 +120,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v1.1.0
+    uses: gedankrayze/depscan@v1.2.0
     with:
-      version: v1.1.0
+      version: v1.2.0
       path: .
       format: sarif
       output: depscan.sarif
@@ -133,7 +133,11 @@ The `report` action output contains the configured report path. The action suppo
 
 `--direct-only` removes packages confirmed to be transitive, and `--no-dev` removes packages confirmed to be development-only. When a lockfile cannot prove one of those classifications—for example, a Poetry lock without its sibling manifest—the package is retained. JSON reports distinguish that conservative result with `direct_known` and `dev_known`; the corresponding `direct` or `dev` value must only be interpreted when its `*_known` field is true.
 
-The supported report formats are `table`, `json`, `sarif`, and `summary`. When no format is specified, terminal output uses a table and redirected output uses a one-line summary. A file extension of `.json`, `.sarif`, `.txt`, or `.log` selects a matching format unless `--format` overrides it.
+The supported report formats are `table`, `markdown`, `json`, `sarif`, and `summary`. Markdown reports identify the producing DepScan version and repository, followed by an audit summary plus vulnerability, dependency-status, suppression, and soft-failure tables; all provider-controlled cell content is escaped before rendering. When no format is specified, terminal output uses a table and redirected output uses a one-line summary. A file extension of `.md`, `.markdown`, `.json`, `.sarif`, `.txt`, or `.log` selects a matching format unless `--format` overrides it.
+
+```bash
+depscan scan --format markdown --output depscan.md .
+```
 
 JSON reports contain one RFC 3339 UTC `generated_at` timestamp captured by the scan orchestration. By default it is the real scan time. For byte-reproducible CI evidence, set the standard `SOURCE_DATE_EPOCH` environment variable to an integer number of seconds since the Unix epoch:
 

@@ -48,7 +48,13 @@ try {
     "nuget",
     "cargo",
   ]);
-  const format = oneOf("DEPSCAN_ACTION_FORMAT", ["table", "json", "sarif", "summary"]);
+  const format = oneOf("DEPSCAN_ACTION_FORMAT", [
+    "table",
+    "markdown",
+    "json",
+    "sarif",
+    "summary",
+  ]);
   const failOn = oneOf("DEPSCAN_ACTION_FAIL_ON", [
     "critical",
     "high",

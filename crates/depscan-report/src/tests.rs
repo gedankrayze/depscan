@@ -47,6 +47,10 @@ fn soft_provider_errors_are_visible_in_every_report_format() {
     let summary = render_summary(&document);
     assert!(summary.contains("1 soft failures"));
 
+    let markdown = render_markdown(&document);
+    assert!(markdown.contains("## Soft failures"));
+    assert!(markdown.contains("advisory TEST-FAIL hydration failed"));
+
     let json = render(&document, OutputFormat::Json, false).unwrap();
     assert!(json.contains("\"provider\": \"osv\""));
     assert!(json.contains("TEST-FAIL"));
@@ -192,10 +196,12 @@ fn manifest_resolution_preserves_constraint_and_distinguishes_latest_versions() 
     }]);
 
     let table = render(&document, OutputFormat::Table, false).unwrap();
+    let markdown = render(&document, OutputFormat::Markdown, false).unwrap();
     let json = render(&document, OutputFormat::Json, false).unwrap();
 
     assert!(table.contains("RESOLVED  range-example ^1.2.0 → 1.9.4"));
     assert!(table.contains("latest stable: 2.0.0"));
+    assert!(markdown.contains("| range-example | ^1.2.0 | 1.9.4 | 2.0.0 | Resolved |"));
     assert!(json.contains("\"raw\": \"^1.2.0\""));
     assert!(json.contains("\"normalized\": \"^1.2.0\""));
     assert!(json.contains("\"latest_stable\": \"2.0.0\""));
@@ -206,6 +212,7 @@ fn manifest_resolution_preserves_constraint_and_distinguishes_latest_versions() 
 fn yanked_current_is_visible_in_every_format_and_counted_once() {
     let document = freshness_document(Staleness::Current, true);
     let table = render(&document, OutputFormat::Table, false).unwrap();
+    let markdown = render(&document, OutputFormat::Markdown, false).unwrap();
     let json = render(&document, OutputFormat::Json, false).unwrap();
     let sarif = render(&document, OutputFormat::Sarif, false).unwrap();
     let summary = render(&document, OutputFormat::Summary, false).unwrap();
@@ -213,6 +220,7 @@ fn yanked_current_is_visible_in_every_format_and_counted_once() {
     assert!(table.contains("YANKED"));
     assert!(table.contains("latest non-yanked stable is 1.9.0"));
     assert!(!table.contains("CURRENT"));
+    assert!(markdown.contains("Yanked"));
     assert!(json.contains("\"yanked\": true"));
     assert!(sarif.contains("DEPSCAN-YANKED"));
     assert!(sarif.contains("\"level\": \"warning\""));
@@ -242,6 +250,7 @@ fn non_yanked_current_release_has_no_risk_signal() {
 
     for format in [
         OutputFormat::Table,
+        OutputFormat::Markdown,
         OutputFormat::Json,
         OutputFormat::Sarif,
         OutputFormat::Summary,
@@ -259,11 +268,13 @@ fn non_yanked_current_release_has_no_risk_signal() {
 fn retained_withdrawn_advisory_is_visible_in_every_format_and_total() {
     let document = vulnerability_document(true);
     let table = render(&document, OutputFormat::Table, false).unwrap();
+    let markdown = render(&document, OutputFormat::Markdown, false).unwrap();
     let json = render(&document, OutputFormat::Json, false).unwrap();
     let sarif = render(&document, OutputFormat::Sarif, false).unwrap();
     let summary = render(&document, OutputFormat::Summary, false).unwrap();
 
     assert!(table.contains("GHSA-WITHDRAWN [WITHDRAWN]"));
+    assert!(markdown.contains("| Withdrawn | withdrawn fixture |"));
     assert!(json.contains("\"withdrawn\": true"));
     assert!(sarif.contains("withdrawn advisory"));
     assert!(sarif.contains("\"withdrawn\": true"));
@@ -288,6 +299,11 @@ fn active_advisory_is_not_labeled_withdrawn() {
             .unwrap()
             .contains("withdrawn advisory")
     );
+    assert!(
+        !render(&document, OutputFormat::Markdown, false)
+            .unwrap()
+            .contains("| Withdrawn |")
+    );
     assert_eq!(Totals::from_document(&document).withdrawn, 0);
 }
 
@@ -295,6 +311,7 @@ fn active_advisory_is_not_labeled_withdrawn() {
 fn active_suppression_is_auditable_in_every_format() {
     let document = suppression_document(true);
     let table = render(&document, OutputFormat::Table, false).unwrap();
+    let markdown = render(&document, OutputFormat::Markdown, false).unwrap();
     let json = render(&document, OutputFormat::Json, false).unwrap();
     let sarif = render(&document, OutputFormat::Sarif, false).unwrap();
     let summary = render(&document, OutputFormat::Summary, false).unwrap();
@@ -303,6 +320,10 @@ fn active_suppression_is_auditable_in_every_format() {
     assert!(table.contains("EXPIRED"));
     assert!(table.contains("accepted until the next release"));
     assert!(table.contains("expired rule did not suppress this finding"));
+    assert!(markdown.contains("| Active | example | GHSA-SUPPRESSED | CVE-2099-0001 | config |"));
+    assert!(
+        markdown.contains("| Expired | example | GHSA-SUPPRESSED | GHSA-SUPPRESSED | config |")
+    );
     assert!(json.contains("\"active\": true"));
     assert!(json.contains("\"vulnerability\""));
     assert!(json.contains("\"reason\": \"accepted until the next release\""));
@@ -322,12 +343,14 @@ fn active_suppression_is_auditable_in_every_format() {
 fn expired_only_suppression_keeps_the_vulnerability_actionable() {
     let document = suppression_document(false);
     let table = render(&document, OutputFormat::Table, false).unwrap();
+    let markdown = render(&document, OutputFormat::Markdown, false).unwrap();
     let sarif = render(&document, OutputFormat::Sarif, false).unwrap();
     let summary = render(&document, OutputFormat::Summary, false).unwrap();
 
     assert!(table.contains("HIGH"));
     assert!(table.contains("EXPIRED"));
     assert!(!table.contains("\n  SUPPRESS"));
+    assert!(markdown.contains("| Expired | example | GHSA-SUPPRESSED | CVE-2099-0001 | config |"));
     assert_eq!(sarif.matches("\"ruleId\": \"GHSA-SUPPRESSED\"").count(), 1);
     assert_eq!(
         sarif
