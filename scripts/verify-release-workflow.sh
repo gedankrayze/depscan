@@ -6,6 +6,7 @@ quality_workflow=.github/workflows/release-quality.yml
 acceptance_workflow=.github/workflows/release-acceptance.yml
 asset_contract=.github/release-assets.txt
 asset_verifier=scripts/verify-release-assets.sh
+static_verifier=scripts/verify-static-linux.sh
 installer_action=.github/actions/install-cargo-dist/action.yml
 installer_unix=.github/actions/install-cargo-dist/install-cargo-dist.sh
 installer_windows=.github/actions/install-cargo-dist/install-cargo-dist.ps1
@@ -17,6 +18,7 @@ for required_file in \
   "$acceptance_workflow" \
   "$asset_contract" \
   "$asset_verifier" \
+  "$static_verifier" \
   "$installer_action" \
   "$installer_unix" \
   "$installer_windows" \
@@ -250,6 +252,33 @@ if [[ $(grep -Fc 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' "$a
   echo "release acceptance must use the reviewed checkout v7 pin exactly twice" >&2
   exit 1
 fi
+# shellcheck disable=SC2016
+grep -Fq 'release-source/scripts/verify-static-linux.sh "$ACCEPTANCE_BINARY"' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq 'docker build --network none --tag "$image" "$smoke_root"' "$acceptance_workflow"
+if [[ $(grep -Fc "            'FROM scratch'" "$acceptance_workflow") -ne 1 ]]; then
+  echo "release acceptance must build exactly one literal scratch image" >&2
+  exit 1
+fi
+if [[ $(grep -Fc 'docker run --rm --network none --read-only' "$acceptance_workflow") -ne 3 ]]; then
+  echo "release acceptance must run Linux version, help, and scan inside read-only networkless scratch" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+grep -Fq -- '--mount "type=bind,source=$DEPSCAN_CACHE_DIR,target=/cache,readonly"' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq -- '--mount "type=bind,source=$GITHUB_WORKSPACE/release-source/fixtures/e2e/cargo,target=/project,readonly"' "$acceptance_workflow"
+grep -Fq 'EXPECTED_OFFLINE_SUMMARY: "depscan: 4 packages | 0 vulns | 0 withdrawn | 0 outdated (0 major, 0 yanked) | 0 suppressed | 0 expired ignores | 3 soft failures"' "$acceptance_workflow"
+# shellcheck disable=SC2016
+if [[ $(grep -Fc '[[ "$summary" != "$EXPECTED_OFFLINE_SUMMARY" ]]' "$acceptance_workflow") -ne 2 ]]; then
+  echo "release acceptance must enforce the exact Unix fixture summary twice" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+if [[ $(grep -Fc 'if ($summaryText -ne $env:EXPECTED_OFFLINE_SUMMARY)' "$acceptance_workflow") -ne 1 ]]; then
+  echo "release acceptance must enforce the exact Windows fixture summary" >&2
+  exit 1
+fi
 if [[ $(wc -l < "$asset_contract") -ne 16 ]] \
   || ! cmp -s "$asset_contract" <(LC_ALL=C sort -u "$asset_contract") \
   || grep -Fq 'depscan-cli.rb' "$asset_contract" \
@@ -259,5 +288,6 @@ if [[ $(wc -l < "$asset_contract") -ne 16 ]] \
 fi
 
 shellcheck "$asset_verifier"
+shellcheck "$static_verifier"
 
 echo "release workflow pins, verified bootstrap, and permissions verified"

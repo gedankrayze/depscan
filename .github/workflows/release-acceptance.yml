@@ -114,6 +114,7 @@ jobs:
       RELEASE_REPOSITORY: gedankrayze/depscan
       RELEASE_TAG: v1.1.0
       RELEASE_TARGET: ${{ matrix.target }}
+      EXPECTED_OFFLINE_SUMMARY: "depscan: 4 packages | 0 vulns | 0 withdrawn | 0 outdated (0 major, 0 yanked) | 0 suppressed | 0 expired ignores | 3 soft failures"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -230,6 +231,14 @@ jobs:
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "ACCEPTANCE_BINARY=$binary" -Encoding utf8
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "RELEASE_SHA256=$actual" -Encoding utf8
+      - name: Verify the downloaded Linux artifact is static
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends binutils file
+          release-source/scripts/verify-static-linux.sh "$ACCEPTANCE_BINARY"
       - name: Prepare the Unix offline fixture cache
         if: runner.os != 'Windows'
         shell: bash
@@ -291,6 +300,43 @@ jobs:
           Set-Content -LiteralPath (Join-Path $offline "crates_io.synced-at") `
             -Value $stamp -Encoding utf8
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "DEPSCAN_CACHE_DIR=$cache" -Encoding utf8
+      - name: Smoke the downloaded Linux binary in scratch
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root=$(mktemp -d "${RUNNER_TEMP}/depscan-release-scratch.XXXXXX")
+          install -m 0755 "$ACCEPTANCE_BINARY" "$smoke_root/depscan"
+          printf '%s\n' \
+            'FROM scratch' \
+            'COPY depscan /depscan' \
+            'ENTRYPOINT ["/depscan"]' \
+            > "$smoke_root/Dockerfile"
+
+          image="depscan-release-acceptance:${RELEASE_TARGET}"
+          docker build --network none --tag "$image" "$smoke_root"
+
+          version=$(docker run --rm --network none --read-only "$image" --version)
+          if [[ "$version" != "depscan ${RELEASE_TAG#v}" ]]; then
+            echo "scratch image contains the wrong depscan version: $version" >&2
+            exit 1
+          fi
+          docker run --rm --network none --read-only "$image" --help >/dev/null
+
+          summary=$(
+            docker run --rm --network none --read-only \
+              -e DEPSCAN_CACHE_DIR=/cache \
+              --mount "type=bind,source=$DEPSCAN_CACHE_DIR,target=/cache,readonly" \
+              --mount "type=bind,source=$GITHUB_WORKSPACE/release-source/fixtures/e2e/cargo,target=/project,readonly" \
+              "$image" scan --offline --format summary \
+                --fail-on never --fail-on-outdated never \
+                /project
+          )
+          printf '%s\n' "$summary"
+          if [[ "$summary" != "$EXPECTED_OFFLINE_SUMMARY" ]]; then
+            echo "scratch scan returned an unexpected summary" >&2
+            exit 1
+          fi
       - name: Smoke the downloaded Unix binary
         if: runner.os != 'Windows'
         shell: bash
@@ -304,7 +350,10 @@ jobs:
               release-source/fixtures/e2e/cargo
           )
           printf '%s\n' "$summary"
-          grep -Fq 'depscan: 4 packages | 0 vulns' <<<"$summary"
+          if [[ "$summary" != "$EXPECTED_OFFLINE_SUMMARY" ]]; then
+            echo "downloaded release binary returned an unexpected summary" >&2
+            exit 1
+          fi
           printf 'release target=%s sha256=%s\n' "$RELEASE_TARGET" "$RELEASE_SHA256"
       - name: Smoke the downloaded Windows binary
         if: runner.os == 'Windows'
@@ -327,7 +376,7 @@ jobs:
           }
           $summaryText = ($summary -join "`n").Trim()
           Write-Output $summaryText
-          if ($summaryText -notmatch '^depscan: 4 packages \| 0 vulns') {
+          if ($summaryText -ne $env:EXPECTED_OFFLINE_SUMMARY) {
               throw "Downloaded release binary returned an unexpected summary"
           }
           Write-Output "release target=$($env:RELEASE_TARGET) sha256=$($env:RELEASE_SHA256)"
