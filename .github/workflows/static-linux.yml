@@ -77,16 +77,19 @@ jobs:
             "$image" scan --offline --format summary /project)
           printf '%s\n' "$output"
           grep -F '0 vulns' <<<"$output"
-      - name: Record artifact checksum
+      - name: Stage artifact and record checksum
         shell: bash
         run: |
           set -euo pipefail
-          cd "target/$CARGO_TARGET/release"
+          artifact_dir="artifacts/$CARGO_TARGET"
+          mkdir -p "$artifact_dir"
+          install -m 0755 "target/$CARGO_TARGET/release/depscan" "$artifact_dir/depscan"
+          cd "$artifact_dir"
           sha256sum depscan > depscan.sha256
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: depscan-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/depscan
-            target/${{ matrix.target }}/release/depscan.sha256
+            artifacts/${{ matrix.target }}/depscan
+            artifacts/${{ matrix.target }}/depscan.sha256
           if-no-files-found: error
