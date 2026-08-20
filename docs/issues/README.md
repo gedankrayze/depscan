@@ -79,7 +79,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-058](DS-058.md) | P1 | Closed | Do not classify unproven Node dependencies as known transitive |
 | [DS-059](DS-059.md) | P1 | Closed | Bind Cargo direct and development metadata to exact locked identities |
 | [DS-060](DS-060.md) | P1 | Closed | Make requirements include reads capability-safe |
-| [DS-061](DS-061.md) | P1 | In progress | Preserve the verified GitHub Action executable identity |
+| [DS-061](DS-061.md) | P1 | Closed | Preserve the verified GitHub Action executable identity |
 | [DS-062](DS-062.md) | P2 | Closed | Remove direct use of maintenance-seeking `urlencoding` |
 | [DS-063](DS-063.md) | P1 | Closed | Support suffix-aware npm extglobs safely |
 | [DS-064](DS-064.md) | P1 | In progress | Use full-width held-handle identity at filesystem trust boundaries |
