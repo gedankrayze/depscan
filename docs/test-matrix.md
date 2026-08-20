@@ -185,6 +185,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-070 | independent unavailable-endpoint, delayed-timeout, and invalid-builder retry/redaction contracts plus successful native Windows job `96373789695` |
 | DS-071 | server-pause/client-post-write rendezvous, partial-publication assertions, exact final replacement, and successful native Windows job `96373789695` |
 | DS-072 | provider public-API preservation, 129-test provider suite, workspace/all-target suite, exact Clippy, and an audited 400-line source-file ceiling |
+| DS-073 | parser public-API preservation, 74-unit plus complete integration suite, workspace/all-target suite, exact Clippy, stable Cargo snapshots, and an audited 400-line Rust-file ceiling |
 
 ## Platform and external evidence boundary
 
