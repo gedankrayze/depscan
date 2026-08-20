@@ -83,3 +83,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-062](DS-062.md) | P2 | Closed | Remove direct use of maintenance-seeking `urlencoding` |
 | [DS-063](DS-063.md) | P1 | Closed | Support suffix-aware npm extglobs safely |
 | [DS-064](DS-064.md) | P1 | In progress | Use full-width held-handle identity at filesystem trust boundaries |
+| [DS-065](DS-065.md) | P1 | In progress | Keep platform-gated CLI tests warning-free on Windows |

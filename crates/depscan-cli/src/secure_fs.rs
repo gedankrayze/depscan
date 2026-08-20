@@ -577,8 +577,9 @@ fn normalize_relative(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    #[cfg(not(windows))]
     use std::{
-        fs,
         sync::{Arc, Barrier},
         thread,
     };

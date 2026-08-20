@@ -5,8 +5,13 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
+};
+
+#[cfg(all(unix, debug_assertions))]
+use std::{
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
