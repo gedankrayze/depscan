@@ -1,7 +1,11 @@
 use depscan_core::{DetectedSource, EcosystemParser, Package, SourceKind};
 use depscan_parsers::CargoParser;
 use serde_json::{Value as Json, json};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,7 +26,17 @@ fn parse_inline_cargo(manifest: &str, lock: &str) -> Result<Vec<Package>, String
     parse(directory.path().join("Cargo.lock"), SourceKind::CargoLock)
 }
 
-fn normalized(packages: &[Package], root: &std::path::Path) -> Json {
+fn portable_relative_path(path: &Path) -> String {
+    path.components()
+        .map(|component| match component {
+            Component::Normal(name) => name.to_str().expect("UTF-8 Cargo fixture component"),
+            _ => panic!("Cargo fixture provenance was not a normalized relative path: {path:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn normalized(packages: &[Package], root: &Path) -> Json {
     let canonical_root = fs::canonicalize(root).expect("canonical Cargo fixture root");
     Json::Array(
         packages
@@ -43,7 +57,7 @@ fn normalized(packages: &[Package], root: &std::path::Path) -> Json {
                     "dev_known": package.dev_known,
                     "enrichable": package.enrichable,
                     "resolved_from_range": package.resolved_from_range,
-                    "source": source,
+                    "source": portable_relative_path(source),
                 })
             })
             .collect(),
