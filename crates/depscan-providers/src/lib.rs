@@ -2582,6 +2582,8 @@ struct OsvSyncConfig {
     force_rollback_staging_error: bool,
     #[cfg(test)]
     observed_max_chunk_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    stream_progress: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl OsvSyncConfig {
@@ -2607,6 +2609,8 @@ impl OsvSyncConfig {
             force_rollback_staging_error: false,
             #[cfg(test)]
             observed_max_chunk_bytes: None,
+            #[cfg(test)]
+            stream_progress: None,
         })
     }
 
@@ -2685,6 +2689,10 @@ where
             .write_all(bytes)
             .await
             .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
+        #[cfg(test)]
+        if let Some(progress) = &config.stream_progress {
+            progress.send_replace(downloaded);
+        }
         if downloaded >= next_progress {
             debug!(%url, downloaded, "streaming OSV dump");
             next_progress = downloaded.saturating_add(OSV_DUMP_PROGRESS_INTERVAL_BYTES);
@@ -7414,52 +7422,52 @@ mod tests {
         let previous_marker = "2000-01-01T00:00:00Z";
         seed_sync_files(&cache, &previous, previous_marker);
         let client =
-            HttpClient::with_timeouts(StdDuration::from_millis(50), StdDuration::from_secs(1))
+            HttpClient::with_timeouts(StdDuration::from_secs(30), StdDuration::from_secs(30))
                 .unwrap();
         let observed_chunk_bytes = Arc::new(AtomicUsize::new(0));
+        let (stream_progress, mut streamed_bytes) = tokio::sync::watch::channel(0u64);
         let mut config = test_sync_config(base_url);
+        config.transfer_timeout = StdDuration::from_secs(30);
         config.observed_max_chunk_bytes = Some(observed_chunk_bytes.clone());
+        config.stream_progress = Some(stream_progress);
         let sync_cache = cache.clone();
         let sync = tokio::spawn(async move {
             sync_osv_dumps_with_config(&client, &sync_cache, &[Ecosystem::Npm], &config).await
         });
 
-        tokio::time::timeout(StdDuration::from_secs(2), paused.notified())
-            .await
-            .expect("slow response did not reach its pause");
-        let (archive_path, marker_path) = sync_paths(&cache);
-        assert_eq!(fs::read(&archive_path).unwrap(), previous);
-        assert_eq!(fs::read_to_string(&marker_path).unwrap(), previous_marker);
-
-        let partial_size = tokio::time::timeout(StdDuration::from_secs(1), async {
-            loop {
-                let partial = fs::read_dir(cache.root().join("offline"))
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            paused.notified().await;
+            streamed_bytes
+                .wait_for(|bytes| *bytes > 0)
+                .await
+                .expect("stream progress sender closed before the first write");
+            let (archive_path, marker_path) = sync_paths(&cache);
+            assert_eq!(fs::read(&archive_path).unwrap(), previous);
+            assert_eq!(fs::read_to_string(&marker_path).unwrap(), previous_marker);
+            let partial_size = *streamed_bytes.borrow_and_update();
+            assert!(partial_size > 0);
+            assert!(partial_size < replacement.len() as u64);
+            assert!(
+                fs::read_dir(cache.root().join("offline"))
                     .unwrap()
                     .filter_map(Result::ok)
-                    .find(|entry| entry.file_name().to_string_lossy().ends_with(".zip.tmp"))
-                    .and_then(|entry| entry.metadata().ok())
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-                if partial > 0 {
-                    break partial;
-                }
-                sleep(StdDuration::from_millis(5)).await;
-            }
+                    .any(|entry| entry.file_name().to_string_lossy().ends_with(".zip.tmp")),
+                "the client write did not target the held temporary file"
+            );
+
+            resume.notify_one();
+            let paths = sync.await.unwrap().unwrap();
+            server.await.unwrap();
+            assert_eq!(paths, vec![archive_path.clone()]);
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert!(observed_chunk_bytes.load(Ordering::SeqCst) > 0);
+            assert!(observed_chunk_bytes.load(Ordering::SeqCst) < replacement.len());
+            assert_eq!(fs::read(&archive_path).unwrap(), replacement);
+            assert_ne!(fs::read_to_string(marker_path).unwrap(), previous_marker);
+            assert_no_sync_temps(&cache);
         })
         .await
-        .expect("streamed bytes were not written to the temporary file");
-        assert!(partial_size < replacement.len() as u64);
-
-        resume.notify_one();
-        let paths = sync.await.unwrap().unwrap();
-        server.await.unwrap();
-        assert_eq!(paths, vec![archive_path.clone()]);
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert!(observed_chunk_bytes.load(Ordering::SeqCst) > 0);
-        assert!(observed_chunk_bytes.load(Ordering::SeqCst) < replacement.len());
-        assert_eq!(fs::read(&archive_path).unwrap(), replacement);
-        assert_ne!(fs::read_to_string(marker_path).unwrap(), previous_marker);
-        assert_no_sync_temps(&cache);
+        .expect("slow stream did not complete the server/client/write/publication sequence");
     }
 
     #[tokio::test]
