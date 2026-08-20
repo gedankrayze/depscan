@@ -186,6 +186,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-071 | server-pause/client-post-write rendezvous, partial-publication assertions, exact final replacement, and successful native Windows job `96373789695` |
 | DS-072 | provider public-API preservation, 129-test provider suite, workspace/all-target suite, exact Clippy, and an audited 400-line source-file ceiling |
 | DS-073 | parser public-API preservation, 74-unit plus complete integration suite, workspace/all-target suite, exact Clippy, stable Cargo snapshots, and an audited 400-line Rust-file ceiling |
+| DS-074 | CLI command/security-boundary modularization, 22 unit and 88 non-live integration tests, exact process/snapshot preservation, workspace/all-target suite, exact Clippy, and an audited 400-line Rust-file ceiling |
 
 ## Platform and external evidence boundary
 
