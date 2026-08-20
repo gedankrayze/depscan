@@ -2222,7 +2222,14 @@ fn malformed_scan_config_does_not_affect_non_scan_commands() {
 
     assert_exit(&output, 0);
     assert!(output.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&output.stdout).contains(&project.cache.to_string_lossy()[..]));
+    let stdout = String::from_utf8(output.stdout).expect("cache path is UTF-8");
+    let mut lines = stdout.lines();
+    let reported = PathBuf::from(lines.next().expect("cache path output"));
+    assert!(lines.next().is_none(), "cache path output must be one line");
+    assert_eq!(
+        reported,
+        fs::canonicalize(&project.cache).expect("canonical cache path")
+    );
 
     for arguments in [&["completions", "bash"][..], &["sync", "--help"][..]] {
         let output = command(&project.cache)
@@ -3293,29 +3300,39 @@ fn help_and_subcommand_contracts_match_byte_snapshots() {
         (
             &["--help"][..],
             "10bc330d746d85597e467f2d4b74001007d5b5398d2ffa9ec7cf1488f3092025",
+            "9d06a647ad5d52a3848a1beef180180f9f194a9fb0bfd3080e09d11db031b756",
         ),
         (
             &["scan", "--help"][..],
             "04da79771018066416cff2365e532a9e3264040d88604482fb82bbc154a09553",
+            "e1126e87cbbeac7607240226f1b53bec1ffb23e9a63b50f0a4e59ae30eb15b36",
         ),
         (
             &["sync", "--help"][..],
             "fd120e80384cb8a4b1cd7e3452e4d46512f88791c6f5a856514e19f2cbdc5dc0",
+            "66a947961b2ad4628a202fb1619fa2e80c507217c8983e67be558a8b954ee8c8",
         ),
         (
             &["cache", "--help"][..],
             "6652e14a617b9afe15c2db0394d21dde4544b92dd58f75f33bbcb0cfa75ce05f",
+            "f775873438292ac5af31a5d142dc1cd2ce3714c378b8c25d7ec935a2177dc5cd",
         ),
         (
             &["completions", "--help"][..],
             "e64f7f2ad60e86fdaab63e9c6a77ffc71069e2dd57124461bd51c09d657d4eb5",
+            "c7f90f5f245ebbe42844c6242d54e5b7f246d03130e70f82b4ff4fcf16efd203",
         ),
     ];
-    for (arguments, expected_sha256) in cases {
+    for (arguments, unix_sha256, windows_sha256) in cases {
         let output = command(&directory.path().join("cache"))
             .args(arguments)
             .output()
             .expect("render help snapshot");
+        let expected_sha256 = if cfg!(windows) {
+            windows_sha256
+        } else {
+            unix_sha256
+        };
         assert_stdout_snapshot(&output, expected_sha256);
     }
 }
