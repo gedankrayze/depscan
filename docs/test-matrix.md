@@ -179,6 +179,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-064 | core `file_identity::{retained_handle_identity_distinguishes_replacement_files,retained_handle_identity_matches_a_hard_link_alias,borrowed_and_owned_constructors_identify_the_same_handle,windows_identity_compares_all_file_id_bytes,unsupported_platform_fails_closed}`; CLI `secure_fs::{config_regular_file_replacement_is_denied_or_detected,output_regular_file_replacement_is_denied_or_detected_before_publication}`; provider `cache_sentinel_regular_replacement_is_denied_or_detected` plus `capability_relative_offline_reads_reject_root_child_and_final_name_swaps`; native Linux/Windows runtime remains pending |
 | DS-065 | exact all-target Clippy, focused CLI secure-filesystem and exit-code harnesses, and native Windows strict-Clippy jobs `96352453674` / `96352465577` |
 | DS-066 | platform-specific exact help snapshots, canonical cache-path assertion, complete CLI exit-code harness, and native Windows quality rerun |
+| DS-067 | canonical-root Cargo source snapshots, complete `cargo_manifest` integration harness, exact Clippy, and native Windows quality rerun |
 
 ## Platform and external evidence boundary
 

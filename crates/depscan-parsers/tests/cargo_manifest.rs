@@ -23,10 +23,16 @@ fn parse_inline_cargo(manifest: &str, lock: &str) -> Result<Vec<Package>, String
 }
 
 fn normalized(packages: &[Package], root: &std::path::Path) -> Json {
+    let canonical_root = fs::canonicalize(root).expect("canonical Cargo fixture root");
     Json::Array(
         packages
             .iter()
             .map(|package| {
+                let canonical_source =
+                    fs::canonicalize(&package.source_file).expect("canonical Cargo package source");
+                let source = canonical_source
+                    .strip_prefix(&canonical_root)
+                    .expect("Cargo source is inside canonical fixture root");
                 json!({
                     "name": package.name,
                     "display_name": package.display_name,
@@ -37,7 +43,7 @@ fn normalized(packages: &[Package], root: &std::path::Path) -> Json {
                     "dev_known": package.dev_known,
                     "enrichable": package.enrichable,
                     "resolved_from_range": package.resolved_from_range,
-                    "source": package.source_file.strip_prefix(root).unwrap(),
+                    "source": source,
                 })
             })
             .collect(),

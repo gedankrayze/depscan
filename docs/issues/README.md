@@ -85,3 +85,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-064](DS-064.md) | P1 | In progress | Use full-width held-handle identity at filesystem trust boundaries |
 | [DS-065](DS-065.md) | P1 | Closed | Keep platform-gated CLI tests warning-free on Windows |
 | [DS-066](DS-066.md) | P1 | In progress | Make CLI contract tests exact across native path conventions |
+| [DS-067](DS-067.md) | P1 | In progress | Compare Cargo fixture provenance under one canonical root |
