@@ -113,7 +113,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 
 | Issue | Regression test or gate |
 |---|---|
-| DS-001 | `git check-ignore`, Renovate config validation, PR-policy positive/negative probes, and required-ruleset evidence recorded in the issue |
+| DS-001 | `git check-ignore`, Renovate config validation, fixture-only alert triage, PR-policy positive/negative probes, and required-protection evidence recorded in the issue |
 | DS-002 | provider CVSS table plus CLI vulnerability exit `1` |
 | DS-003 | core NuGet identity, canonical-case OSV mock, lowercase registry-coordinate test |
 | DS-004 | core PEP 440 tables and PyPI selector tests |
