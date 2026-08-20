@@ -161,7 +161,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-046 | `verify-static-linux.sh`, native musl build-artifact matrix, runner-owned binary/checksum staging, and tag-bound downloaded-archive ELF plus networkless/read-only `scratch` acceptance on both Linux architectures |
 | DS-047 | capability-relative sync race tests at acquisition, lock, cleanup, staging, archive/marker publication, rollback and error boundaries |
 | DS-048 | `secure_fs.rs` config/root/parent/final swap, symlink, atomic creation/replacement and permission-preservation tests plus CLI process checks |
-| DS-049 | `verify-github-action.sh`, typed argument-vector probes, and the Linux `uses: ./` CI smoke; real per-runner release download remains recorded in the issue |
+| DS-049 | `verify-github-action.sh`, typed argument-vector/exit probes, Linux local-binary `uses: ./` CI smoke, and immutable-tag `uses: ./release-source` no-override downloads with exact version/report/byte-identity/provider-exit checks on all five native runners |
 | DS-050 | online cached-registry and offline-dump manifest-to-OSV process tests, including exact/ranged constraints, shared-coordinate mapping, vulnerability exit `1`, and unresolved-cache errors |
 | DS-051 | consumed-field document validator, query-hit match/evaluability tests, hydration cache bypass/non-publication, offline shape parity, and CLI hard/soft malformed-record tests |
 | DS-052 | strict root/workspace manifest fallback fixtures plus unauthorized, missing-executable, provenance, and post-start hard-failure process tests |

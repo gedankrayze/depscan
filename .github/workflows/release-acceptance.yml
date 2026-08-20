@@ -300,6 +300,173 @@ jobs:
           Set-Content -LiteralPath (Join-Path $offline "crates_io.synced-at") `
             -Value $stamp -Encoding utf8
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "DEPSCAN_CACHE_DIR=$cache" -Encoding utf8
+      - id: published_action
+        name: Run the immutable tagged action without a binary override
+        uses: ./release-source
+        with:
+          version: v1.1.0
+          path: release-source/fixtures/e2e/cargo
+          ecosystem: cargo
+          format: summary
+          output: ${{ runner.temp }}/depscan-published-action-summary.txt
+          fail-on: never
+          fail-on-outdated: never
+          offline: "true"
+      - name: Verify the tagged action result on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ACTION_REPORT: ${{ steps.published_action.outputs.report }}
+        run: |
+          set -euo pipefail
+          expected_report="$RUNNER_TEMP/depscan-published-action-summary.txt"
+          if [[ "$ACTION_REPORT" != "$expected_report" ]] \
+            || [[ ! "$DEPSCAN_ACTION_INSTALLED_BINARY" = /* ]] \
+            || [[ ! -x "$DEPSCAN_ACTION_INSTALLED_BINARY" ]]; then
+            echo "tagged action did not expose the expected report and installed binary" >&2
+            exit 1
+          fi
+          if [[ "$($DEPSCAN_ACTION_INSTALLED_BINARY --version)" != "depscan ${RELEASE_TAG#v}" ]]; then
+            echo "tagged action installed the wrong depscan version" >&2
+            exit 1
+          fi
+          if ! cmp -s "$DEPSCAN_ACTION_INSTALLED_BINARY" "$ACCEPTANCE_BINARY"; then
+            echo "action download differs from the independently attested archive binary" >&2
+            exit 1
+          fi
+          action_summary=$(cat -- "$expected_report")
+          if [[ "$action_summary" != "$EXPECTED_OFFLINE_SUMMARY" ]]; then
+            echo "tagged action returned an unexpected report" >&2
+            exit 1
+          fi
+      - name: Verify the tagged action result on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ACTION_REPORT: ${{ steps.published_action.outputs.report }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expectedReport = Join-Path $env:RUNNER_TEMP "depscan-published-action-summary.txt"
+          $actionReport = (Resolve-Path -LiteralPath $env:ACTION_REPORT).Path
+          $expectedReport = (Resolve-Path -LiteralPath $expectedReport).Path
+          if ($actionReport -ne $expectedReport `
+              -or -not [IO.Path]::IsPathFullyQualified($env:DEPSCAN_ACTION_INSTALLED_BINARY) `
+              -or -not (Test-Path -LiteralPath $env:DEPSCAN_ACTION_INSTALLED_BINARY -PathType Leaf)) {
+              throw "Tagged action did not expose the expected report and installed binary"
+          }
+          $version = (& $env:DEPSCAN_ACTION_INSTALLED_BINARY --version) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $version.Trim() -ne "depscan $($env:RELEASE_TAG.Substring(1))") {
+              throw "Tagged action installed the wrong depscan version: $version"
+          }
+          $actionHash = (Get-FileHash -LiteralPath $env:DEPSCAN_ACTION_INSTALLED_BINARY -Algorithm SHA256).Hash
+          $archiveHash = (Get-FileHash -LiteralPath $env:ACCEPTANCE_BINARY -Algorithm SHA256).Hash
+          if ($actionHash -ne $archiveHash) {
+              throw "Action download differs from the independently attested archive binary"
+          }
+          $actionSummary = (Get-Content -LiteralPath $expectedReport -Raw).Trim()
+          if ($actionSummary -ne $env:EXPECTED_OFFLINE_SUMMARY) {
+              throw "Tagged action returned an unexpected report"
+          }
+      - id: provider_failure_unix
+        name: Preserve provider exit 30 through the tagged Unix action runner
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        shell: bash
+        env:
+          DEPSCAN_CACHE_DIR: ${{ runner.temp }}/depscan-action-provider-failure-cache
+          DEPSCAN_ACTION_BINARY: ""
+          DEPSCAN_ACTION_PATH_INPUT: release-source/fixtures/e2e/cargo
+          DEPSCAN_ACTION_ECOSYSTEM: cargo
+          DEPSCAN_ACTION_FORMAT: summary
+          DEPSCAN_ACTION_OUTPUT: ""
+          DEPSCAN_ACTION_FAIL_ON: never
+          DEPSCAN_ACTION_FAIL_ON_OUTDATED: never
+          DEPSCAN_ACTION_OFFLINE: "true"
+          DEPSCAN_ACTION_NO_CACHE: "false"
+          DEPSCAN_ACTION_NO_DEV: "false"
+          DEPSCAN_ACTION_DIRECT_ONLY: "false"
+          DEPSCAN_ACTION_INCLUDE_WITHDRAWN: "false"
+        run: |
+          set -euo pipefail
+          if [[ -e "$DEPSCAN_CACHE_DIR" ]]; then
+            echo "provider-failure cache unexpectedly exists" >&2
+            exit 1
+          fi
+          stdout="$RUNNER_TEMP/depscan-action-provider-failure.stdout"
+          stderr="$RUNNER_TEMP/depscan-action-provider-failure.stderr"
+          set +e
+          node release-source/scripts/github-action/run-depscan.mjs >"$stdout" 2>"$stderr"
+          exit_code=$?
+          set -e
+          cat -- "$stderr" >&2
+          if [[ "$exit_code" -ne 30 ]] || ! grep -Fq 'provider hard failure' "$stderr"; then
+            echo "tagged action runner did not preserve provider exit 30" >&2
+            exit 1
+          fi
+          printf '30\n' > "$RUNNER_TEMP/depscan-action-provider-exit.txt"
+          exit "$exit_code"
+      - id: provider_failure_windows
+        name: Preserve provider exit 30 through the tagged Windows action runner
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          DEPSCAN_CACHE_DIR: ${{ runner.temp }}/depscan-action-provider-failure-cache
+          DEPSCAN_ACTION_BINARY: ""
+          DEPSCAN_ACTION_PATH_INPUT: release-source/fixtures/e2e/cargo
+          DEPSCAN_ACTION_ECOSYSTEM: cargo
+          DEPSCAN_ACTION_FORMAT: summary
+          DEPSCAN_ACTION_OUTPUT: ""
+          DEPSCAN_ACTION_FAIL_ON: never
+          DEPSCAN_ACTION_FAIL_ON_OUTDATED: never
+          DEPSCAN_ACTION_OFFLINE: "true"
+          DEPSCAN_ACTION_NO_CACHE: "false"
+          DEPSCAN_ACTION_NO_DEV: "false"
+          DEPSCAN_ACTION_DIRECT_ONLY: "false"
+          DEPSCAN_ACTION_INCLUDE_WITHDRAWN: "false"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (Test-Path -LiteralPath $env:DEPSCAN_CACHE_DIR) {
+              throw "Provider-failure cache unexpectedly exists"
+          }
+          $stdout = Join-Path $env:RUNNER_TEMP "depscan-action-provider-failure.stdout"
+          $stderr = Join-Path $env:RUNNER_TEMP "depscan-action-provider-failure.stderr"
+          & node "release-source/scripts/github-action/run-depscan.mjs" 1> $stdout 2> $stderr
+          $exitCode = $LASTEXITCODE
+          $stderrText = Get-Content -LiteralPath $stderr -Raw
+          [Console]::Error.Write($stderrText)
+          if ($exitCode -ne 30 -or $stderrText -notmatch 'provider hard failure') {
+              throw "Tagged action runner did not preserve provider exit 30"
+          }
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "depscan-action-provider-exit.txt") `
+            -Value "30" -Encoding utf8
+          exit $exitCode
+      - name: Require tagged Unix action failure evidence
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        env:
+          FAILURE_OUTCOME: ${{ steps.provider_failure_unix.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$FAILURE_OUTCOME" != failure ]] \
+            || [[ "$(tr -d '\r\n' < "$RUNNER_TEMP/depscan-action-provider-exit.txt")" != 30 ]]; then
+            echo "tagged Unix action failure contract was not observed" >&2
+            exit 1
+          fi
+      - name: Require tagged Windows action failure evidence
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          FAILURE_OUTCOME: ${{ steps.provider_failure_windows.outcome }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sentinel = Join-Path $env:RUNNER_TEMP "depscan-action-provider-exit.txt"
+          if ($env:FAILURE_OUTCOME -ne "failure" `
+              -or -not (Test-Path -LiteralPath $sentinel -PathType Leaf) `
+              -or (Get-Content -LiteralPath $sentinel -Raw).Trim() -ne "30") {
+              throw "Tagged Windows action failure contract was not observed"
+          }
       - name: Smoke the downloaded Linux binary in scratch
         if: runner.os == 'Linux'
         shell: bash

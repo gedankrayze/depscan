@@ -252,6 +252,52 @@ if [[ $(grep -Fc 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' "$a
   echo "release acceptance must use the reviewed checkout v7 pin exactly twice" >&2
   exit 1
 fi
+if [[ $(grep -Fc 'uses: ./release-source' "$acceptance_workflow") -ne 1 ]] \
+  || grep -Eq '^[[:space:]]+binary:' "$acceptance_workflow" \
+  || grep -Fq 'uses: gedankrayze/depscan@' "$acceptance_workflow"; then
+  echo "release acceptance must use the immutable local tag checkout once without a binary override" >&2
+  exit 1
+fi
+grep -Fq '          version: v1.1.0' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '          output: ${{ runner.temp }}/depscan-published-action-summary.txt' "$acceptance_workflow"
+grep -Fq '          offline: "true"' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq 'if ! cmp -s "$DEPSCAN_ACTION_INSTALLED_BINARY" "$ACCEPTANCE_BINARY"; then' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '$actionHash = (Get-FileHash -LiteralPath $env:DEPSCAN_ACTION_INSTALLED_BINARY -Algorithm SHA256).Hash' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '[[ "$($DEPSCAN_ACTION_INSTALLED_BINARY --version)" != "depscan ${RELEASE_TAG#v}" ]]' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '$version.Trim() -ne "depscan $($env:RELEASE_TAG.Substring(1))"' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '$version = (& $env:DEPSCAN_ACTION_INSTALLED_BINARY --version) -join "`n"' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '[[ "$action_summary" != "$EXPECTED_OFFLINE_SUMMARY" ]]' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '$actionSummary -ne $env:EXPECTED_OFFLINE_SUMMARY' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '$archiveHash = (Get-FileHash -LiteralPath $env:ACCEPTANCE_BINARY -Algorithm SHA256).Hash' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq 'if ($actionHash -ne $archiveHash) {' "$acceptance_workflow"
+if [[ $(grep -Fc 'continue-on-error: true' "$acceptance_workflow") -ne 2 ]]; then
+  echo "release acceptance must exercise provider failure on Unix and Windows" >&2
+  exit 1
+fi
+grep -Fq 'id: provider_failure_unix' "$acceptance_workflow"
+grep -Fq 'id: provider_failure_windows' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '[[ "$exit_code" -ne 30 ]]' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '$exitCode -ne 30' "$acceptance_workflow"
+# shellcheck disable=SC2016
+grep -Fq '$PSNativeCommandUseErrorActionPreference = $false' "$acceptance_workflow"
+grep -Fq 'steps.provider_failure_unix.outcome' "$acceptance_workflow"
+grep -Fq 'steps.provider_failure_windows.outcome' "$acceptance_workflow"
+if [[ $(grep -Fc 'provider hard failure' "$acceptance_workflow") -ne 2 ]]; then
+  echo "release acceptance must bind both provider-failure probes to the typed diagnostic" >&2
+  exit 1
+fi
 # shellcheck disable=SC2016
 grep -Fq 'release-source/scripts/verify-static-linux.sh "$ACCEPTANCE_BINARY"' "$acceptance_workflow"
 # shellcheck disable=SC2016
