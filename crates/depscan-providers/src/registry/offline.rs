@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RegistryOffline {
     pub(crate) cache: Cache,
     pub(crate) now: DateTime<Utc>,

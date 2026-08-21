@@ -7,6 +7,15 @@ pub struct HttpClient {
     pub(crate) retry_runtime: Arc<dyn RetryRuntime>,
     pub(crate) retry_settings: RetrySettings,
 }
+impl std::fmt::Debug for HttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpClient")
+            .field("request_timeout", &self.request_timeout)
+            .field("retry_settings", &self.retry_settings)
+            .finish_non_exhaustive()
+    }
+}
+
 impl HttpClient {
     pub fn new() -> Result<Self, ProviderError> {
         Self::with_timeouts(HTTP_REQUEST_TIMEOUT, HTTP_REQUEST_TIMEOUT)

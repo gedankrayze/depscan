@@ -101,7 +101,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-080](DS-080.md) | P2 | Closed | Bound multiplicative retry amplification across cache and HTTP layers |
 | [DS-081](DS-081.md) | P2 | Closed | Add a wall-clock deadline to OSV batch pagination |
 | [DS-082](DS-082.md) | P2 | Closed | Remove the redundant enrichment concurrency limiter |
-| [DS-083](DS-083.md) | P1 | Open | Prepare the published API surface for growth before the next release |
+| [DS-083](DS-083.md) | P1 | Closed | Prepare the published API surface for growth before the next release |
 | [DS-084](DS-084.md) | P2 | Closed | Consolidate duplicated OSV identity matching and package dedup |
 | [DS-085](DS-085.md) | P2 | Closed | Replace panic-prone indexing with typed lookups |
 | [DS-086](DS-086.md) | P2 | Closed | Prune unused and misplaced dependency declarations |

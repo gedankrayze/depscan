@@ -17,6 +17,7 @@ use depscan_core::ScanDocument;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutputFormat {
     Table,
     Markdown,

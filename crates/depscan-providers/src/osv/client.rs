@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OsvClient {
     pub(crate) http: HttpClient,
     pub(crate) cache: Cache,

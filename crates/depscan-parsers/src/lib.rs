@@ -109,6 +109,14 @@ fn parse_yaml_document(path: &Path, text: &str) -> Result<Yaml, ParseError> {
 pub struct ParserSet {
     parsers: Vec<Box<dyn EcosystemParser>>,
 }
+
+impl std::fmt::Debug for ParserSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParserSet")
+            .field("parsers", &self.parsers.len())
+            .finish_non_exhaustive()
+    }
+}
 impl Default for ParserSet {
     fn default() -> Self {
         Self {

@@ -326,7 +326,7 @@ impl Cache {
         Ok(stats)
     }
 }
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CacheStats {
     pub files: u64,
     pub bytes: u64,

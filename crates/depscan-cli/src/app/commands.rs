@@ -96,9 +96,7 @@ async fn sync(args: SyncArgs) -> Result<AppExit, CliError> {
         &http,
         &cache,
         &ecosystems.into_iter().collect::<Vec<_>>(),
-        OsvSyncOptions {
-            transfer_timeout: args.transfer_timeout,
-        },
+        OsvSyncOptions::default().with_transfer_timeout(args.transfer_timeout),
     )
     .await
     .map_err(CliError::provider)?;

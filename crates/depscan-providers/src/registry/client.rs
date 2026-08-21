@@ -2,6 +2,7 @@ use super::*;
 
 // One semaphore per ecosystem; the match in `semaphore` makes a new `Ecosystem` variant a
 // compile error here instead of a runtime lookup panic.
+#[derive(Debug)]
 pub(crate) struct RegistryLimits {
     npm: Semaphore,
     pypi: Semaphore,
@@ -29,7 +30,7 @@ impl RegistryLimits {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RegistryClient {
     pub(crate) http: HttpClient,
     pub(crate) cache: Cache,

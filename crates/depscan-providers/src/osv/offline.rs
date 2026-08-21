@@ -40,7 +40,7 @@ impl OsvDumpValidationContext<'_> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OsvOffline {
     pub(crate) cache: Cache,
     pub(crate) limits: OsvDumpLimits,

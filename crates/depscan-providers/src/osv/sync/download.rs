@@ -1,12 +1,20 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct OsvSyncOptions {
     /// Maximum wall-clock time for one dump transfer attempt.
     ///
     /// The HTTP client's ten-second connect/read-idle deadline still applies. A transfer may run
     /// longer than ten seconds while bytes continue to arrive, up to this overall deadline.
     pub transfer_timeout: StdDuration,
+}
+
+impl OsvSyncOptions {
+    pub fn with_transfer_timeout(mut self, transfer_timeout: StdDuration) -> Self {
+        self.transfer_timeout = transfer_timeout;
+        self
+    }
 }
 
 impl Default for OsvSyncOptions {
