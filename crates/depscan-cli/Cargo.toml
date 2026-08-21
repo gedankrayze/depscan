@@ -30,7 +30,6 @@ depscan-parsers.workspace = true
 depscan-providers.workspace = true
 depscan-report.workspace = true
 futures.workspace = true
-anyhow.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 cap-tempfile.workspace = true
@@ -48,7 +47,6 @@ tempfile.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 sha2.workspace = true
-tempfile.workspace = true
 zip.workspace = true
 
 [lints]
