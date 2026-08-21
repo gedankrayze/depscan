@@ -1,0 +1,41 @@
+name: Dependency audit
+
+# Scheduled advisory scanning of this repository's own dependency tree. The PR-time dogfood
+# self-scan runs offline against cached fixtures, so without this job a newly published
+# advisory affecting Cargo.lock would go unnoticed until the next dependency bump.
+on:
+  schedule:
+    - cron: "43 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rustsec-audit:
+    name: RustSec advisories for Cargo.lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit the locked dependency tree
+        run: cargo audit
+
+  self-scan:
+    name: Live depscan self-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+      - name: Build the CLI
+        run: cargo build --release --locked -p depscan-cli
+      - name: Scan this workspace against live OSV data
+        run: ./target/release/depscan scan --ecosystem cargo --fail-on high --format summary .
