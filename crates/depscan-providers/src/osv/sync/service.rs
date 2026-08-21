@@ -54,9 +54,28 @@ pub(crate) async fn sync_osv_dumps_with_config(
         let archive_name = OsString::from(format!("{ecosystem_slug}.zip"));
         let marker_name = OsString::from(format!("{ecosystem_slug}.synced-at"));
         let path = dir.display_path(&archive_name);
+        // The `dir.revalidate()` and `validate_marker_target` probes deliberately stay inline:
+        // they are a bounded set of metadata syscalls on an already-open directory handle, and
+        // keeping them on the async side preserves the exact boundary-hook ordering the swap
+        // safety tests inject failures into. The expensive operations — temporary-file
+        // creation, the marker write and fsync, and the publication rename/fsync sequence —
+        // run on the blocking pool.
         validate_marker_target(&dir, &marker_name)?;
         let temp_prefix = format!(".{ecosystem_slug}-");
-        let archive_temp = CapabilityTempFile::new(&dir, &temp_prefix, ".zip.tmp")?;
+        let archive_temp = {
+            let temp_dir = dir.clone();
+            let prefix = temp_prefix.clone();
+            tokio::task::spawn_blocking(move || {
+                CapabilityTempFile::new(&temp_dir, &prefix, ".zip.tmp")
+            })
+            .await
+            .map_err(|error| {
+                ProviderError::Cache(format!(
+                    "OSV temporary-file task for {} failed: {error}",
+                    eco.osv_name()
+                ))
+            })??
+        };
         #[cfg(test)]
         config.reach_boundary(OsvSyncBoundary::AfterTemporaryCreation);
         dir.revalidate()?;
@@ -96,11 +115,26 @@ pub(crate) async fn sync_osv_dumps_with_config(
         }
 
         dir.revalidate()?;
-        let mut marker_temp = CapabilityTempFile::new(&dir, &temp_prefix, ".synced-at.tmp")?;
-        marker_temp
-            .write_all(Utc::now().to_rfc3339().as_bytes())
-            .and_then(|_| marker_temp.as_file().sync_all())
-            .map_err(|error| ProviderError::Cache(error.to_string()))?;
+        let marker_temp = {
+            let marker_dir = dir.clone();
+            let prefix = temp_prefix.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut marker_temp =
+                    CapabilityTempFile::new(&marker_dir, &prefix, ".synced-at.tmp")?;
+                marker_temp
+                    .write_all(Utc::now().to_rfc3339().as_bytes())
+                    .and_then(|_| marker_temp.as_file().sync_all())
+                    .map_err(|error| ProviderError::Cache(error.to_string()))?;
+                Ok::<_, ProviderError>(marker_temp)
+            })
+            .await
+            .map_err(|error| {
+                ProviderError::Cache(format!(
+                    "OSV marker task for {} failed: {error}",
+                    eco.osv_name()
+                ))
+            })??
+        };
         #[cfg(test)]
         config.reach_boundary(OsvSyncBoundary::BeforeRollbackStaging);
         dir.revalidate()?;
@@ -126,15 +160,30 @@ pub(crate) async fn sync_osv_dumps_with_config(
 
         dir.revalidate()?;
         validate_marker_target(&dir, &marker_name)?;
-        publish_osv_pair(
-            &dir,
-            archive_temp,
-            marker_temp,
-            &archive_name,
-            &marker_name,
-            previous_archive,
-            config,
-        )?;
+        {
+            let publish_dir = dir.clone();
+            let publish_archive_name = archive_name.clone();
+            let publish_marker_name = marker_name.clone();
+            let publish_config = config.clone();
+            tokio::task::spawn_blocking(move || {
+                publish_osv_pair(
+                    &publish_dir,
+                    archive_temp,
+                    marker_temp,
+                    &publish_archive_name,
+                    &publish_marker_name,
+                    previous_archive,
+                    &publish_config,
+                )
+            })
+            .await
+            .map_err(|error| {
+                ProviderError::Cache(format!(
+                    "OSV publication task for {} failed: {error}",
+                    eco.osv_name()
+                ))
+            })??;
+        }
         dir.revalidate()?;
         let _ = fs2::FileExt::unlock(&sync_lock);
         written.push(path);
