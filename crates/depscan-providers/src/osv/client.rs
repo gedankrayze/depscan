@@ -1,11 +1,12 @@
 use super::*;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OsvClient {
     pub(crate) http: HttpClient,
     pub(crate) cache: Cache,
     pub(crate) concurrency: Arc<Semaphore>,
     pub(crate) base_url: String,
+    pub(crate) batch_deadline: StdDuration,
 }
 impl OsvClient {
     pub fn new(http: HttpClient, cache: Cache) -> Self {
@@ -22,7 +23,14 @@ impl OsvClient {
             cache,
             concurrency: Arc::new(Semaphore::new(16)),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            batch_deadline: OSV_QUERY_BATCH_DEADLINE,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_batch_deadline(mut self, deadline: StdDuration) -> Self {
+        self.batch_deadline = deadline;
+        self
     }
     #[cfg(test)]
     pub(crate) async fn query_batch(
@@ -45,7 +53,20 @@ impl OsvClient {
             .map(|index| (index, None::<String>))
             .collect::<Vec<_>>();
 
+        let started = tokio::time::Instant::now();
         while !pending.is_empty() {
+            // Checked between round-trips; each in-flight request is separately bounded by the
+            // HTTP request timeout, so the practical bound is the deadline plus one request.
+            if started.elapsed() > self.batch_deadline {
+                let error = ProviderError::Network(format!(
+                    "OSV batch query exceeded its {}-second pagination deadline",
+                    self.batch_deadline.as_secs()
+                ));
+                for (index, _) in &pending {
+                    failures[*index] = Some(error.clone());
+                }
+                break;
+            }
             let queries = pending
                 .iter()
                 .map(|(index, page_token)| (&batch[*index], page_token.as_deref()))
@@ -133,7 +154,7 @@ impl OsvClient {
             })
             .collect()
     }
-    pub(crate) fn publish_hydrated_document(
+    pub(crate) async fn publish_hydrated_document(
         &self,
         cache_key: &str,
         id: &str,
@@ -143,7 +164,7 @@ impl OsvClient {
     ) -> Result<PublishedHydration, ProviderError> {
         let candidate_modified = validate_osv_document(value, Some(id))?.modified;
         let ttl = Duration::hours(24 * 3650);
-        let mut generation = self.cache.snapshot("osv/vuln", cache_key, ttl);
+        let mut generation = self.cache.snapshot("osv/vuln", cache_key, ttl).await;
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
             if let Some(current) = &generation
                 && let Ok(current_modified) = validate_osv_document(&current.value, Some(id))
@@ -155,14 +176,18 @@ impl OsvClient {
                     reusable: self.cache.policy.read && current.fresh,
                 });
             }
-            match self.cache.put_if_unchanged(
-                "osv/vuln",
-                cache_key,
-                generation.as_ref(),
-                value,
-                etag.clone(),
-                ttl,
-            )? {
+            match self
+                .cache
+                .put_if_unchanged(
+                    "osv/vuln",
+                    cache_key,
+                    generation.clone(),
+                    value,
+                    etag.clone(),
+                    ttl,
+                )
+                .await?
+            {
                 CacheCommit::Written => {
                     return Ok(PublishedHydration {
                         value: value.clone(),
@@ -183,7 +208,8 @@ impl OsvClient {
         let cache_key = revision.cache_key();
         if let Some((value, _)) = self
             .cache
-            .get("osv/vuln", &cache_key, Duration::hours(24 * 3650))
+            .get_if_fresh("osv/vuln", &cache_key, Duration::hours(24 * 3650))
+            .await
         {
             match validate_osv_document(&value, Some(&revision.id)) {
                 Ok(document) if document.modified >= revision.modified => {
@@ -221,13 +247,16 @@ impl OsvClient {
             id: revision.id.clone(),
             modified: actual_modified,
         };
-        let mut published = match self.publish_hydrated_document(
-            &actual_revision.cache_key(),
-            &revision.id,
-            &value,
-            etag,
-            true,
-        ) {
+        let mut published = match self
+            .publish_hydrated_document(
+                &actual_revision.cache_key(),
+                &revision.id,
+                &value,
+                etag,
+                true,
+            )
+            .await
+        {
             Ok(published) => published,
             Err(error) => {
                 return Ok(HydratedDocument {
@@ -237,13 +266,16 @@ impl OsvClient {
             }
         };
         if actual_revision != *revision {
-            published = match self.publish_hydrated_document(
-                &cache_key,
-                &revision.id,
-                &published.value,
-                None,
-                published.reusable,
-            ) {
+            published = match self
+                .publish_hydrated_document(
+                    &cache_key,
+                    &revision.id,
+                    &published.value,
+                    None,
+                    published.reusable,
+                )
+                .await
+            {
                 Ok(published) => published,
                 Err(error) => {
                     let value = if self.cache.policy.read && published.reusable {

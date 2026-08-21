@@ -14,7 +14,8 @@ use depscan_core::{
     Ecosystem, EnrichError, FileIdentity, LatestVersions, NuGetVersion, Package, ProviderError,
     RegistryEnrichment, Severity, VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome,
     Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
-    latest_matching_version, normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
+    latest_matching_version, normalize_name, osv_affected_identity_matches,
+    pypi_version_is_prerelease, pypi_version_is_stable,
 };
 use directories::{BaseDirs, ProjectDirs};
 use fs2::FileExt;
@@ -52,6 +53,10 @@ const USER_AGENT_VALUE: &str = concat!(
 );
 const OSV_QUERY_TTL_SECS: i64 = 60 * 60;
 const OSV_MAX_QUERY_PAGES: usize = 1_000;
+// Wall-clock bound for one OSV batch query across all of its pagination round-trips. The page
+// cap alone would let a slow or adversarial server hold a scan for hours at ten seconds per
+// page; five minutes comfortably covers real pagination while keeping the wait interruptible.
+const OSV_QUERY_BATCH_DEADLINE: StdDuration = StdDuration::from_secs(5 * 60);
 const REGISTRY_TTL_SECS: i64 = 6 * 60 * 60;
 const CACHE_COMMIT_ATTEMPTS: usize = 3;
 const NPM_REGISTRY_BASE_URL: &str = "https://registry.npmjs.org";

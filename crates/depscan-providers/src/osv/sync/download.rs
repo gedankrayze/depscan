@@ -1,12 +1,20 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct OsvSyncOptions {
     /// Maximum wall-clock time for one dump transfer attempt.
     ///
     /// The HTTP client's ten-second connect/read-idle deadline still applies. A transfer may run
     /// longer than ten seconds while bytes continue to arrive, up to this overall deadline.
     pub transfer_timeout: StdDuration,
+}
+
+impl OsvSyncOptions {
+    pub fn with_transfer_timeout(mut self, transfer_timeout: StdDuration) -> Self {
+        self.transfer_timeout = transfer_timeout;
+        self
+    }
 }
 
 impl Default for OsvSyncOptions {
@@ -17,7 +25,8 @@ impl Default for OsvSyncOptions {
     }
 }
 
-#[cfg(test)]
+/// Named checkpoints between the sync steps. In production `OsvSyncConfig::checkpoint` treats
+/// them purely as revalidation points; under test they also drive boundary-injection hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OsvSyncBoundary {
     AfterTemporaryCreation,
@@ -40,12 +49,17 @@ pub(crate) struct OsvSyncConfig {
     pub(crate) backoff_base: StdDuration,
     pub(crate) max_retry_delay: StdDuration,
     #[cfg(test)]
+    pub(crate) hooks: OsvSyncTestHooks,
+}
+
+// The single seam for every test-only observation of the sync pipeline; production code calls
+// the always-present helper methods below, which compile to no-ops without the hooks.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct OsvSyncTestHooks {
     pub(crate) boundary_hook: Option<Arc<dyn Fn(OsvSyncBoundary) + Send + Sync>>,
-    #[cfg(test)]
     pub(crate) force_rollback_staging_error: bool,
-    #[cfg(test)]
     pub(crate) observed_max_chunk_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    #[cfg(test)]
     pub(crate) stream_progress: Option<tokio::sync::watch::Sender<u64>>,
 }
 
@@ -67,13 +81,7 @@ impl OsvSyncConfig {
             backoff_base: OSV_DUMP_BACKOFF_BASE,
             max_retry_delay: OSV_DUMP_MAX_RETRY_DELAY,
             #[cfg(test)]
-            boundary_hook: None,
-            #[cfg(test)]
-            force_rollback_staging_error: false,
-            #[cfg(test)]
-            observed_max_chunk_bytes: None,
-            #[cfg(test)]
-            stream_progress: None,
+            hooks: OsvSyncTestHooks::default(),
         })
     }
 
@@ -96,8 +104,38 @@ impl OsvSyncConfig {
 
     #[cfg(test)]
     pub(crate) fn reach_boundary(&self, boundary: OsvSyncBoundary) {
-        if let Some(hook) = &self.boundary_hook {
+        if let Some(hook) = &self.hooks.boundary_hook {
             hook(boundary);
+        }
+    }
+
+    /// Revalidates the offline directory at a named step boundary. Under test the boundary is
+    /// also reported to the injection hook first, so swap-safety tests can act between steps.
+    pub(crate) fn checkpoint(
+        &self,
+        directory: &OfflineDirectory,
+        boundary: OsvSyncBoundary,
+    ) -> Result<(), ProviderError> {
+        #[cfg(test)]
+        self.reach_boundary(boundary);
+        #[cfg(not(test))]
+        let _ = boundary;
+        directory.revalidate()
+    }
+
+    #[inline]
+    fn observe_chunk(&self, _length: usize) {
+        #[cfg(test)]
+        if let Some(observed) = &self.hooks.observed_max_chunk_bytes {
+            observed.fetch_max(_length, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn report_stream_progress(&self, _downloaded: u64) {
+        #[cfg(test)]
+        if let Some(progress) = &self.hooks.stream_progress {
+            progress.send_replace(_downloaded);
         }
     }
 }
@@ -131,10 +169,7 @@ where
             retry_after: None,
         })?;
         let bytes = chunk.as_ref();
-        #[cfg(test)]
-        if let Some(observed) = &config.observed_max_chunk_bytes {
-            observed.fetch_max(bytes.len(), std::sync::atomic::Ordering::Relaxed);
-        }
+        config.observe_chunk(bytes.len());
         downloaded = downloaded.checked_add(bytes.len() as u64).ok_or_else(|| {
             OsvDownloadFailure::Fatal(ProviderError::InvalidResponse(format!(
                 "{url}: OSV dump size overflowed"
@@ -152,10 +187,7 @@ where
             .write_all(bytes)
             .await
             .map_err(|error| OsvDownloadFailure::Fatal(ProviderError::Cache(error.to_string())))?;
-        #[cfg(test)]
-        if let Some(progress) = &config.stream_progress {
-            progress.send_replace(downloaded);
-        }
+        config.report_stream_progress(downloaded);
         if downloaded >= next_progress {
             debug!(%url, downloaded, "streaming OSV dump");
             next_progress = downloaded.saturating_add(OSV_DUMP_PROGRESS_INTERVAL_BYTES);

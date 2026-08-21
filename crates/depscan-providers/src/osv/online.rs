@@ -17,7 +17,8 @@ impl VulnProvider for OsvClient {
             let query_cache_key = osv_query_cache_key(package);
             let generation = self
                 .cache
-                .snapshot("osv/query", &query_cache_key, query_ttl);
+                .snapshot("osv/query", &query_cache_key, query_ttl)
+                .await;
             if self.cache.policy.read
                 && let Some(cached) = &generation
                 && cached.fresh
@@ -36,6 +37,11 @@ impl VulnProvider for OsvClient {
             }
         }
 
+        // A cache-commit conflict deliberately re-queries the batch (bounded by
+        // CACHE_COMMIT_ATTEMPTS) instead of converging locally: the re-query re-enforces the
+        // revision-regression check against the server rather than trusting a concurrent local
+        // write, and the concurrent-refresh race tests pin that behavior. Batch queries make the
+        // bounded extra round-trips cheap relative to the per-package registry paths.
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
             if missing.is_empty() {
                 break;
@@ -107,14 +113,18 @@ impl VulnProvider for OsvClient {
                             continue;
                         }
                     };
-                    match self.cache.put_if_unchanged(
-                        "osv/query",
-                        &osv_query_cache_key(&package),
-                        generation.as_ref(),
-                        &value,
-                        None,
-                        query_ttl,
-                    ) {
+                    match self
+                        .cache
+                        .put_if_unchanged(
+                            "osv/query",
+                            &osv_query_cache_key(&package),
+                            generation,
+                            &value,
+                            None,
+                            query_ttl,
+                        )
+                        .await
+                    {
                         Ok(CacheCommit::Written) => {
                             // The validated network result was already retained for this scan.
                         }

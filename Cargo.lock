@@ -83,12 +83,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -197,9 +191,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cap-fs-ext"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b"
+checksum = "56ff379b70af8e08307a8f65e7040c7301cb4a572538ade16b4984f0da77847f"
 dependencies = [
  "cap-primitives",
  "cap-std",
@@ -209,9 +203,9 @@ dependencies = [
 
 [[package]]
 name = "cap-primitives"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdadbd7c002d3a484b35243669abdae85a0ebaded5a61117169dc3400f9a7ff0"
+checksum = "8b5f74729fd2f44701d1a8eb47e906cdb3ccd9ec0f02baad85a744b791940b18"
 dependencies = [
  "ambient-authority",
  "fs-set-times",
@@ -227,9 +221,9 @@ dependencies = [
 
 [[package]]
 name = "cap-std"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
+checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
 dependencies = [
  "cap-primitives",
  "io-extras",
@@ -239,9 +233,9 @@ dependencies = [
 
 [[package]]
 name = "cap-tempfile"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42f22d5c0b1147e8bd9105fa004450f673c139d7e632f7edc3980f94a51f20f3"
+checksum = "038b3f6a5d4b5641b1bb99d638eb7a22013de84f81c528d8930de06d7383fbd5"
 dependencies = [
  "cap-std",
  "rand 0.9.5",
@@ -477,9 +471,8 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "depscan-cli"
-version = "1.2.0"
+version = "2.0.0"
 dependencies = [
- "anyhow",
  "cap-fs-ext",
  "cap-std",
  "cap-tempfile",
@@ -505,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-core"
-version = "1.2.0"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -521,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-parsers"
-version = "1.2.0"
+version = "2.0.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -536,7 +529,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
  "toml",
  "tracing",
  "unicode-general-category",
@@ -546,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-providers"
-version = "1.2.0"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "cap-fs-ext",
@@ -566,7 +558,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 2.0.20",
  "tokio",
  "tracing",
  "wiremock",
@@ -575,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-report"
-version = "1.2.0"
+version = "2.0.0"
 dependencies = [
  "chrono",
  "depscan-core",
@@ -1382,9 +1373,9 @@ dependencies = [
 
 [[package]]
 name = "noyalib"
-version = "0.0.25"
+version = "0.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39e4b278236e6bc151420f042b7ec16f3902a8b534f8a605a6277d85c1430e51"
+checksum = "db7cb50aa7b401e6520d3ef64e0f782f010e2c4e0ee4c31a5fce58d2fa322f29"
 dependencies = [
  "hashbrown",
  "indexmap",

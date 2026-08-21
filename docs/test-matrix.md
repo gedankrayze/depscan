@@ -7,16 +7,16 @@ This document is the durable index from the version 0.1 development specificatio
 Run the deterministic suite without public network access:
 
 ```bash
-cargo +1.97.1 fmt --all -- --check
-cargo +1.97.1 test --workspace --all-targets --locked
-cargo +1.97.1 clippy --all-targets -- -D warnings
-cargo +1.95.0 test --workspace --all-targets --locked
+cargo +1.98.0 fmt --all -- --check
+cargo +1.98.0 test --workspace --all-targets --locked
+cargo +1.98.0 clippy --all-targets -- -D warnings
+cargo +1.96.0 test --workspace --all-targets --locked
 ```
 
 The ignored live provider suite is deliberately opt-in and belongs in the scheduled workflow, not pull-request CI:
 
 ```bash
-DEPSCAN_RUN_LIVE=1 cargo +1.97.1 test --locked -p depscan-cli \
+DEPSCAN_RUN_LIVE=1 cargo +1.98.0 test --locked -p depscan-cli \
   --test e2e_matrix live_provider_matrix_for_every_ecosystem \
   -- --exact --ignored --nocapture
 ```
@@ -137,7 +137,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-022 | CLI/config merge unit tests and complete config process tests |
 | DS-023 | `tool_fallbacks.rs` nine sandbox/authorization/failure tests plus parser `tool_outputs.rs` |
 | DS-024 | `cargo metadata`, package-list/package-build checks for every workspace crate |
-| DS-025 | pinned 1.97.1 quality matrix and 1.95.0 MSRV job/tests |
+| DS-025 | pinned 1.98.0 quality matrix and 1.96.0 MSRV job/tests |
 | DS-026 | locked workspace gates, direct-version audit, `cargo audit` |
 | DS-027 | pnpm/Yarn YAML anchor/duplicate/merge/depth/scalar safety tests |
 | DS-028 | this inventory, native registry mocks, four-ecosystem process E2E, offline dogfood, ignored live suite |
@@ -157,11 +157,11 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-042 | controlled clock/canonical ordering plus repeated byte-identical process JSON |
 | DS-043 | yanked-current/outdated/partial-file renderer and process matrices |
 | DS-044 | typed-value/conflict/repeat/inference process tests plus help/completion byte snapshots |
-| DS-045 | release-plan/dry-run, exact current-main tag target, prepublication 16-file/paired-plus-aggregate checksum verification with internal manifests excluded, required no-bypass `v*` tag-rule plus host re-peel controls, immutable-ready draft publication, and the five-native-runner `release-acceptance.yml` provenance/download/startup/scan matrix; this cannot be replaced by a unit test |
-| DS-046 | `verify-static-linux.sh`, native musl build-artifact matrix, runner-owned binary/checksum staging, and tag-bound downloaded-archive ELF plus networkless/read-only `scratch` acceptance on both Linux architectures |
+| DS-045 | release-plan/dry-run, exact current-main tag target, prepublication 16-file/paired-plus-aggregate checksum verification with internal manifests excluded, required no-bypass `v*` tag-rule plus host re-peel controls, immutable-ready draft publication, tag run `32380870606`, and five-native-runner acceptance run `32382623588` |
+| DS-046 | `verify-static-linux.sh`, native musl build-artifact matrix, runner-owned binary/checksum staging, and v1.2.0 acceptance jobs `96469635920`/`96469635949` proving downloaded-archive ELF plus networkless/read-only `scratch` execution on both Linux architectures |
 | DS-047 | capability-relative sync race tests at acquisition, lock, cleanup, staging, archive/marker publication, rollback and error boundaries |
 | DS-048 | `secure_fs.rs` config/root/parent/final swap, symlink, atomic creation/replacement and permission-preservation tests plus CLI process checks |
-| DS-049 | `verify-github-action.sh`, typed argument-vector/exit probes, Linux local-binary `uses: ./` CI smoke, and immutable-tag `uses: ./release-source` no-override downloads with exact version/report/byte-identity/provider-exit checks on all five native runners |
+| DS-049 | `verify-github-action.sh`, typed argument-vector/exit probes, Linux local-binary `uses: ./` CI smoke, and v1.2.0 acceptance run `32382623588` with immutable-tag `uses: ./release-source` no-override downloads plus exact version/report/byte-identity/provider-exit checks on all five native runners |
 | DS-050 | online cached-registry and offline-dump manifest-to-OSV process tests, including exact/ranged constraints, shared-coordinate mapping, vulnerability exit `1`, and unresolved-cache errors |
 | DS-051 | consumed-field document validator, query-hit match/evaluability tests, hydration cache bypass/non-publication, offline shape parity, and CLI hard/soft malformed-record tests |
 | DS-052 | strict root/workspace manifest fallback fixtures plus unauthorized, missing-executable, provenance, and post-start hard-failure process tests |
@@ -189,6 +189,27 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-074 | CLI command/security-boundary modularization, 22 unit and 88 non-live integration tests, exact process/snapshot preservation, workspace/all-target suite, exact Clippy, and an audited 400-line Rust-file ceiling |
 | DS-075 | core/report public-API preservation, 30 core and 10 report tests, repository-wide 400-line and dedicated-test-module enforcement, CI/release-quality wiring guard, workspace/all-target suite, and exact Clippy |
 | DS-076 | Markdown renderer structure/escaping/unresolved-metadata tests; `.md`/`.markdown` inference; withdrawn/yanked process matrices; GitHub Action typed-format probe |
+| DS-077 | provider `cache_publication_under_lock_contention_keeps_the_runtime_responsive` plus async cache snapshot/read/CAS wrappers and the full provider suite |
+| DS-078 | process `broken_pipe::{offline_scan_with_closed_stdout_keeps_the_scan_exit_code,completions_with_closed_stdout_exit_cleanly,cache_path_with_closed_stdout_exits_cleanly}` |
+| DS-079 | offline registry and sync filesystem work isolated through bounded `spawn_blocking`; provider offline/sync suites and strict Clippy |
+| DS-080 | registry conflict tests proving one normal network fetch, local adoption of a fresh winner, and bounded no-cache refetch behavior |
+| DS-081 | `batch_pagination_stops_at_the_wall_clock_deadline` plus partial-package soft-failure/query-cache controls |
+| DS-082 | provider online enrichment suite with the single `buffer_unordered` concurrency owner and removal audit for the redundant limiter |
+| DS-083 | public API compile/doc review; non-exhaustive error/report/sync surfaces; Debug and CacheStats trait tests; DS-097 major-version gate |
+| DS-084 | core OSV identity and `dedup_packages` tests plus parser/CLI equivalence coverage after duplicate implementation removal |
+| DS-085 | exhaustive `RegistryLimits::semaphore` matching, registry budget test, and yarn selector error-path fixtures |
+| DS-086 | release build/package checks, direct dependency-tree audit, and workspace/all-target suite after manifest pruning |
+| DS-087 | package/API review plus full workspace and package verification after removing or demoting dead public items |
+| DS-088 | CVSS v3/v4 scoring tests, report snapshots, checked sentinel allocation, and DS-097 major-version gate |
+| DS-089 | sync test-hook module and complete 132-test provider suite, including publication/capability/download regressions |
+| DS-090 | CLI diagnostics process tests proving config-origin and configured verbosity logging after early tracing initialization |
+| DS-091 | weekly/manual `dependency-audit.yml`: RustSec `cargo audit` plus live workspace self-scan; first protected-main dispatch and negative advisory experiment remain external evidence |
+| DS-092 | `SECURITY.md`, README link, enabled GitHub private vulnerability reporting, and pending protected-main Security-tab pickup |
+| DS-093 | release-workflow pin/count verifier and release-mode local gates; first v7 tag-driven native execution remains external evidence |
+| DS-094 | `verify-ci-policy.sh` exact stable/MSRV comment-and-SHA consistency across every workflow toolchain pin |
+| DS-095 | release-mode package-cache purge followed by five-crate `cargo package --workspace --allow-dirty --locked` verification |
+| DS-096 | stable 1.98.0 full gate and MSRV 1.96.0 workspace/all-target check/test; protected Ubuntu/Windows matrix remains external evidence |
+| DS-097 | exact workspace/action/README/installer/report/acceptance 2.0.0 alignment, lockfile-only workspace version delta, full release gate, verified cargo-dist `generate --check`, reviewed 16-file `v2.0.0` plan, and read-only immutable-tag-control preflight |
 
 ## Platform and external evidence boundary
 

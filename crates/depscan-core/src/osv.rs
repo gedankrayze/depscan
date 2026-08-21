@@ -166,7 +166,7 @@ pub fn evaluate_osv_affected(
 
     for raw_entry in affected
         .iter()
-        .filter(|entry| affected_identity_matches(entry, package))
+        .filter(|entry| osv_affected_identity_matches(entry, package))
     {
         let entry: AffectedEntry = serde_json::from_value(raw_entry.clone())
             .map_err(|error| OsvEvaluationError::MalformedAffected(error.to_string()))?;
@@ -212,7 +212,10 @@ pub fn evaluate_osv_affected(
     })
 }
 
-fn affected_identity_matches(entry: &Value, package: &Package) -> bool {
+/// Returns whether one OSV `affected[]` entry names this package's ecosystem and (normalized)
+/// name. Shared by range evaluation here and severity scoring in the providers so the two can
+/// never disagree about which advisories apply to a package.
+pub fn osv_affected_identity_matches(entry: &Value, package: &Package) -> bool {
     let Some(affected_package) = entry.get("package") else {
         return false;
     };

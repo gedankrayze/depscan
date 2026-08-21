@@ -88,7 +88,7 @@ Cargo-dist 0.32.0 generates the release plan and MSI definition. The checked-in 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v1.2.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v2.0.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
@@ -120,9 +120,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v1.2.0
+    uses: gedankrayze/depscan@v2.0.0
     with:
-      version: v1.2.0
+      version: v2.0.0
       path: .
       format: sarif
       output: depscan.sarif
@@ -224,7 +224,7 @@ Version freshness is evaluated from cached registry metadata when a usable entry
 
 ## Development
 
-The pinned toolchain is the latest verified stable patch (Rust 1.97.1 as of 2026-08-19). The supported MSRV follows an N−2 stable policy and is currently Rust 1.95.0. On each stable Rust release, refresh the pin, move the MSRV to the new N−2 release, update CI, and verify both toolchains before merging.
+The pinned toolchain is the latest verified stable patch (Rust 1.98.0 as of 2026-08-21). The supported MSRV follows an N−2 stable policy and is currently Rust 1.96.0. On each stable Rust release, refresh the pin, move the MSRV to the new N−2 release, update CI, and verify both toolchains before merging.
 
 The workspace is divided at its architectural boundaries:
 
@@ -242,17 +242,44 @@ rather than alongside production implementations. The architecture check runs in
 release quality gates without an exception list.
 
 ```bash
-bash scripts/check-rust-architecture.sh
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace --all-targets
+bash scripts/dev-gate.sh quick
+bash scripts/dev-gate.sh full    # frozen ordinary change
+bash scripts/dev-gate.sh release # use instead of full for release-sensitive changes
 ```
+
+`scripts/dev-gate.sh` is the canonical local validation entry point. The full mode runs
+the architecture check, formatting, exact strict Clippy invocation, all-target workspace
+tests, action and release verifiers, and patch hygiene; release mode adds package and
+release-binary verification. Run focused tests while iterating, then one full gate on the
+frozen tree.
+
+Repository-specific agent guidance lives in [`AGENTS.md`](AGENTS.md), with focused change,
+pull-request-triage, and release skills under [`.agents/skills`](.agents/skills). Optional
+Codex project hooks under [`.codex`](.codex) provide session context and block direct-main,
+force-push, and release-tag mutation commands. Review and trust non-managed hooks through
+`/hooks`; hooks are guardrails, while protected branches, tag rules, and CI remain the
+authoritative controls.
+
+To avoid duplicate runner consumption, pushes to `develop` rely on the pull-request run;
+push workflows run again only after protected `main` changes. Superseded CI and static
+pull-request runs are cancelled, static builds are limited to source/build changes, and
+release dry runs are limited to release-sensitive paths.
+
+Before every authorized remote push, run `bash scripts/pre-push-check.sh`. It fails closed
+when the GitHub CLI cannot inspect the repository or when an incoming pull request remains
+open, so those PRs are triaged and processed before new work is published. The normal
+outgoing `develop` -> `main` integration PR is excluded from that sweep.
 
 The checked-in [verification matrix](docs/test-matrix.md) maps the development specification and every audit issue to parser fixtures, version tables, provider mocks, process-level E2E tests, platform CI, live probes, or artifact gates. Pull requests dogfood an offline scan of this workspace on Linux, macOS, and Windows; public API checks remain an explicitly enabled scheduled/manual job.
 
 ## Known limitations
 
 The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` resolved-version extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above; without it, `bun.lockb` scans visibly degrade to manifest constraints. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
+
+## Security
+
+Report suspected vulnerabilities privately as described in [SECURITY.md](SECURITY.md); do not
+open a public issue for an unpatched vulnerability.
 
 ## License
 

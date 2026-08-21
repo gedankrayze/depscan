@@ -186,7 +186,7 @@ pub(super) async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         fs::write(&path, content)
             .map_err(|e| CliError::usage(format!("writing {}: {e}", path.display())))?;
     } else {
-        print!("{content}");
+        write_stdout(content.as_bytes())?;
     }
     if has_vulnerability_failure(&document, fail_on) {
         Ok(AppExit::Vulnerabilities)
@@ -257,6 +257,9 @@ fn scan_timestamp() -> Result<DateTime<Utc>, CliError> {
     Ok(timestamp)
 }
 
+// Scan-level enrichment concurrency; per-ecosystem provider semaphores throttle further below.
+const MAX_CONCURRENT_ENRICHMENTS: usize = 64;
+
 async fn fetch_latest<P>(
     registry: &P,
     packages: &[Package],
@@ -265,7 +268,6 @@ async fn fetch_latest<P>(
 where
     P: VersionProvider + Clone,
 {
-    let sem = std::sync::Arc::new(Semaphore::new(64));
     stream::iter(
         packages
             .iter()
@@ -273,9 +275,7 @@ where
             .cloned()
             .map(|package| {
                 let registry = (*registry).clone();
-                let sem = sem.clone();
                 async move {
-                    let _permit = sem.acquire().await.expect("semaphore closes only on drop");
                     let key = package.key();
                     match registry.latest(&package).await {
                         Ok(latest) => (key, (Some(latest), vec![])),
@@ -295,7 +295,7 @@ where
                 }
             }),
     )
-    .buffer_unordered(64)
+    .buffer_unordered(MAX_CONCURRENT_ENRICHMENTS)
     .collect()
     .await
 }

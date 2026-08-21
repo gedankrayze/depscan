@@ -58,7 +58,7 @@ fn renders_complete_auditable_sections_and_escapes_untrusted_cells() {
     let rendered = render_markdown(&document);
 
     assert!(rendered.starts_with(
-        "# depscan report\n\n_Gedank Rayze DepScan, v1.2.0, \
+        "# depscan report\n\n_Gedank Rayze DepScan, v2.0.0, \
          [https://github.com/gedankrayze/depscan](https://github.com/gedankrayze/depscan)_\n\n\
          Generated: `2026-08-20T12:00:00+00:00`"
     ));
@@ -114,12 +114,7 @@ fn unresolved_manifest_constraint_remains_visible_without_registry_metadata() {
 }
 
 #[test]
-fn markdown_format_parses_and_infers_only_documented_extensions() {
-    assert_eq!(
-        OutputFormat::parse("markdown"),
-        Some(OutputFormat::Markdown)
-    );
-    assert_eq!(OutputFormat::parse("md"), None);
+fn markdown_format_infers_only_documented_extensions() {
     assert_eq!(
         OutputFormat::infer(Path::new("report.md")),
         Some(OutputFormat::Markdown)

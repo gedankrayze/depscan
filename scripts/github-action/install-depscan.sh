@@ -3,7 +3,7 @@ set -euo pipefail
 
 version=${DEPSCAN_ACTION_VERSION:-}
 if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-  echo "version must be an exact depscan release tag such as v1.2.0" >&2
+  echo "version must be an exact depscan release tag such as v2.0.0" >&2
   exit 1
 fi
 

@@ -1,6 +1,6 @@
 # depscan issue ledger
 
-This directory is the authoritative ledger for defects and specification gaps found during the 2026-08-19 code, runtime, dependency, and release audit.
+This directory is the authoritative ledger for defects and specification gaps found during the 2026-08-19 code, runtime, dependency, and release audit. Later reviews append new issues to the same ledger; DS-077 onward come from the 2026-08-21 code, async-runtime, API-surface, and CI-posture review.
 
 ## Workflow
 
@@ -63,11 +63,11 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-042](DS-042.md) | P1 | Closed | Make JSON output reproducible when requested |
 | [DS-043](DS-043.md) | P1 | Closed | Show yanked installed versions even when otherwise current |
 | [DS-044](DS-044.md) | P1 | Closed | Strengthen CLI help and typed value parsing |
-| [DS-045](DS-045.md) | P2 | In progress | Generate release automation and complete the target matrix |
-| [DS-046](DS-046.md) | P2 | In progress | Deliver and verify genuinely static Linux artifacts |
+| [DS-045](DS-045.md) | P2 | Closed | Generate release automation and complete the target matrix |
+| [DS-046](DS-046.md) | P2 | Closed | Deliver and verify genuinely static Linux artifacts |
 | [DS-047](DS-047.md) | P1 | Closed | Make offline sync publication capability-safe during directory swaps |
 | [DS-048](DS-048.md) | P1 | Closed | Make configuration and report file access capability-safe |
-| [DS-049](DS-049.md) | P2 | In progress | Deliver the M6 composite GitHub Action |
+| [DS-049](DS-049.md) | P2 | Closed | Deliver the M6 composite GitHub Action |
 | [DS-050](DS-050.md) | P1 | Closed | Scan registry-resolved manifest dependencies for vulnerabilities |
 | [DS-051](DS-051.md) | P1 | Closed | Reject malformed OSV advisory shapes without false-clean results |
 | [DS-052](DS-052.md) | P1 | Closed | Degrade unavailable Bun binary-lock extraction to manifests |
@@ -95,3 +95,24 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-074](DS-074.md) | P2 | Closed | Modularize CLI architecture and isolate CLI tests |
 | [DS-075](DS-075.md) | P2 | Closed | Enforce repository-wide Rust module boundaries |
 | [DS-076](DS-076.md) | P2 | Closed | Add an auditable Markdown report format |
+| [DS-077](DS-077.md) | P1 | Closed | Move blocking cache locks and IO off the async runtime |
+| [DS-078](DS-078.md) | P1 | Closed | Exit cleanly instead of panicking when stdout closes early |
+| [DS-079](DS-079.md) | P2 | Closed | Move remaining blocking filesystem IO in async provider paths off the runtime |
+| [DS-080](DS-080.md) | P2 | Closed | Bound multiplicative retry amplification across cache and HTTP layers |
+| [DS-081](DS-081.md) | P2 | Closed | Add a wall-clock deadline to OSV batch pagination |
+| [DS-082](DS-082.md) | P2 | Closed | Remove the redundant enrichment concurrency limiter |
+| [DS-083](DS-083.md) | P1 | Closed | Prepare the published API surface for growth before the next release |
+| [DS-084](DS-084.md) | P2 | Closed | Consolidate duplicated OSV identity matching and package dedup |
+| [DS-085](DS-085.md) | P2 | Closed | Replace panic-prone indexing with typed lookups |
+| [DS-086](DS-086.md) | P2 | Closed | Prune unused and misplaced dependency declarations |
+| [DS-087](DS-087.md) | P2 | Closed | Remove dead public API and the duplicate ecosystem alias table |
+| [DS-088](DS-088.md) | P2 | Closed | Tighten numeric conversions and remove infallible expect noise |
+| [DS-089](DS-089.md) | P2 | Closed | Reduce test-only conditional compilation woven through the sync service |
+| [DS-090](DS-090.md) | P2 | Closed | Initialize tracing before configuration resolution |
+| [DS-091](DS-091.md) | P1 | In progress | Schedule advisory scanning of depscan's own dependency tree |
+| [DS-092](DS-092.md) | P2 | In progress | Add a SECURITY.md vulnerability disclosure policy |
+| [DS-093](DS-093.md) | P2 | In progress | Refresh the dist-pinned actions/checkout to the v7 line |
+| [DS-094](DS-094.md) | P2 | Closed | Assert toolchain pin consistency across workflows |
+| [DS-095](DS-095.md) | P2 | Closed | Purge stale packaging caches before release-gate verification |
+| [DS-096](DS-096.md) | P2 | In progress | Coordinate the Rust 1.98.0 toolchain and 1.96.0 MSRV refresh |
+| [DS-097](DS-097.md) | P1 | Closed | Align the unreleased breaking API surface to version 2.0.0 |

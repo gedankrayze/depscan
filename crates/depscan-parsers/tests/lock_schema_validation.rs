@@ -265,8 +265,8 @@ fn rejects_wrong_missing_malformed_and_future_schemas_as_invalid() {
                         "{directory}/{case} returned unexpected context: {message}"
                     );
                 }
-                ParseError::Io { .. } => {
-                    panic!("{directory}/{case} returned I/O instead of invalid-format error")
+                other => {
+                    panic!("{directory}/{case} returned a non-invalid-format error: {other}")
                 }
             }
         }

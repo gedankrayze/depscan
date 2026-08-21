@@ -214,11 +214,16 @@ pub(crate) fn bind_yarn_direct_dependencies(
             }
         }
         for (name, index) in entry_matches {
-            bound
+            let Some(selector) = bound
                 .by_name
                 .get_mut(&name)
-                .expect("Yarn selector match came from an existing direct dependency")[index]
-                .matching_entries += 1;
+                .and_then(|selectors| selectors.get_mut(index))
+            else {
+                return Err(format!(
+                    "Yarn direct dependency {name:?} disappeared while binding selector matches"
+                ));
+            };
+            selector.matching_entries += 1;
         }
     }
     Ok(bound)

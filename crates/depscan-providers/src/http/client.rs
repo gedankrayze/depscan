@@ -7,6 +7,15 @@ pub struct HttpClient {
     pub(crate) retry_runtime: Arc<dyn RetryRuntime>,
     pub(crate) retry_settings: RetrySettings,
 }
+impl std::fmt::Debug for HttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpClient")
+            .field("request_timeout", &self.request_timeout)
+            .field("retry_settings", &self.retry_settings)
+            .finish_non_exhaustive()
+    }
+}
+
 impl HttpClient {
     pub fn new() -> Result<Self, ProviderError> {
         Self::with_timeouts(HTTP_REQUEST_TIMEOUT, HTTP_REQUEST_TIMEOUT)
@@ -145,7 +154,7 @@ impl HttpClient {
             "{context}: retry policy allowed no attempts"
         )))
     }
-    pub async fn get_json(
+    pub(crate) async fn get_json(
         &self,
         url: &str,
         headers: HeaderMap,
@@ -168,7 +177,7 @@ impl HttpClient {
         self.request_json(reqwest::Method::GET, url, None, headers)
             .await
     }
-    pub async fn post_json(&self, url: &str, body: Value) -> Result<Value, ProviderError> {
+    pub(crate) async fn post_json(&self, url: &str, body: Value) -> Result<Value, ProviderError> {
         match self
             .request_json(reqwest::Method::POST, url, Some(body), HeaderMap::new())
             .await?

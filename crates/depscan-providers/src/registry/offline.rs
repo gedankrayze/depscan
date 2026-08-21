@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RegistryOffline {
     pub(crate) cache: Cache,
     pub(crate) now: DateTime<Utc>,
@@ -159,7 +159,11 @@ impl RegistryOffline {
 #[async_trait]
 impl VersionProvider for RegistryOffline {
     async fn latest(&self, package: &Package) -> Result<RegistryEnrichment, ProviderError> {
-        self.latest_at(package, self.now)
+        let this = self.clone();
+        let package = package.clone();
+        tokio::task::spawn_blocking(move || this.latest_at(&package, this.now))
+            .await
+            .map_err(|error| ProviderError::Offline(error.to_string()))?
             .map(RegistryEnrichment::versions_only)
     }
 }

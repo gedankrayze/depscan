@@ -109,6 +109,14 @@ fn parse_yaml_document(path: &Path, text: &str) -> Result<Yaml, ParseError> {
 pub struct ParserSet {
     parsers: Vec<Box<dyn EcosystemParser>>,
 }
+
+impl std::fmt::Debug for ParserSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParserSet")
+            .field("parsers", &self.parsers.len())
+            .finish_non_exhaustive()
+    }
+}
 impl Default for ParserSet {
     fn default() -> Self {
         Self {
@@ -159,12 +167,9 @@ fn ecosystem_for_kind(kind: &SourceKind) -> Ecosystem {
     }
 }
 
-fn candidate(root: &Path, file: &str, kind: SourceKind) -> Option<DetectedSource> {
+fn source(root: &Path, file: &str, kind: SourceKind) -> Option<DetectedSource> {
     let path = root.join(file);
     path.is_file().then_some(DetectedSource { path, kind })
-}
-fn source(root: &Path, name: &str, kind: SourceKind) -> Option<DetectedSource> {
-    candidate(root, name, kind)
 }
 
 mod node;
@@ -177,16 +182,7 @@ pub use nuget::NugetParser;
 mod cargo;
 pub use cargo::CargoParser;
 
-fn dedup(packages: Vec<Package>) -> Vec<Package> {
-    let mut map: BTreeMap<String, Package> = BTreeMap::new();
-    for p in packages {
-        let key = p.key();
-        map.entry(key)
-            .and_modify(|old| old.merge_metadata(&p))
-            .or_insert(p);
-    }
-    map.into_values().collect()
-}
+use depscan_core::dedup_packages as dedup;
 
 #[cfg(test)]
 mod tests;

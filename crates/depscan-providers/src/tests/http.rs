@@ -31,13 +31,11 @@ fn production_network_budgets_match_the_documented_contract() {
     let osv = OsvClient::new(http.clone(), cache.clone());
     assert_eq!(osv.concurrency.available_permits(), 16);
     let registries = RegistryClient::new(http, cache);
-    assert_eq!(registries.limits[&Ecosystem::Npm].available_permits(), 16);
-    assert_eq!(registries.limits[&Ecosystem::PyPI].available_permits(), 16);
-    assert_eq!(registries.limits[&Ecosystem::NuGet].available_permits(), 16);
-    assert_eq!(
-        registries.limits[&Ecosystem::CratesIo].available_permits(),
-        8
-    );
+    let permits = |ecosystem| registries.limits.semaphore(ecosystem).available_permits();
+    assert_eq!(permits(Ecosystem::Npm), 16);
+    assert_eq!(permits(Ecosystem::PyPI), 16);
+    assert_eq!(permits(Ecosystem::NuGet), 16);
+    assert_eq!(permits(Ecosystem::CratesIo), 8);
 }
 
 #[test]

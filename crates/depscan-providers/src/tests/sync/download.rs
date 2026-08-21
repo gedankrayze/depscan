@@ -39,8 +39,8 @@ async fn sync_streams_a_slow_large_dump_before_atomic_replacement() {
     let (stream_progress, mut streamed_bytes) = tokio::sync::watch::channel(0u64);
     let mut config = test_sync_config(base_url);
     config.transfer_timeout = StdDuration::from_secs(30);
-    config.observed_max_chunk_bytes = Some(observed_chunk_bytes.clone());
-    config.stream_progress = Some(stream_progress);
+    config.hooks.observed_max_chunk_bytes = Some(observed_chunk_bytes.clone());
+    config.hooks.stream_progress = Some(stream_progress);
     let sync_cache = cache.clone();
     let sync = tokio::spawn(async move {
         sync_osv_dumps_with_config(&client, &sync_cache, &[Ecosystem::Npm], &config).await

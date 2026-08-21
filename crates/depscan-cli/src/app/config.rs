@@ -108,6 +108,9 @@ pub(super) fn prepare_scan(args: ScanArgs) -> Result<PreparedScan, CliError> {
         ))
     })?;
     let loaded = load_config(&scan_root, args.config.as_deref())?;
+    // Emitted while resolution happens; visible when the CLI itself asked for verbosity.
+    // Config-set verbosity takes effect from the scan phase onward via the filter reload.
+    loaded.origin.log();
     let mut prepared = merge_scan_config(args, loaded)?;
     if let Some(configured) = prepared.implicit_config_output.as_deref() {
         let output = prepared

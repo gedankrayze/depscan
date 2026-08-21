@@ -2,12 +2,34 @@ name: Static Linux
 
 on:
   pull_request:
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/static-linux.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**'
+      - 'fixtures/rust-sample/**'
+      - 'rust-toolchain.toml'
+      - 'scripts/verify-static-linux.sh'
   push:
-    branches: [main, develop]
+    branches: [main]
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/static-linux.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**'
+      - 'fixtures/rust-sample/**'
+      - 'rust-toolchain.toml'
+      - 'scripts/verify-static-linux.sh'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: static-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   static-linux:
@@ -25,7 +47,7 @@ jobs:
             platform: linux/arm64
     env:
       CARGO_TARGET: ${{ matrix.target }}
-      RUST_IMAGE: rust:1.97.1-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900
+      RUST_IMAGE: rust:1.98.0-alpine@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a02cf1d6ea424dce
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

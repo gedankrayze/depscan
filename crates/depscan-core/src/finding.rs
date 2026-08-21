@@ -12,7 +12,7 @@ pub enum Severity {
 }
 
 impl Severity {
-    pub fn from_cvss(score: f32) -> Self {
+    pub fn from_cvss(score: f64) -> Self {
         if score >= 9.0 {
             Self::Critical
         } else if score >= 7.0 {
@@ -41,7 +41,7 @@ pub struct Vulnerability {
     pub aliases: Vec<String>,
     pub summary: String,
     pub severity: Option<Severity>,
-    pub cvss_score: Option<f32>,
+    pub cvss_score: Option<f64>,
     #[serde(default)]
     pub fixed_in: Vec<String>,
     #[serde(default)]

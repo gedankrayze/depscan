@@ -43,18 +43,7 @@ pub(super) fn consolidate_packages(
     no_dev: bool,
     direct_only: bool,
 ) -> Vec<Package> {
-    let mut packages = dedup_packages(packages);
+    let mut packages = depscan_core::dedup_packages(packages);
     filter_packages(&mut packages, no_dev, direct_only);
     packages
-}
-
-fn dedup_packages(packages: Vec<Package>) -> Vec<Package> {
-    let mut merged = BTreeMap::<String, Package>::new();
-    for package in packages {
-        merged
-            .entry(package.key())
-            .and_modify(|existing| existing.merge_metadata(&package))
-            .or_insert(package);
-    }
-    merged.into_values().collect()
 }

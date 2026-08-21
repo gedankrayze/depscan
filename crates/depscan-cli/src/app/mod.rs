@@ -20,7 +20,7 @@ use depscan_report::{OutputFormat, render};
 use futures::{StreamExt, stream};
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
@@ -28,9 +28,10 @@ use std::{
     str::FromStr,
     time::Duration as StdDuration,
 };
-use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Registry, layer::SubscriberExt as _, reload, util::SubscriberInitExt as _,
+};
 mod commands;
 mod config;
 mod policy;
@@ -357,6 +358,8 @@ pub(crate) async fn run() -> ExitCode {
     match cli.command {
         Some(Command::Scan(args)) => run_scan(args).await,
         None => run_scan(cli.default_scan).await,
-        Some(command) => run_non_scan(command).await,
+        Some(Command::Sync(args)) => run_sync(args).await,
+        Some(Command::Cache(args)) => run_cache(args),
+        Some(Command::Completions { shell }) => run_completions(shell),
     }
 }

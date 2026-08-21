@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ParseError {
     #[error("failed to parse {path}: {message}")]
     Invalid { path: PathBuf, message: String },
@@ -11,6 +12,7 @@ pub enum ParseError {
 }
 
 #[derive(Debug, Clone, Error)]
+#[non_exhaustive]
 pub enum ProviderError {
     #[error("network provider failed: {0}")]
     Network(String),

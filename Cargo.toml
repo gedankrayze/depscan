@@ -9,12 +9,12 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "1.2.0"
+version = "2.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gedankrayze/depscan"
 homepage = "https://github.com/gedankrayze/depscan"
-rust-version = "1.95.0"
+rust-version = "1.96.0"
 authors = ["depscan contributors"]
 readme = "README.md"
 keywords = ["security", "dependencies", "vulnerability", "osv", "cli"]
@@ -22,11 +22,10 @@ categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
 
 [workspace.dependencies]
-depscan-core = { version = "1.2.0", path = "crates/depscan-core" }
-depscan-parsers = { version = "1.2.0", path = "crates/depscan-parsers" }
-depscan-providers = { version = "1.2.0", path = "crates/depscan-providers" }
-depscan-report = { version = "1.2.0", path = "crates/depscan-report" }
-anyhow = "1.0.104"
+depscan-core = { version = "2.0.0", path = "crates/depscan-core" }
+depscan-parsers = { version = "2.0.0", path = "crates/depscan-parsers" }
+depscan-providers = { version = "2.0.0", path = "crates/depscan-providers" }
+depscan-report = { version = "2.0.0", path = "crates/depscan-report" }
 async-trait = "0.1.92"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
@@ -45,7 +44,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-noyalib = { version = "0.0.25", default-features = false, features = ["std"] }
+noyalib = { version = "0.0.27", default-features = false, features = ["std"] }
 js-semver = "0.3.0"
 sha2 = "0.11.0"
 toml = "1.1.4"
@@ -96,7 +95,7 @@ targets = [
 ]
 
 [workspace.metadata.dist.github-action-commits]
-"actions/checkout" = "de0fac2e4500dabe0009e67214ff5f5447ce83dd" # v6.0.2
+"actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7.0.1
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8.0.1
 "actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2

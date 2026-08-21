@@ -1,10 +1,40 @@
 use super::*;
 
-#[derive(Clone)]
+// One semaphore per ecosystem; the match in `semaphore` makes a new `Ecosystem` variant a
+// compile error here instead of a runtime lookup panic.
+#[derive(Debug)]
+pub(crate) struct RegistryLimits {
+    npm: Semaphore,
+    pypi: Semaphore,
+    nuget: Semaphore,
+    crates_io: Semaphore,
+}
+
+impl RegistryLimits {
+    fn new() -> Self {
+        Self {
+            npm: Semaphore::new(16),
+            pypi: Semaphore::new(16),
+            nuget: Semaphore::new(16),
+            crates_io: Semaphore::new(8),
+        }
+    }
+
+    pub(crate) fn semaphore(&self, ecosystem: Ecosystem) -> &Semaphore {
+        match ecosystem {
+            Ecosystem::Npm => &self.npm,
+            Ecosystem::PyPI => &self.pypi,
+            Ecosystem::NuGet => &self.nuget,
+            Ecosystem::CratesIo => &self.crates_io,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct RegistryClient {
     pub(crate) http: HttpClient,
     pub(crate) cache: Cache,
-    pub(crate) limits: Arc<HashMap<Ecosystem, Arc<Semaphore>>>,
+    pub(crate) limits: Arc<RegistryLimits>,
     pub(crate) npm_base_url: String,
     pub(crate) pypi_base_url: String,
     pub(crate) nuget_base_url: String,
@@ -50,16 +80,10 @@ impl RegistryClient {
         nuget_registration_base_url: impl Into<String>,
         crates_index_base_url: impl Into<String>,
     ) -> Self {
-        let limits = HashMap::from([
-            (Ecosystem::Npm, Arc::new(Semaphore::new(16))),
-            (Ecosystem::PyPI, Arc::new(Semaphore::new(16))),
-            (Ecosystem::NuGet, Arc::new(Semaphore::new(16))),
-            (Ecosystem::CratesIo, Arc::new(Semaphore::new(8))),
-        ]);
         Self {
             http,
             cache,
-            limits: Arc::new(limits),
+            limits: Arc::new(RegistryLimits::new()),
             npm_base_url: npm_base_url.into().trim_end_matches('/').to_owned(),
             pypi_base_url: pypi_base_url.into().trim_end_matches('/').to_owned(),
             nuget_base_url: nuget_base_url.into().trim_end_matches('/').to_owned(),
@@ -94,6 +118,13 @@ impl RegistryClient {
             .await
     }
 
+    // With cache reads enabled, one logical lookup performs at most one network fetch; the
+    // HTTP client's DS-031 retry policy applies inside that single fetch, so the documented
+    // worst case is exactly the HTTP attempt budget. Cache-commit conflicts are then a purely
+    // local CAS concern: a fresh concurrent winner is trusted exactly as the fast path trusts
+    // fresh cache, and a stale winner just becomes the new expected generation. Under --no-cache
+    // the winner can be neither served nor clobbered with an older response, so each conflict
+    // refetches instead — bounded by the same commit-attempt budget.
     pub(crate) async fn metadata_with_limit(
         &self,
         namespace: &str,
@@ -102,84 +133,81 @@ impl RegistryClient {
         max_bytes: Option<usize>,
     ) -> Result<Value, ProviderError> {
         let ttl = Duration::seconds(REGISTRY_TTL_SECS);
-        let mut generation = self.cache.snapshot("registry", namespace, ttl);
-        let mut cached = self.cache.policy.read.then(|| generation.clone()).flatten();
-        let mut force_revalidate = false;
+        let mut generation = self.cache.snapshot("registry", namespace, ttl).await;
+        let cached = self.cache.policy.read.then(|| generation.clone()).flatten();
+        if let Some(cached) = &cached
+            && cached.fresh
+        {
+            return Ok(cached.value.clone());
+        }
+        let (mut value, mut etag) = self
+            .fetch_metadata(url, &headers, max_bytes, cached.as_ref())
+            .await?;
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
-            if !force_revalidate
-                && let Some(cached) = &cached
-                && cached.fresh
+            match self
+                .cache
+                .put_if_unchanged(
+                    "registry",
+                    namespace,
+                    generation.clone(),
+                    &value,
+                    etag.clone(),
+                    ttl,
+                )
+                .await?
             {
-                return Ok(cached.value.clone());
-            }
-            force_revalidate = false;
-            let mut request_headers = headers.clone();
-            let conditional = add_if_none_match(&mut request_headers, cached.as_ref());
-            let response = if let Some(max_bytes) = max_bytes {
-                self.http
-                    .get_json_limited_revalidated(url, max_bytes, request_headers)
-                    .await?
-            } else {
-                self.http.get_json_revalidated(url, request_headers).await?
-            };
-            match response {
-                Revalidated::Modified { value, etag } => {
-                    match self.cache.put_if_unchanged(
-                        "registry",
-                        namespace,
-                        generation.as_ref(),
-                        &value,
-                        etag,
-                        ttl,
-                    )? {
-                        CacheCommit::Written => return Ok(value),
-                        CacheCommit::Conflict(current) => {
-                            generation = current;
-                            cached = self.cache.policy.read.then(|| generation.clone()).flatten();
-                            force_revalidate = true;
-                        }
-                    }
+                CacheCommit::Written => return Ok(value),
+                CacheCommit::Conflict(Some(current)) if current.fresh && self.cache.policy.read => {
+                    return Ok(current.value);
                 }
-                Revalidated::NotModified { etag } => {
-                    if !conditional {
-                        return Err(ProviderError::InvalidResponse(format!(
-                            "{url}: received HTTP 304 without sending If-None-Match"
-                        )));
-                    }
-                    let snapshot = cached.as_ref().ok_or_else(|| {
-                        ProviderError::InvalidResponse(format!(
-                            "{url}: received HTTP 304 without a cached registry value"
-                        ))
-                    })?;
-                    let value = snapshot.value.clone();
-                    let etag = etag.or_else(|| snapshot.etag.clone());
-                    match self.cache.put_if_unchanged(
-                        "registry",
-                        namespace,
-                        generation.as_ref(),
-                        &value,
-                        etag,
-                        ttl,
-                    )? {
-                        CacheCommit::Written => return Ok(value),
-                        CacheCommit::Conflict(Some(current)) if current.fresh => {
-                            if self.cache.policy.read {
-                                return Ok(current.value);
-                            }
-                            generation = Some(current);
-                            cached = None;
-                        }
-                        CacheCommit::Conflict(current) => {
-                            generation = current;
-                            cached = self.cache.policy.read.then(|| generation.clone()).flatten();
-                        }
+                CacheCommit::Conflict(current) => {
+                    generation = current;
+                    if !self.cache.policy.read {
+                        (value, etag) = self.fetch_metadata(url, &headers, max_bytes, None).await?;
                     }
                 }
             }
         }
         Err(ProviderError::Cache(format!(
-            "registry cache entry {namespace:?} changed repeatedly during revalidation"
+            "registry cache entry {namespace:?} changed repeatedly during publication"
         )))
+    }
+
+    async fn fetch_metadata(
+        &self,
+        url: &str,
+        headers: &HeaderMap,
+        max_bytes: Option<usize>,
+        cached: Option<&CacheLookup>,
+    ) -> Result<(Value, Option<String>), ProviderError> {
+        let mut request_headers = headers.clone();
+        let conditional = add_if_none_match(&mut request_headers, cached);
+        let response = if let Some(max_bytes) = max_bytes {
+            self.http
+                .get_json_limited_revalidated(url, max_bytes, request_headers)
+                .await?
+        } else {
+            self.http.get_json_revalidated(url, request_headers).await?
+        };
+        match response {
+            Revalidated::Modified { value, etag } => Ok((value, etag)),
+            Revalidated::NotModified { etag } => {
+                if !conditional {
+                    return Err(ProviderError::InvalidResponse(format!(
+                        "{url}: received HTTP 304 without sending If-None-Match"
+                    )));
+                }
+                let snapshot = cached.ok_or_else(|| {
+                    ProviderError::InvalidResponse(format!(
+                        "{url}: received HTTP 304 without a cached registry value"
+                    ))
+                })?;
+                Ok((
+                    snapshot.value.clone(),
+                    etag.or_else(|| snapshot.etag.clone()),
+                ))
+            }
+        }
     }
 
     pub(crate) async fn nuget_canonical_name(
@@ -218,7 +246,9 @@ impl RegistryClient {
     }
 
     pub(crate) async fn npm(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
-        let _permit = self.limits[&Ecosystem::Npm]
+        let _permit = self
+            .limits
+            .semaphore(Ecosystem::Npm)
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
@@ -234,7 +264,9 @@ impl RegistryClient {
         npm_version_result(p, &data).map(RegistryEnrichment::versions_only)
     }
     pub(crate) async fn pypi(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
-        let _permit = self.limits[&Ecosystem::PyPI]
+        let _permit = self
+            .limits
+            .semaphore(Ecosystem::PyPI)
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
@@ -249,7 +281,9 @@ impl RegistryClient {
         pypi_version_result(p, &data).map(RegistryEnrichment::versions_only)
     }
     pub(crate) async fn nuget(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
-        let _permit = self.limits[&Ecosystem::NuGet]
+        let _permit = self
+            .limits
+            .semaphore(Ecosystem::NuGet)
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
@@ -269,7 +303,9 @@ impl RegistryClient {
     }
     pub(crate) async fn crates(&self, p: &Package) -> Result<RegistryEnrichment, ProviderError> {
         let path = crates_io_sparse_path(&p.name)?;
-        let _permit = self.limits[&Ecosystem::CratesIo]
+        let _permit = self
+            .limits
+            .semaphore(Ecosystem::CratesIo)
             .acquire()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;

@@ -101,9 +101,9 @@ impl Cache {
         if !self.policy.read {
             return None;
         }
-        self.snapshot(namespace, key, ttl)
+        self.snapshot_blocking(namespace, key, ttl)
     }
-    pub(crate) fn snapshot(
+    pub(crate) fn snapshot_blocking(
         &self,
         namespace: &str,
         key: &str,
@@ -112,6 +112,42 @@ impl Cache {
         let path = self.filename(namespace, key);
         let entry = Self::read_entry(&path)?;
         Some(self.lookup_from_entry(entry, ttl))
+    }
+    pub(crate) async fn snapshot(
+        &self,
+        namespace: &str,
+        key: &str,
+        ttl: Duration,
+    ) -> Option<CacheLookup> {
+        let cache = self.clone();
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+        match tokio::task::spawn_blocking(move || cache.snapshot_blocking(&namespace, &key, ttl))
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                debug!(%error, "cache snapshot task failed");
+                None
+            }
+        }
+    }
+    pub(crate) async fn get_if_fresh(
+        &self,
+        namespace: &str,
+        key: &str,
+        ttl: Duration,
+    ) -> Option<(Value, Option<String>)> {
+        let cache = self.clone();
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+        match tokio::task::spawn_blocking(move || cache.get(&namespace, &key, ttl)).await {
+            Ok(cached) => cached,
+            Err(error) => {
+                debug!(%error, "cache read task failed");
+                None
+            }
+        }
     }
     pub(crate) fn read_entry(path: &Path) -> Option<CacheEntry> {
         let text = fs::read_to_string(path).ok()?;
@@ -163,7 +199,10 @@ impl Cache {
         .map_err(|e| ProviderError::Cache(e.to_string()))?;
         fs::rename(tmp, path).map_err(|e| ProviderError::Cache(e.to_string()))
     }
-    pub fn put(
+    // An unconditional write used as the cache-seeding seam by in-crate tests; production
+    // writes go through `put_if_unchanged`.
+    #[cfg(test)]
+    pub(crate) fn put(
         &self,
         namespace: &str,
         key: &str,
@@ -176,7 +215,26 @@ impl Cache {
         let _ = fs2::FileExt::unlock(&lock);
         Ok(())
     }
-    pub(crate) fn put_if_unchanged(
+    pub(crate) async fn put_if_unchanged(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Option<CacheLookup>,
+        value: &Value,
+        etag: Option<String>,
+        ttl: Duration,
+    ) -> Result<CacheCommit, ProviderError> {
+        let cache = self.clone();
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+        let value = value.clone();
+        tokio::task::spawn_blocking(move || {
+            cache.put_if_unchanged_blocking(&namespace, &key, expected.as_ref(), &value, etag, ttl)
+        })
+        .await
+        .map_err(|error| ProviderError::Cache(error.to_string()))?
+    }
+    pub(crate) fn put_if_unchanged_blocking(
         &self,
         namespace: &str,
         key: &str,
@@ -271,7 +329,7 @@ impl Cache {
         Ok(stats)
     }
 }
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CacheStats {
     pub files: u64,
     pub bytes: u64,

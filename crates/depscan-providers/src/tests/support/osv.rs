@@ -15,8 +15,20 @@ pub(crate) fn osv_range_fixtures() -> Vec<OsvRangeFixture> {
     serde_json::from_str(include_str!("../../../../../fixtures/osv-range-cases.json")).unwrap()
 }
 
+pub(crate) fn fixture_ecosystem(value: &str) -> Ecosystem {
+    [
+        Ecosystem::Npm,
+        Ecosystem::PyPI,
+        Ecosystem::NuGet,
+        Ecosystem::CratesIo,
+    ]
+    .into_iter()
+    .find(|ecosystem| ecosystem.osv_name().eq_ignore_ascii_case(value))
+    .unwrap_or_else(|| panic!("unknown fixture ecosystem {value:?}"))
+}
+
 pub(crate) fn fixture_package(fixture: &OsvRangeFixture) -> Package {
-    let ecosystem = Ecosystem::from_cli(&fixture.ecosystem).unwrap();
+    let ecosystem = fixture_ecosystem(&fixture.ecosystem);
     Package::new(
         ecosystem,
         &fixture.package,
@@ -41,7 +53,7 @@ pub(crate) fn write_fixture_archives(root: &Path, fixtures: &[OsvRangeFixture]) 
         let mut archive = zip::ZipWriter::new(file);
         for fixture in fixtures
             .iter()
-            .filter(|fixture| Ecosystem::from_cli(&fixture.ecosystem) == Some(ecosystem))
+            .filter(|fixture| fixture_ecosystem(&fixture.ecosystem) == ecosystem)
         {
             let id = fixture.document.get("id").and_then(Value::as_str).unwrap();
             let mut document = fixture.document.clone();

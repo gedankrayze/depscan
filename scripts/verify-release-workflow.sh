@@ -54,7 +54,7 @@ release_action_uses=$(
   grep -hE '^[[:space:]-]*uses:[[:space:]]+[^.]' "$release_workflow" "$quality_workflow"
 )
 for expected in \
-  'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd:6' \
+  'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1:6' \
   'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a:4' \
   'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c:4' \
   'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6:1'; do
@@ -241,7 +241,7 @@ for mapping in \
     exit 1
   fi
 done
-grep -Fq '          ref: v1.2.0' "$acceptance_workflow"
+grep -Fq '          ref: v2.0.0' "$acceptance_workflow"
 grep -Fq '          persist-credentials: false' "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '[[ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]' "$acceptance_workflow"
@@ -268,7 +268,7 @@ if [[ $(grep -Fc 'uses: ./release-source' "$acceptance_workflow") -ne 1 ]] \
   echo "release acceptance must use the immutable local tag checkout once without a binary override" >&2
   exit 1
 fi
-grep -Fq '          version: v1.2.0' "$acceptance_workflow"
+grep -Fq '          version: v2.0.0' "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '          output: ${{ runner.temp }}/depscan-published-action-summary.txt' "$acceptance_workflow"
 grep -Fq '          offline: "true"' "$acceptance_workflow"
