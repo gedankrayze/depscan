@@ -378,3 +378,44 @@ async fn failed_registry_revalidation_preserves_the_stale_cache_entry() {
     assert_eq!(after.value, before.value);
     server.verify().await;
 }
+
+#[tokio::test]
+async fn conflicting_fresh_winner_is_adopted_without_a_second_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"revision": 2}))
+                .set_delay(std::time::Duration::from_millis(500)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Cache {
+        root: cache_dir.path().to_path_buf(),
+        policy: CachePolicy::default(),
+    };
+    cache
+        .put("registry", "conflict-budget", &json!({"revision": 1}), None)
+        .unwrap();
+    age_cache_entry(&cache, "registry", "conflict-budget", Duration::hours(7));
+    let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
+
+    // While the single fetch is in flight, a concurrent writer publishes a fresh winner. The
+    // resulting commit conflict must be resolved locally by adopting the winner, never by a
+    // second network request.
+    let url = format!("{}/metadata", server.uri());
+    let lookup = client.metadata("conflict-budget", &url, HeaderMap::new());
+    let winner = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cache
+            .put("registry", "conflict-budget", &json!({"revision": 3}), None)
+            .unwrap();
+    };
+    let (value, ()) = tokio::join!(lookup, winner);
+
+    assert_eq!(value.unwrap(), json!({"revision": 3}));
+    server.verify().await;
+}

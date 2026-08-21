@@ -117,6 +117,13 @@ impl RegistryClient {
             .await
     }
 
+    // With cache reads enabled, one logical lookup performs at most one network fetch; the
+    // HTTP client's DS-031 retry policy applies inside that single fetch, so the documented
+    // worst case is exactly the HTTP attempt budget. Cache-commit conflicts are then a purely
+    // local CAS concern: a fresh concurrent winner is trusted exactly as the fast path trusts
+    // fresh cache, and a stale winner just becomes the new expected generation. Under --no-cache
+    // the winner can be neither served nor clobbered with an older response, so each conflict
+    // refetches instead — bounded by the same commit-attempt budget.
     pub(crate) async fn metadata_with_limit(
         &self,
         namespace: &str,
@@ -126,91 +133,80 @@ impl RegistryClient {
     ) -> Result<Value, ProviderError> {
         let ttl = Duration::seconds(REGISTRY_TTL_SECS);
         let mut generation = self.cache.snapshot("registry", namespace, ttl).await;
-        let mut cached = self.cache.policy.read.then(|| generation.clone()).flatten();
-        let mut force_revalidate = false;
+        let cached = self.cache.policy.read.then(|| generation.clone()).flatten();
+        if let Some(cached) = &cached
+            && cached.fresh
+        {
+            return Ok(cached.value.clone());
+        }
+        let (mut value, mut etag) = self
+            .fetch_metadata(url, &headers, max_bytes, cached.as_ref())
+            .await?;
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
-            if !force_revalidate
-                && let Some(cached) = &cached
-                && cached.fresh
+            match self
+                .cache
+                .put_if_unchanged(
+                    "registry",
+                    namespace,
+                    generation.clone(),
+                    &value,
+                    etag.clone(),
+                    ttl,
+                )
+                .await?
             {
-                return Ok(cached.value.clone());
-            }
-            force_revalidate = false;
-            let mut request_headers = headers.clone();
-            let conditional = add_if_none_match(&mut request_headers, cached.as_ref());
-            let response = if let Some(max_bytes) = max_bytes {
-                self.http
-                    .get_json_limited_revalidated(url, max_bytes, request_headers)
-                    .await?
-            } else {
-                self.http.get_json_revalidated(url, request_headers).await?
-            };
-            match response {
-                Revalidated::Modified { value, etag } => {
-                    match self
-                        .cache
-                        .put_if_unchanged(
-                            "registry",
-                            namespace,
-                            generation.clone(),
-                            &value,
-                            etag,
-                            ttl,
-                        )
-                        .await?
-                    {
-                        CacheCommit::Written => return Ok(value),
-                        CacheCommit::Conflict(current) => {
-                            generation = current;
-                            cached = self.cache.policy.read.then(|| generation.clone()).flatten();
-                            force_revalidate = true;
-                        }
-                    }
+                CacheCommit::Written => return Ok(value),
+                CacheCommit::Conflict(Some(current)) if current.fresh && self.cache.policy.read => {
+                    return Ok(current.value);
                 }
-                Revalidated::NotModified { etag } => {
-                    if !conditional {
-                        return Err(ProviderError::InvalidResponse(format!(
-                            "{url}: received HTTP 304 without sending If-None-Match"
-                        )));
-                    }
-                    let snapshot = cached.as_ref().ok_or_else(|| {
-                        ProviderError::InvalidResponse(format!(
-                            "{url}: received HTTP 304 without a cached registry value"
-                        ))
-                    })?;
-                    let value = snapshot.value.clone();
-                    let etag = etag.or_else(|| snapshot.etag.clone());
-                    match self
-                        .cache
-                        .put_if_unchanged(
-                            "registry",
-                            namespace,
-                            generation.clone(),
-                            &value,
-                            etag,
-                            ttl,
-                        )
-                        .await?
-                    {
-                        CacheCommit::Written => return Ok(value),
-                        CacheCommit::Conflict(Some(current)) if current.fresh => {
-                            if self.cache.policy.read {
-                                return Ok(current.value);
-                            }
-                            generation = Some(current);
-                            cached = None;
-                        }
-                        CacheCommit::Conflict(current) => {
-                            generation = current;
-                            cached = self.cache.policy.read.then(|| generation.clone()).flatten();
-                        }
+                CacheCommit::Conflict(current) => {
+                    generation = current;
+                    if !self.cache.policy.read {
+                        (value, etag) = self.fetch_metadata(url, &headers, max_bytes, None).await?;
                     }
                 }
             }
         }
         Err(ProviderError::Cache(format!(
-            "registry cache entry {namespace:?} changed repeatedly during revalidation"
+            "registry cache entry {namespace:?} changed repeatedly during publication"
         )))
+    }
+
+    async fn fetch_metadata(
+        &self,
+        url: &str,
+        headers: &HeaderMap,
+        max_bytes: Option<usize>,
+        cached: Option<&CacheLookup>,
+    ) -> Result<(Value, Option<String>), ProviderError> {
+        let mut request_headers = headers.clone();
+        let conditional = add_if_none_match(&mut request_headers, cached);
+        let response = if let Some(max_bytes) = max_bytes {
+            self.http
+                .get_json_limited_revalidated(url, max_bytes, request_headers)
+                .await?
+        } else {
+            self.http.get_json_revalidated(url, request_headers).await?
+        };
+        match response {
+            Revalidated::Modified { value, etag } => Ok((value, etag)),
+            Revalidated::NotModified { etag } => {
+                if !conditional {
+                    return Err(ProviderError::InvalidResponse(format!(
+                        "{url}: received HTTP 304 without sending If-None-Match"
+                    )));
+                }
+                let snapshot = cached.ok_or_else(|| {
+                    ProviderError::InvalidResponse(format!(
+                        "{url}: received HTTP 304 without a cached registry value"
+                    ))
+                })?;
+                Ok((
+                    snapshot.value.clone(),
+                    etag.or_else(|| snapshot.etag.clone()),
+                ))
+            }
+        }
     }
 
     pub(crate) async fn nuget_canonical_name(

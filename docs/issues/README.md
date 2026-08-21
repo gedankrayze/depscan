@@ -98,7 +98,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-077](DS-077.md) | P1 | Closed | Move blocking cache locks and IO off the async runtime |
 | [DS-078](DS-078.md) | P1 | Closed | Exit cleanly instead of panicking when stdout closes early |
 | [DS-079](DS-079.md) | P2 | Closed | Move remaining blocking filesystem IO in async provider paths off the runtime |
-| [DS-080](DS-080.md) | P2 | Open | Bound multiplicative retry amplification across cache and HTTP layers |
+| [DS-080](DS-080.md) | P2 | Closed | Bound multiplicative retry amplification across cache and HTTP layers |
 | [DS-081](DS-081.md) | P2 | Open | Add a wall-clock deadline to OSV batch pagination |
 | [DS-082](DS-082.md) | P2 | Closed | Remove the redundant enrichment concurrency limiter |
 | [DS-083](DS-083.md) | P1 | Open | Prepare the published API surface for growth before the next release |
