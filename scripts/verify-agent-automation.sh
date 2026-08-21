@@ -55,6 +55,8 @@ if found != expected:
 PY
 
 grep -Fq 'cargo clippy --all-targets -- -D warnings' AGENTS.md
+grep -Fq 'delete the merged local ticket branch' AGENTS.md
+grep -Fq 'delete that merged local branch' .agents/skills/depscan-change/SKILL.md
 grep -Fq '"matcher": "^Bash$"' .codex/hooks.json
 grep -Fq '"matcher": "^(startup|resume|clear|compact)$"' .codex/hooks.json
 if [[ $(grep -Fc '"commandWindows":' .codex/hooks.json) -ne 2 ]]; then

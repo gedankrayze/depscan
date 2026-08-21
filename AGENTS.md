@@ -6,6 +6,9 @@
 - The integration path is `ticket/*` -> `develop` -> `main`. Do not push directly to `main`.
 - Do not commit, push, merge, create or move tags, publish releases, or change remote
   repository settings without the user's explicit permission for that action.
+- After a local integration, prove the ticket branch is an ancestor of the target branch,
+  then delete the merged local ticket branch. Delete a remote branch only with explicit
+  permission and after separately verifying its merged state.
 - Preserve unrelated work. Inspect the worktree before editing and stage explicit paths.
 - Treat release workflows, action installers, capability-safe filesystem code, frozen
   fixtures, snapshots, and security-boundary tests as sensitive review surfaces.

@@ -18,5 +18,7 @@ artifacts, installers, or publication, and `depscan-pr-triage` for incoming pull
 5. Run `bash scripts/dev-gate.sh quick` at a checkpoint.
 6. On the frozen tree, run `bash scripts/dev-gate.sh full` once and inspect
    `git diff --check`, `git status`, and the complete diff.
-7. Report the outcome first, then changed files, verification evidence, and any native,
+7. After local integration, prove the ticket branch is an ancestor of the target, then
+   delete that merged local branch. Remote branch deletion requires separate permission.
+8. Report the outcome first, then changed files, verification evidence, and any native,
    cross-target, or external-state evidence still pending.
