@@ -1,6 +1,7 @@
 use super::*;
 
 mod cache;
+mod conflicts;
 mod crates;
 mod nuget;
 mod online;
