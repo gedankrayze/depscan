@@ -60,4 +60,26 @@ for static_path in \
   fi
 done
 
-printf 'CI policy verified: canonical PR evidence and path-scoped heavy workflows\n'
+# A toolchain bump must land in rust-toolchain.toml and every workflow pin together. Version
+# comments on the pinned dtolnay/rust-toolchain commits are the human-auditable half of each
+# pin; requiring them to match the toolchain channel (or the MSRV for the dedicated MSRV job)
+# turns a missed workflow into a failure instead of silent drift.
+toolchain_channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+if [[ -z "$toolchain_channel" || -z "$msrv" ]]; then
+  echo "cannot determine the toolchain channel or MSRV" >&2
+  exit 1
+fi
+toolchain_pins=$(grep -rn "dtolnay/rust-toolchain@" .github/workflows/ || true)
+if [[ -z "$toolchain_pins" ]]; then
+  echo "no pinned dtolnay/rust-toolchain uses found" >&2
+  exit 1
+fi
+stray_toolchains=$(grep -vE "# (${toolchain_channel}|${msrv})$" <<<"$toolchain_pins" || true)
+if [[ -n "$stray_toolchains" ]]; then
+  echo "workflow toolchain pins disagree with rust-toolchain.toml (${toolchain_channel}) or the MSRV (${msrv}):" >&2
+  echo "$stray_toolchains" >&2
+  exit 1
+fi
+
+printf 'CI policy verified: canonical PR evidence, path-scoped heavy workflows, and consistent toolchain pins\n'
