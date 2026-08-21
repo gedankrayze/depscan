@@ -276,6 +276,11 @@ The checked-in [verification matrix](docs/test-matrix.md) maps the development s
 
 The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` resolved-version extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above; without it, `bun.lockb` scans visibly degrade to manifest constraints. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
 
+## Security
+
+Report suspected vulnerabilities privately as described in [SECURITY.md](SECURITY.md); do not
+open a public issue for an unpatched vulnerability.
+
 ## License
 
 Licensed under either the Apache License, Version 2.0 or the MIT license, at your option. Both complete license texts are distributed together in [LICENSE](LICENSE).
