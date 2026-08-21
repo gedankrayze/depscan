@@ -109,10 +109,10 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-088](DS-088.md) | P2 | Closed | Tighten numeric conversions and remove infallible expect noise |
 | [DS-089](DS-089.md) | P2 | Closed | Reduce test-only conditional compilation woven through the sync service |
 | [DS-090](DS-090.md) | P2 | Closed | Initialize tracing before configuration resolution |
-| [DS-091](DS-091.md) | P1 | In progress | Schedule advisory scanning of depscan's own dependency tree |
-| [DS-092](DS-092.md) | P2 | In progress | Add a SECURITY.md vulnerability disclosure policy |
+| [DS-091](DS-091.md) | P1 | Closed | Schedule advisory scanning of depscan's own dependency tree |
+| [DS-092](DS-092.md) | P2 | Closed | Add a SECURITY.md vulnerability disclosure policy |
 | [DS-093](DS-093.md) | P2 | In progress | Refresh the dist-pinned actions/checkout to the v7 line |
 | [DS-094](DS-094.md) | P2 | Closed | Assert toolchain pin consistency across workflows |
 | [DS-095](DS-095.md) | P2 | Closed | Purge stale packaging caches before release-gate verification |
-| [DS-096](DS-096.md) | P2 | In progress | Coordinate the Rust 1.98.0 toolchain and 1.96.0 MSRV refresh |
+| [DS-096](DS-096.md) | P2 | Closed | Coordinate the Rust 1.98.0 toolchain and 1.96.0 MSRV refresh |
 | [DS-097](DS-097.md) | P1 | Closed | Align the unreleased breaking API surface to version 2.0.0 |

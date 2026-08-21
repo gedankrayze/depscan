@@ -203,12 +203,12 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-088 | CVSS v3/v4 scoring tests, report snapshots, checked sentinel allocation, and DS-097 major-version gate |
 | DS-089 | sync test-hook module and complete 132-test provider suite, including publication/capability/download regressions |
 | DS-090 | CLI diagnostics process tests proving config-origin and configured verbosity logging after early tracing initialization |
-| DS-091 | weekly/manual `dependency-audit.yml`: RustSec `cargo audit` plus live workspace self-scan; first protected-main dispatch and negative advisory experiment remain external evidence |
-| DS-092 | `SECURITY.md`, README link, enabled GitHub private vulnerability reporting, and pending protected-main Security-tab pickup |
+| DS-091 | weekly/manual `dependency-audit.yml`; protected-main success run `32502809614` for RustSec plus live workspace self-scan; isolated RUSTSEC-2020-0071 negative run `32503190254` failing the audit job while the self-scan remained green |
+| DS-092 | protected-main `SECURITY.md`, README link, enabled private vulnerability reporting, and public Security Policy page HTTP/render verification |
 | DS-093 | release-workflow pin/count verifier and release-mode local gates; first v7 tag-driven native execution remains external evidence |
 | DS-094 | `verify-ci-policy.sh` exact stable/MSRV comment-and-SHA consistency across every workflow toolchain pin |
 | DS-095 | release-mode package-cache purge followed by five-crate `cargo package --workspace --allow-dirty --locked` verification |
-| DS-096 | stable 1.98.0 full gate and MSRV 1.96.0 workspace/all-target check/test; protected Ubuntu/Windows matrix remains external evidence |
+| DS-096 | stable 1.98.0 full gate and MSRV 1.96.0 workspace/all-target test; protected PR run `32501810914` with native Ubuntu `96832988185`, macOS `96832988535`, Windows `96832988601`, and MSRV `96832988502` jobs |
 | DS-097 | exact workspace/action/README/installer/report/acceptance 2.0.0 alignment, lockfile-only workspace version delta, full release gate, verified cargo-dist `generate --check`, reviewed 16-file `v2.0.0` plan, and read-only immutable-tag-control preflight |
 
 ## Platform and external evidence boundary
