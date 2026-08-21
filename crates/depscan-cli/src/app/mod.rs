@@ -20,7 +20,7 @@ use depscan_report::{OutputFormat, render};
 use futures::{StreamExt, stream};
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},

@@ -1,6 +1,20 @@
 use crate::{Ecosystem, normalize_name};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
+
+/// Merges duplicate package coordinates (same ecosystem, name, and version) into one entry per
+/// key, combining their metadata. The single owner of the dedup algorithm used by both the
+/// parsers and the CLI consolidation pass.
+pub fn dedup_packages(packages: Vec<Package>) -> Vec<Package> {
+    let mut merged = BTreeMap::<String, Package>::new();
+    for package in packages {
+        merged
+            .entry(package.key())
+            .and_modify(|existing| existing.merge_metadata(&package))
+            .or_insert(package);
+    }
+    merged.into_values().collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestConstraint {

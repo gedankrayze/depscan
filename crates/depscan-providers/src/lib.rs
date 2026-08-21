@@ -14,7 +14,8 @@ use depscan_core::{
     Ecosystem, EnrichError, FileIdentity, LatestVersions, NuGetVersion, Package, ProviderError,
     RegistryEnrichment, Severity, VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome,
     Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
-    latest_matching_version, normalize_name, pypi_version_is_prerelease, pypi_version_is_stable,
+    latest_matching_version, normalize_name, osv_affected_identity_matches,
+    pypi_version_is_prerelease, pypi_version_is_stable,
 };
 use directories::{BaseDirs, ProjectDirs};
 use fs2::FileExt;

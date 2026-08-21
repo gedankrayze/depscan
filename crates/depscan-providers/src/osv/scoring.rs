@@ -34,7 +34,7 @@ pub(crate) fn vulnerability_from_validated_osv(
         let mut matching = document
             .affected
             .iter()
-            .filter(|affected| affected_matches_package(affected, package));
+            .filter(|affected| osv_affected_identity_matches(affected, package));
         let first = matching.next();
         let evaluable = first
             .into_iter()
@@ -139,27 +139,12 @@ pub(crate) fn matching_affected_cvss_score(doc: &Value, package: &Package) -> Op
         .get("affected")
         .and_then(Value::as_array)?
         .iter()
-        .filter(|affected| affected_matches_package(affected, package))
+        .filter(|affected| osv_affected_identity_matches(affected, package))
         .filter_map(|affected| affected.get("severity").and_then(Value::as_array))
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
 
     cvss_score_from_severity_lists(&severity_lists)
-}
-
-pub(crate) fn affected_matches_package(affected: &Value, package: &Package) -> bool {
-    let Some(affected_package) = affected.get("package") else {
-        return false;
-    };
-    let Some(ecosystem) = affected_package.get("ecosystem").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(name) = affected_package.get("name").and_then(Value::as_str) else {
-        return false;
-    };
-
-    ecosystem == package.ecosystem.osv_name()
-        && (name == "*" || normalize_name(package.ecosystem, name) == package.name)
 }
 
 pub(crate) fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Option<f64> {

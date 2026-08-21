@@ -177,16 +177,7 @@ pub use nuget::NugetParser;
 mod cargo;
 pub use cargo::CargoParser;
 
-fn dedup(packages: Vec<Package>) -> Vec<Package> {
-    let mut map: BTreeMap<String, Package> = BTreeMap::new();
-    for p in packages {
-        let key = p.key();
-        map.entry(key)
-            .and_modify(|old| old.merge_metadata(&p))
-            .or_insert(p);
-    }
-    map.into_values().collect()
-}
+use depscan_core::dedup_packages as dedup;
 
 #[cfg(test)]
 mod tests;

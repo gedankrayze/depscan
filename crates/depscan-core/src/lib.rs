@@ -22,8 +22,10 @@ pub use finding::{
     SuppressionMatch, SuppressionSource, SuppressionState, Vulnerability,
 };
 pub use nuget::{NuGetVersion, NuGetVersionError};
-pub use osv::{OsvAffectedEvaluation, OsvEvaluationError, evaluate_osv_affected};
-pub use package::{ManifestConstraint, Package};
+pub use osv::{
+    OsvAffectedEvaluation, OsvEvaluationError, evaluate_osv_affected, osv_affected_identity_matches,
+};
+pub use package::{ManifestConstraint, Package, dedup_packages};
 pub use providers::{EcosystemParser, VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome};
 pub use scan::{ScanDocument, ScanResult};
 pub use version::{
