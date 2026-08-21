@@ -113,3 +113,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-092](DS-092.md) | P2 | Closed | Add a SECURITY.md vulnerability disclosure policy |
 | [DS-093](DS-093.md) | P2 | Closed | Refresh the dist-pinned actions/checkout to the v7 line |
 | [DS-094](DS-094.md) | P2 | Closed | Assert toolchain pin consistency across workflows |
+| [DS-095](DS-095.md) | P2 | Closed | Purge stale packaging caches before release-gate verification |

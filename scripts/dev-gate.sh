@@ -18,6 +18,18 @@ run() {
   "$@"
 }
 
+purge_packaging_caches() {
+  rm -rf target/package
+  local overlay
+  for overlay in "$HOME"/.cargo/registry/src/-*/depscan-* \
+    "$HOME"/.cargo/registry/cache/-*/depscan-*; do
+    [[ -e "$overlay" ]] && rm -rf "$overlay"
+  done
+  rm -rf target/debug/deps/libdepscan_* target/debug/deps/depscan_* \
+    target/debug/.fingerprint/depscan-*
+  return 0
+}
+
 quick_gates() {
   run bash scripts/check-rust-architecture.sh
   run bash scripts/verify-agent-automation.sh
@@ -48,6 +60,11 @@ case "$mode" in
     ;;
   release)
     full_gates
+    # Package verification resolves workspace crates through a version-keyed local overlay
+    # registry; because the version does not change between releases, stale extractions and
+    # their compiled artifacts survive edits and can fail (or silently pass) verification
+    # against old sources. Purge the depscan-specific caches so it always compiles the tree.
+    run purge_packaging_caches
     run cargo package --workspace --allow-dirty --locked
     run cargo build --release --locked -p depscan-cli
     ;;
