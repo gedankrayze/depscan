@@ -36,6 +36,21 @@ concurrency:
 # will be marked as a prerelease.
 on:
   pull_request:
+    paths:
+      - '.github/actions/install-cargo-dist/**'
+      - '.github/release-assets.txt'
+      - '.github/workflows/release-acceptance.yml'
+      - '.github/workflows/release-quality.yml'
+      - '.github/workflows/release.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'action.yml'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'scripts/github-action/**'
+      - 'scripts/verify-github-action.sh'
+      - 'scripts/verify-release-assets.sh'
+      - 'scripts/verify-release-workflow.sh'
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'

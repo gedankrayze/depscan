@@ -242,11 +242,28 @@ rather than alongside production implementations. The architecture check runs in
 release quality gates without an exception list.
 
 ```bash
-bash scripts/check-rust-architecture.sh
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace --all-targets
+bash scripts/dev-gate.sh quick
+bash scripts/dev-gate.sh full    # frozen ordinary change
+bash scripts/dev-gate.sh release # use instead of full for release-sensitive changes
 ```
+
+`scripts/dev-gate.sh` is the canonical local validation entry point. The full mode runs
+the architecture check, formatting, exact strict Clippy invocation, all-target workspace
+tests, action and release verifiers, and patch hygiene; release mode adds package and
+release-binary verification. Run focused tests while iterating, then one full gate on the
+frozen tree.
+
+Repository-specific agent guidance lives in [`AGENTS.md`](AGENTS.md), with focused change,
+pull-request-triage, and release skills under [`.agents/skills`](.agents/skills). Optional
+Codex project hooks under [`.codex`](.codex) provide session context and block direct-main,
+force-push, and release-tag mutation commands. Review and trust non-managed hooks through
+`/hooks`; hooks are guardrails, while protected branches, tag rules, and CI remain the
+authoritative controls.
+
+To avoid duplicate runner consumption, pushes to `develop` rely on the pull-request run;
+push workflows run again only after protected `main` changes. Superseded CI and static
+pull-request runs are cancelled, static builds are limited to source/build changes, and
+release dry runs are limited to release-sensitive paths.
 
 The checked-in [verification matrix](docs/test-matrix.md) maps the development specification and every audit issue to parser fixtures, version tables, provider mocks, process-level E2E tests, platform CI, live probes, or artifact gates. Pull requests dogfood an offline scan of this workspace on Linux, macOS, and Windows; public API checks remain an explicitly enabled scheduled/manual job.
 

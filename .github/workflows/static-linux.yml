@@ -2,12 +2,34 @@ name: Static Linux
 
 on:
   pull_request:
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/static-linux.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**'
+      - 'fixtures/rust-sample/**'
+      - 'rust-toolchain.toml'
+      - 'scripts/verify-static-linux.sh'
   push:
-    branches: [main, develop]
+    branches: [main]
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/static-linux.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**'
+      - 'fixtures/rust-sample/**'
+      - 'rust-toolchain.toml'
+      - 'scripts/verify-static-linux.sh'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: static-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   static-linux:

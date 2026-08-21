@@ -3,10 +3,14 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [develop, main]
+    branches: [main]
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   quality:
@@ -26,6 +30,11 @@ jobs:
       - name: Verify Rust module boundaries
         if: runner.os == 'Linux'
         run: bash scripts/check-rust-architecture.sh
+      - name: Verify repository automation policy
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/verify-agent-automation.sh
+          bash scripts/verify-ci-policy.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
