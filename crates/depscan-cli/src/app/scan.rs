@@ -257,6 +257,9 @@ fn scan_timestamp() -> Result<DateTime<Utc>, CliError> {
     Ok(timestamp)
 }
 
+// Scan-level enrichment concurrency; per-ecosystem provider semaphores throttle further below.
+const MAX_CONCURRENT_ENRICHMENTS: usize = 64;
+
 async fn fetch_latest<P>(
     registry: &P,
     packages: &[Package],
@@ -265,7 +268,6 @@ async fn fetch_latest<P>(
 where
     P: VersionProvider + Clone,
 {
-    let sem = std::sync::Arc::new(Semaphore::new(64));
     stream::iter(
         packages
             .iter()
@@ -273,9 +275,7 @@ where
             .cloned()
             .map(|package| {
                 let registry = (*registry).clone();
-                let sem = sem.clone();
                 async move {
-                    let _permit = sem.acquire().await.expect("semaphore closes only on drop");
                     let key = package.key();
                     match registry.latest(&package).await {
                         Ok(latest) => (key, (Some(latest), vec![])),
@@ -295,7 +295,7 @@ where
                 }
             }),
     )
-    .buffer_unordered(64)
+    .buffer_unordered(MAX_CONCURRENT_ENRICHMENTS)
     .collect()
     .await
 }

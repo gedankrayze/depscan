@@ -28,7 +28,6 @@ use std::{
     str::FromStr,
     time::Duration as StdDuration,
 };
-use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
 mod commands;
