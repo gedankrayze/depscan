@@ -248,3 +248,49 @@ async fn valid_empty_osv_batch_results_preserve_alignment_and_are_cached() {
     }
     server.verify().await;
 }
+
+#[tokio::test]
+async fn batch_pagination_stops_at_the_wall_clock_deadline() {
+    let server = MockServer::start().await;
+    let pages = Arc::new(AtomicUsize::new(0));
+    let responder_pages = pages.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(move |_: &wiremock::Request| {
+            let page = responder_pages.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "results": [{
+                        "vulns": [osv_query_vulnerability("TEST-DEADLINE-1")],
+                        "next_page_token": format!("page-{page}")
+                    }]
+                }))
+                .set_delay(std::time::Duration::from_millis(100))
+        })
+        .mount(&server)
+        .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Cache {
+        root: cache_dir.path().to_path_buf(),
+        policy: CachePolicy::default(),
+    };
+    let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache, server.uri())
+        .with_batch_deadline(StdDuration::from_millis(250));
+    let package = npm_package("deadline-fixture");
+
+    let outcomes = client
+        .query_batch_outcomes(std::slice::from_ref(&package))
+        .await;
+
+    assert_eq!(outcomes.len(), 1);
+    let error = outcomes[0].as_ref().unwrap_err();
+    assert!(
+        error.to_string().contains("pagination deadline"),
+        "expected a deadline failure, got: {error}"
+    );
+    let served = pages.load(Ordering::SeqCst);
+    assert!(
+        (1..OSV_MAX_QUERY_PAGES).contains(&served),
+        "deadline must stop pagination well before the page cap, served {served} pages"
+    );
+}

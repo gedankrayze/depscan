@@ -6,6 +6,7 @@ pub struct OsvClient {
     pub(crate) cache: Cache,
     pub(crate) concurrency: Arc<Semaphore>,
     pub(crate) base_url: String,
+    pub(crate) batch_deadline: StdDuration,
 }
 impl OsvClient {
     pub fn new(http: HttpClient, cache: Cache) -> Self {
@@ -22,7 +23,14 @@ impl OsvClient {
             cache,
             concurrency: Arc::new(Semaphore::new(16)),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            batch_deadline: OSV_QUERY_BATCH_DEADLINE,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_batch_deadline(mut self, deadline: StdDuration) -> Self {
+        self.batch_deadline = deadline;
+        self
     }
     #[cfg(test)]
     pub(crate) async fn query_batch(
@@ -45,7 +53,20 @@ impl OsvClient {
             .map(|index| (index, None::<String>))
             .collect::<Vec<_>>();
 
+        let started = tokio::time::Instant::now();
         while !pending.is_empty() {
+            // Checked between round-trips; each in-flight request is separately bounded by the
+            // HTTP request timeout, so the practical bound is the deadline plus one request.
+            if started.elapsed() > self.batch_deadline {
+                let error = ProviderError::Network(format!(
+                    "OSV batch query exceeded its {}-second pagination deadline",
+                    self.batch_deadline.as_secs()
+                ));
+                for (index, _) in &pending {
+                    failures[*index] = Some(error.clone());
+                }
+                break;
+            }
             let queries = pending
                 .iter()
                 .map(|(index, page_token)| (&batch[*index], page_token.as_deref()))
