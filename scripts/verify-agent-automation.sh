@@ -10,6 +10,7 @@ required_files=(
   .agents/skills/depscan-pr-triage/SKILL.md
   .agents/skills/depscan-release/SKILL.md
   scripts/dev-gate.sh
+  scripts/pre-push-check.sh
   scripts/verify-ci-policy.sh
 )
 for required_file in "${required_files[@]}"; do
@@ -22,6 +23,7 @@ done
 python3 -m json.tool .codex/hooks.json >/dev/null
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .codex/hooks/tests
 bash -n scripts/dev-gate.sh
+bash -n scripts/pre-push-check.sh
 
 python3 - .agents/skills/*/SKILL.md <<'PY'
 import pathlib
@@ -56,7 +58,11 @@ PY
 
 grep -Fq 'cargo clippy --all-targets -- -D warnings' AGENTS.md
 grep -Fq 'delete the merged local ticket branch' AGENTS.md
+grep -Fq 'bash scripts/pre-push-check.sh' AGENTS.md
+grep -Fq 'process all of them with the PR-triage workflow' AGENTS.md
 grep -Fq 'delete that merged local branch' .agents/skills/depscan-change/SKILL.md
+grep -Fq 'bash scripts/pre-push-check.sh' .agents/skills/depscan-change/SKILL.md
+grep -Fq 'bash scripts/pre-push-check.sh' .agents/skills/depscan-pr-triage/SKILL.md
 grep -Fq '"matcher": "^Bash$"' .codex/hooks.json
 grep -Fq '"matcher": "^(startup|resume|clear|compact)$"' .codex/hooks.json
 if [[ $(grep -Fc '"commandWindows":' .codex/hooks.json) -ne 2 ]]; then

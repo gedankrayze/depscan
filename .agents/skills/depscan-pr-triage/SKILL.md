@@ -18,5 +18,8 @@ description: Inspect and process incoming DepScan pull requests and GitHub Actio
    authorizes those remote mutations.
 7. Before an authorized merge, require current-head required checks, verify the source
    branch and review state again, and ensure the local worktree has no unpublished scope.
-8. Report one compact run inventory with exact run/job links or IDs, then the recommended
+8. Before any later remote push, run `bash scripts/pre-push-check.sh`. Process every
+   reported incoming PR first, then rerun the check until it passes. The outgoing
+   `develop` -> `main` integration PR is excluded from the sweep.
+9. Report one compact run inventory with exact run/job links or IDs, then the recommended
    disposition for each PR.

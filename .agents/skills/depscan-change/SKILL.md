@@ -20,5 +20,8 @@ artifacts, installers, or publication, and `depscan-pr-triage` for incoming pull
    `git diff --check`, `git status`, and the complete diff.
 7. After local integration, prove the ticket branch is an ancestor of the target, then
    delete that merged local branch. Remote branch deletion requires separate permission.
-8. Report the outcome first, then changed files, verification evidence, and any native,
+8. Immediately before any authorized remote push, run `bash scripts/pre-push-check.sh`.
+   If it finds incoming PRs, stop and process them with `depscan-pr-triage`; require the
+   check to pass before pushing.
+9. Report the outcome first, then changed files, verification evidence, and any native,
    cross-target, or external-state evidence still pending.

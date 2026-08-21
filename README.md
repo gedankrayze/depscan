@@ -265,6 +265,11 @@ push workflows run again only after protected `main` changes. Superseded CI and 
 pull-request runs are cancelled, static builds are limited to source/build changes, and
 release dry runs are limited to release-sensitive paths.
 
+Before every authorized remote push, run `bash scripts/pre-push-check.sh`. It fails closed
+when the GitHub CLI cannot inspect the repository or when an incoming pull request remains
+open, so those PRs are triaged and processed before new work is published. The normal
+outgoing `develop` -> `main` integration PR is excluded from that sweep.
+
 The checked-in [verification matrix](docs/test-matrix.md) maps the development specification and every audit issue to parser fixtures, version tables, provider mocks, process-level E2E tests, platform CI, live probes, or artifact gates. Pull requests dogfood an offline scan of this workspace on Linux, macOS, and Windows; public API checks remain an explicitly enabled scheduled/manual job.
 
 ## Known limitations

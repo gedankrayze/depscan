@@ -9,6 +9,10 @@
 - After a local integration, prove the ticket branch is an ancestor of the target branch,
   then delete the merged local ticket branch. Delete a remote branch only with explicit
   permission and after separately verifying its merged state.
+- Immediately before every authorized remote push, run `bash scripts/pre-push-check.sh`.
+  If it reports incoming pull requests, process all of them with the PR-triage workflow
+  and rerun the check successfully before pushing. The `develop` -> `main` integration PR
+  is outgoing and is therefore excluded from this incoming-PR sweep.
 - Preserve unrelated work. Inspect the worktree before editing and stage explicit paths.
 - Treat release workflows, action installers, capability-safe filesystem code, frozen
   fixtures, snapshots, and security-boundary tests as sensitive review surfaces.
