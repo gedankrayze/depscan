@@ -10,7 +10,7 @@ permissions:
 jobs:
   preflight:
     name: immutable release preflight
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       release-commit: ${{ steps.release.outputs.commit }}
     env:
