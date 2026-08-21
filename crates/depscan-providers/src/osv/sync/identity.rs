@@ -102,7 +102,7 @@ pub(crate) fn validate_capability_sentinel_with(
         ));
     }
     let identity = std_file_identity(&file, &sentinel_path)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.read_to_end(&mut bytes).map_err(|error| {
         cache_path_error(
             root_path,

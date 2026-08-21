@@ -6,7 +6,16 @@ use crate::{
     },
 };
 use depscan_core::{ScanDocument, ScanResult, SuppressionState};
-use std::{cmp::Reverse, fmt::Write};
+use std::{
+    cmp::Reverse,
+    fmt::{self, Write},
+};
+
+// `fmt::Write` into a `String` cannot fail, so the write result carries no information.
+fn push_line(text: &mut String, line: fmt::Arguments) {
+    let _ = text.write_fmt(line);
+    text.push('\n');
+}
 
 pub fn render_markdown(document: &ScanDocument) -> String {
     let totals = Totals::from_document(document);
@@ -16,12 +25,10 @@ pub fn render_markdown(document: &ScanDocument) -> String {
         env!("CARGO_PKG_REPOSITORY"),
         env!("CARGO_PKG_REPOSITORY"),
     );
-    writeln!(
-        text,
-        "Generated: `{}`\n",
-        document.generated_at.to_rfc3339()
-    )
-    .expect("write Markdown heading");
+    push_line(
+        &mut text,
+        format_args!("Generated: `{}`\n", document.generated_at.to_rfc3339()),
+    );
     write_summary(&mut text, &totals);
     write_vulnerabilities(&mut text, document);
     write_dependency_status(&mut text, document);
@@ -43,7 +50,7 @@ fn write_summary(text: &mut String, totals: &Totals) {
         ("Expired ignores", totals.expired_ignores),
         ("Soft failures", totals.errors),
     ] {
-        writeln!(text, "| {label} | {count} |").expect("write Markdown summary");
+        push_line(text, format_args!("| {label} | {count} |"));
     }
     text.push('\n');
 }
@@ -72,19 +79,20 @@ fn write_vulnerabilities(text: &mut String, document: &ScanDocument) {
             } else {
                 "Active"
             };
-            writeln!(
+            push_line(
                 text,
-                "| {} | {} | {} | {} | {} | {} | {} | {status} | {} |",
-                cell(result.package.ecosystem.display_name()),
-                cell(&result.package.display_name),
-                cell(&result.package.version),
-                cell(&severity),
-                cell(&vulnerability.id),
-                cell_list(&vulnerability.aliases),
-                cell_list(&vulnerability.fixed_in),
-                cell(&vulnerability.summary),
-            )
-            .expect("write Markdown vulnerability");
+                format_args!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {status} | {} |",
+                    cell(result.package.ecosystem.display_name()),
+                    cell(&result.package.display_name),
+                    cell(&result.package.version),
+                    cell(&severity),
+                    cell(&vulnerability.id),
+                    cell_list(&vulnerability.aliases),
+                    cell_list(&vulnerability.fixed_in),
+                    cell(&vulnerability.summary),
+                ),
+            );
         }
     }
     text.push('\n');
@@ -121,17 +129,18 @@ fn write_dependency_status(text: &mut String, document: &ScanDocument) {
         };
         let latest_stable = latest.map_or("Unknown", |latest| latest.latest_stable.as_str());
         let status = dependency_status(result);
-        writeln!(
+        push_line(
             text,
-            "| {} | {} | {} | {} | {} | {} |",
-            cell(result.package.ecosystem.display_name()),
-            cell(&result.package.display_name),
-            cell(declared),
-            cell(matching),
-            cell(latest_stable),
-            cell(&status),
-        )
-        .expect("write Markdown dependency status");
+            format_args!(
+                "| {} | {} | {} | {} | {} | {} |",
+                cell(result.package.ecosystem.display_name()),
+                cell(&result.package.display_name),
+                cell(declared),
+                cell(matching),
+                cell(latest_stable),
+                cell(&status),
+            ),
+        );
     }
     if !wrote_header {
         text.push_str("_None._\n");
@@ -187,21 +196,22 @@ fn write_suppressions(text: &mut String, document: &ScanDocument) {
                     SuppressionState::Active => "Active",
                     SuppressionState::Expired => "Expired",
                 };
-                writeln!(
+                push_line(
                     text,
-                    "| {state} | {} | {} | {} | {} | {} | {} |",
-                    cell(&result.package.display_name),
-                    cell(&finding.vulnerability.id),
-                    cell(&matched.matched_id),
-                    cell(suppression_source_label(matched.source)),
-                    cell(matched.reason.as_deref().unwrap_or("—")),
-                    cell(
-                        &matched
-                            .expires
-                            .map_or_else(|| "—".to_owned(), |date| date.to_string())
+                    format_args!(
+                        "| {state} | {} | {} | {} | {} | {} | {} |",
+                        cell(&result.package.display_name),
+                        cell(&finding.vulnerability.id),
+                        cell(&matched.matched_id),
+                        cell(suppression_source_label(matched.source)),
+                        cell(matched.reason.as_deref().unwrap_or("—")),
+                        cell(
+                            &matched
+                                .expires
+                                .map_or_else(|| "—".to_owned(), |date| date.to_string())
+                        ),
                     ),
-                )
-                .expect("write Markdown suppression");
+                );
             }
         }
     }
@@ -221,14 +231,15 @@ fn write_soft_failures(text: &mut String, document: &ScanDocument) {
     text.push_str("| Provider | Package | Message |\n|---|---|---|\n");
     for result in &document.results {
         for error in &result.errors {
-            writeln!(
+            push_line(
                 text,
-                "| {} | {} | {} |",
-                cell(&error.provider),
-                cell(&result.package.display_name),
-                cell(&error.message),
-            )
-            .expect("write Markdown soft failure");
+                format_args!(
+                    "| {} | {} | {} |",
+                    cell(&error.provider),
+                    cell(&result.package.display_name),
+                    cell(&error.message),
+                ),
+            );
         }
     }
 }

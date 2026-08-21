@@ -356,6 +356,8 @@ pub(crate) async fn run() -> ExitCode {
     match cli.command {
         Some(Command::Scan(args)) => run_scan(args).await,
         None => run_scan(cli.default_scan).await,
-        Some(command) => run_non_scan(command).await,
+        Some(Command::Sync(args)) => run_sync(args).await,
+        Some(Command::Cache(args)) => run_cache(args),
+        Some(Command::Completions { shell }) => run_completions(shell),
     }
 }

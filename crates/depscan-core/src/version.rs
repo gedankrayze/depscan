@@ -56,21 +56,18 @@ pub fn pypi_version_is_stable(version: &str) -> bool {
 }
 
 pub fn classify_staleness(ecosystem: Ecosystem, installed: &str, latest: &str) -> Staleness {
-    if ecosystem == Ecosystem::NuGet {
-        return match (NuGetVersion::parse(installed), NuGetVersion::parse(latest)) {
+    match ecosystem {
+        Ecosystem::NuGet => match (NuGetVersion::parse(installed), NuGetVersion::parse(latest)) {
             (Ok(installed), Ok(latest)) if installed >= latest => Staleness::Current,
             (Ok(installed), Ok(latest)) => {
                 classify_release_segments(installed.release_segments(), latest.release_segments())
             }
             _ => Staleness::Unknown,
-        };
-    }
-
-    if compare_versions(ecosystem, installed, latest) != Ordering::Less {
-        return Staleness::Current;
-    }
-    match ecosystem {
+        },
         Ecosystem::Npm | Ecosystem::CratesIo => {
+            if compare_versions(ecosystem, installed, latest) != Ordering::Less {
+                return Staleness::Current;
+            }
             match (Version::parse(installed), Version::parse(latest)) {
                 (Ok(a), Ok(b)) if a.major != b.major => Staleness::Major,
                 (Ok(a), Ok(b)) if a.minor != b.minor => Staleness::Minor,
@@ -78,12 +75,16 @@ pub fn classify_staleness(ecosystem: Ecosystem, installed: &str, latest: &str) -
                 _ => Staleness::Unknown,
             }
         }
-        Ecosystem::NuGet => unreachable!("NuGet staleness is handled using parsed versions"),
-        Ecosystem::PyPI => match (parse_pep440(installed), parse_pep440(latest)) {
-            (Some(a), Some(b)) if a.epoch() != b.epoch() => Staleness::Major,
-            (Some(a), Some(b)) => classify_release_segments(a.release(), b.release()),
-            _ => Staleness::Unknown,
-        },
+        Ecosystem::PyPI => {
+            if compare_versions(ecosystem, installed, latest) != Ordering::Less {
+                return Staleness::Current;
+            }
+            match (parse_pep440(installed), parse_pep440(latest)) {
+                (Some(a), Some(b)) if a.epoch() != b.epoch() => Staleness::Major,
+                (Some(a), Some(b)) => classify_release_segments(a.release(), b.release()),
+                _ => Staleness::Unknown,
+            }
+        }
     }
 }
 

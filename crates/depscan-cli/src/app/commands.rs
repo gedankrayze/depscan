@@ -13,17 +13,19 @@ pub(super) async fn run_scan(args: ScanArgs) -> ExitCode {
     finish(scan(prepared).await)
 }
 
-pub(super) async fn run_non_scan(command: Command) -> ExitCode {
+pub(super) async fn run_sync(args: SyncArgs) -> ExitCode {
     initialize_tracing("warn");
-    let code = match command {
-        Command::Scan(_) => {
-            unreachable!("scan commands are prepared before tracing initialization")
-        }
-        Command::Sync(args) => sync(args).await,
-        Command::Cache(args) => cache_command(args),
-        Command::Completions { shell } => completions(shell).map(|()| AppExit::Clean),
-    };
-    finish(code)
+    finish(sync(args).await)
+}
+
+pub(super) fn run_cache(args: CacheArgs) -> ExitCode {
+    initialize_tracing("warn");
+    finish(cache_command(args))
+}
+
+pub(super) fn run_completions(shell: CompletionShell) -> ExitCode {
+    initialize_tracing("warn");
+    finish(completions(shell).map(|()| AppExit::Clean))
 }
 
 fn initialize_tracing(level: &str) {

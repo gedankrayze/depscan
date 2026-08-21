@@ -127,14 +127,14 @@ impl OsvCvssVersion {
 
 /// OSV top-level severity takes precedence over affected-entry severity. Within either source,
 /// prefer a valid CVSS v4 vector and then fall back to a valid CVSS v3 vector.
-pub(crate) fn osv_cvss_score(doc: &Value, package: Option<&Package>) -> Option<f32> {
+pub(crate) fn osv_cvss_score(doc: &Value, package: Option<&Package>) -> Option<f64> {
     doc.get("severity")
         .and_then(Value::as_array)
         .and_then(|severity| cvss_score_from_severity_lists(&[severity.as_slice()]))
         .or_else(|| matching_affected_cvss_score(doc, package?))
 }
 
-pub(crate) fn matching_affected_cvss_score(doc: &Value, package: &Package) -> Option<f32> {
+pub(crate) fn matching_affected_cvss_score(doc: &Value, package: &Package) -> Option<f64> {
     let severity_lists = doc
         .get("affected")
         .and_then(Value::as_array)?
@@ -162,7 +162,7 @@ pub(crate) fn affected_matches_package(affected: &Value, package: &Package) -> b
         && (name == "*" || normalize_name(package.ecosystem, name) == package.name)
 }
 
-pub(crate) fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Option<f32> {
+pub(crate) fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Option<f64> {
     [OsvCvssVersion::V4, OsvCvssVersion::V3]
         .into_iter()
         .find_map(|version| {
@@ -177,6 +177,5 @@ pub(crate) fn cvss_score_from_severity_lists(severity_lists: &[&[Value]]) -> Opt
                 .filter(|vector| version.accepts(vector))
                 .map(|vector| vector.score())
                 .max_by(f64::total_cmp)
-                .map(|score| score as f32)
         })
 }
