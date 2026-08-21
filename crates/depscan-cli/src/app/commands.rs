@@ -21,10 +21,7 @@ pub(super) async fn run_non_scan(command: Command) -> ExitCode {
         }
         Command::Sync(args) => sync(args).await,
         Command::Cache(args) => cache_command(args),
-        Command::Completions { shell } => {
-            completions(shell);
-            Ok(AppExit::Clean)
-        }
+        Command::Completions { shell } => completions(shell).map(|()| AppExit::Clean),
     };
     finish(code)
 }
@@ -43,6 +40,21 @@ fn finish(code: Result<AppExit, CliError>) -> ExitCode {
             error!("{error}");
             error.exit_code()
         }
+    }
+}
+
+// Rust ignores SIGPIPE, so a closed stdout consumer (for example `depscan | head`) surfaces as
+// a BrokenPipe write error. Suppress it and keep the scan's own exit code instead of aborting.
+pub(super) fn write_stdout(bytes: &[u8]) -> Result<(), CliError> {
+    use io::Write as _;
+    let mut stdout = io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+            debug!("stdout consumer closed the pipe; suppressing remaining output");
+            Ok(())
+        }
+        Err(error) => Err(CliError::usage(format!("writing to stdout: {error}"))),
     }
 }
 
@@ -75,7 +87,7 @@ async fn sync(args: SyncArgs) -> Result<AppExit, CliError> {
     .await
     .map_err(CliError::provider)?;
     for path in paths {
-        println!("synced {}", path.display());
+        write_stdout(format!("synced {}\n", path.display()).as_bytes())?;
     }
     Ok(AppExit::Clean)
 }
@@ -84,35 +96,37 @@ fn cache_command(args: CacheArgs) -> Result<AppExit, CliError> {
     match args.command {
         CacheCommand::Clear => {
             cache.clear().map_err(CliError::provider)?;
-            println!("cache cleared: {}", cache.root().display());
+            write_stdout(format!("cache cleared: {}\n", cache.root().display()).as_bytes())?;
         }
         CacheCommand::Stats => {
             let stats = cache.stats().map_err(CliError::provider)?;
-            println!(
-                "cache: {} files, {} bytes ({})",
-                stats.files,
-                stats.bytes,
-                cache.root().display()
-            );
+            write_stdout(
+                format!(
+                    "cache: {} files, {} bytes ({})\n",
+                    stats.files,
+                    stats.bytes,
+                    cache.root().display()
+                )
+                .as_bytes(),
+            )?;
         }
-        CacheCommand::Path => println!("{}", cache.root().display()),
+        CacheCommand::Path => {
+            write_stdout(format!("{}\n", cache.root().display()).as_bytes())?;
+        }
     }
     Ok(AppExit::Clean)
 }
-fn completions(shell: CompletionShell) {
+fn completions(shell: CompletionShell) -> Result<(), CliError> {
     let mut command = Cli::command();
+    let mut script = Vec::new();
     match shell {
-        CompletionShell::Bash => generate(shells::Bash, &mut command, "depscan", &mut io::stdout()),
-        CompletionShell::Elvish => {
-            generate(shells::Elvish, &mut command, "depscan", &mut io::stdout())
+        CompletionShell::Bash => generate(shells::Bash, &mut command, "depscan", &mut script),
+        CompletionShell::Elvish => generate(shells::Elvish, &mut command, "depscan", &mut script),
+        CompletionShell::Fish => generate(shells::Fish, &mut command, "depscan", &mut script),
+        CompletionShell::PowerShell => {
+            generate(shells::PowerShell, &mut command, "depscan", &mut script)
         }
-        CompletionShell::Fish => generate(shells::Fish, &mut command, "depscan", &mut io::stdout()),
-        CompletionShell::PowerShell => generate(
-            shells::PowerShell,
-            &mut command,
-            "depscan",
-            &mut io::stdout(),
-        ),
-        CompletionShell::Zsh => generate(shells::Zsh, &mut command, "depscan", &mut io::stdout()),
+        CompletionShell::Zsh => generate(shells::Zsh, &mut command, "depscan", &mut script),
     }
+    write_stdout(&script)
 }

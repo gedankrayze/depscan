@@ -186,7 +186,7 @@ pub(super) async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         fs::write(&path, content)
             .map_err(|e| CliError::usage(format!("writing {}: {e}", path.display())))?;
     } else {
-        print!("{content}");
+        write_stdout(content.as_bytes())?;
     }
     if has_vulnerability_failure(&document, fail_on) {
         Ok(AppExit::Vulnerabilities)

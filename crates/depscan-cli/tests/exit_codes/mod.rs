@@ -1,3 +1,4 @@
+mod broken_pipe;
 mod cli_contract;
 mod config_basic;
 mod config_policy;
