@@ -54,7 +54,7 @@ release_action_uses=$(
   grep -hE '^[[:space:]-]*uses:[[:space:]]+[^.]' "$release_workflow" "$quality_workflow"
 )
 for expected in \
-  'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd:6' \
+  'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1:6' \
   'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a:4' \
   'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c:4' \
   'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6:1'; do
