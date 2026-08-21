@@ -154,7 +154,7 @@ impl HttpClient {
             "{context}: retry policy allowed no attempts"
         )))
     }
-    pub async fn get_json(
+    pub(crate) async fn get_json(
         &self,
         url: &str,
         headers: HeaderMap,
@@ -177,7 +177,7 @@ impl HttpClient {
         self.request_json(reqwest::Method::GET, url, None, headers)
             .await
     }
-    pub async fn post_json(&self, url: &str, body: Value) -> Result<Value, ProviderError> {
+    pub(crate) async fn post_json(&self, url: &str, body: Value) -> Result<Value, ProviderError> {
         match self
             .request_json(reqwest::Method::POST, url, Some(body), HeaderMap::new())
             .await?

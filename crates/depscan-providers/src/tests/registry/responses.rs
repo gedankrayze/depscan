@@ -61,7 +61,7 @@ async fn native_registry_http_mocks_reject_malformed_documents_for_every_ecosyst
 #[tokio::test]
 async fn registry_fixtures_keep_unconstrained_and_matching_latest_distinct() {
     for fixture in registry_range_fixtures() {
-        let ecosystem = Ecosystem::from_cli(&fixture.ecosystem).unwrap();
+        let ecosystem = fixture_ecosystem(&fixture.ecosystem);
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = Cache {
             root: cache_dir.path().to_path_buf(),

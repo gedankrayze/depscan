@@ -114,12 +114,7 @@ fn unresolved_manifest_constraint_remains_visible_without_registry_metadata() {
 }
 
 #[test]
-fn markdown_format_parses_and_infers_only_documented_extensions() {
-    assert_eq!(
-        OutputFormat::parse("markdown"),
-        Some(OutputFormat::Markdown)
-    );
-    assert_eq!(OutputFormat::parse("md"), None);
+fn markdown_format_infers_only_documented_extensions() {
     assert_eq!(
         OutputFormat::infer(Path::new("report.md")),
         Some(OutputFormat::Markdown)

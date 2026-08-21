@@ -22,22 +22,11 @@ impl Ecosystem {
             Self::CratesIo => "crates.io",
         }
     }
+    /// Human-readable name used in reports. Currently identical to [`Self::osv_name`] for
+    /// every supported ecosystem; kept as a separate accessor so report naming can diverge
+    /// from OSV's identifiers without an API break.
     pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Npm => "npm",
-            Self::PyPI => "PyPI",
-            Self::NuGet => "NuGet",
-            Self::CratesIo => "crates.io",
-        }
-    }
-    pub fn from_cli(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "npm" | "node" | "bun" => Some(Self::Npm),
-            "pypi" | "python" => Some(Self::PyPI),
-            "nuget" | "dotnet" | ".net" => Some(Self::NuGet),
-            "cargo" | "crates" | "crates.io" | "rust" => Some(Self::CratesIo),
-            _ => None,
-        }
+        self.osv_name()
     }
 }
 

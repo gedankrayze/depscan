@@ -199,7 +199,10 @@ impl Cache {
         .map_err(|e| ProviderError::Cache(e.to_string()))?;
         fs::rename(tmp, path).map_err(|e| ProviderError::Cache(e.to_string()))
     }
-    pub fn put(
+    // An unconditional write used as the cache-seeding seam by in-crate tests; production
+    // writes go through `put_if_unchanged`.
+    #[cfg(test)]
+    pub(crate) fn put(
         &self,
         namespace: &str,
         key: &str,

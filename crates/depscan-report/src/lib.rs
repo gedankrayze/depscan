@@ -27,17 +27,6 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "table" => Some(Self::Table),
-            "markdown" => Some(Self::Markdown),
-            "json" => Some(Self::Json),
-            "sarif" => Some(Self::Sarif),
-            "summary" => Some(Self::Summary),
-            _ => None,
-        }
-    }
-
     pub fn infer(path: &Path) -> Option<Self> {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("md" | "markdown") => Some(Self::Markdown),

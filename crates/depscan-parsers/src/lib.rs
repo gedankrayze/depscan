@@ -167,12 +167,9 @@ fn ecosystem_for_kind(kind: &SourceKind) -> Ecosystem {
     }
 }
 
-fn candidate(root: &Path, file: &str, kind: SourceKind) -> Option<DetectedSource> {
+fn source(root: &Path, file: &str, kind: SourceKind) -> Option<DetectedSource> {
     let path = root.join(file);
     path.is_file().then_some(DetectedSource { path, kind })
-}
-fn source(root: &Path, name: &str, kind: SourceKind) -> Option<DetectedSource> {
-    candidate(root, name, kind)
 }
 
 mod node;
