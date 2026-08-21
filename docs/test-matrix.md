@@ -7,16 +7,16 @@ This document is the durable index from the version 0.1 development specificatio
 Run the deterministic suite without public network access:
 
 ```bash
-cargo +1.97.1 fmt --all -- --check
-cargo +1.97.1 test --workspace --all-targets --locked
-cargo +1.97.1 clippy --all-targets -- -D warnings
-cargo +1.95.0 test --workspace --all-targets --locked
+cargo +1.98.0 fmt --all -- --check
+cargo +1.98.0 test --workspace --all-targets --locked
+cargo +1.98.0 clippy --all-targets -- -D warnings
+cargo +1.96.0 test --workspace --all-targets --locked
 ```
 
 The ignored live provider suite is deliberately opt-in and belongs in the scheduled workflow, not pull-request CI:
 
 ```bash
-DEPSCAN_RUN_LIVE=1 cargo +1.97.1 test --locked -p depscan-cli \
+DEPSCAN_RUN_LIVE=1 cargo +1.98.0 test --locked -p depscan-cli \
   --test e2e_matrix live_provider_matrix_for_every_ecosystem \
   -- --exact --ignored --nocapture
 ```
@@ -137,7 +137,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-022 | CLI/config merge unit tests and complete config process tests |
 | DS-023 | `tool_fallbacks.rs` nine sandbox/authorization/failure tests plus parser `tool_outputs.rs` |
 | DS-024 | `cargo metadata`, package-list/package-build checks for every workspace crate |
-| DS-025 | pinned 1.97.1 quality matrix and 1.95.0 MSRV job/tests |
+| DS-025 | pinned 1.98.0 quality matrix and 1.96.0 MSRV job/tests |
 | DS-026 | locked workspace gates, direct-version audit, `cargo audit` |
 | DS-027 | pnpm/Yarn YAML anchor/duplicate/merge/depth/scalar safety tests |
 | DS-028 | this inventory, native registry mocks, four-ecosystem process E2E, offline dogfood, ignored live suite |

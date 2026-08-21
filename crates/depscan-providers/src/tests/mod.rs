@@ -1,5 +1,4 @@
 use super::osv::sync::*;
-use super::osv::*;
 use super::*;
 use std::{
     io::{Cursor, Write},
@@ -9,7 +8,7 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt},
+    io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     sync::Notify,
     task::JoinHandle,

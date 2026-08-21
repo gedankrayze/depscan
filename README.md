@@ -224,7 +224,7 @@ Version freshness is evaluated from cached registry metadata when a usable entry
 
 ## Development
 
-The pinned toolchain is the latest verified stable patch (Rust 1.97.1 as of 2026-08-19). The supported MSRV follows an N−2 stable policy and is currently Rust 1.95.0. On each stable Rust release, refresh the pin, move the MSRV to the new N−2 release, update CI, and verify both toolchains before merging.
+The pinned toolchain is the latest verified stable patch (Rust 1.98.0 as of 2026-08-21). The supported MSRV follows an N−2 stable policy and is currently Rust 1.96.0. On each stable Rust release, refresh the pin, move the MSRV to the new N−2 release, update CI, and verify both toolchains before merging.
 
 The workspace is divided at its architectural boundaries:
 
