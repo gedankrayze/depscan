@@ -2,6 +2,7 @@ mod broken_pipe;
 mod cli_contract;
 mod config_basic;
 mod config_policy;
+mod diagnostics;
 mod filters_node;
 mod filters_python;
 mod input_validation;

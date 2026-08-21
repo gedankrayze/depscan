@@ -1,6 +1,11 @@
 use super::*;
 
 pub(super) async fn run_scan(args: ScanArgs) -> ExitCode {
+    // Tracing starts before configuration resolution so resolution diagnostics are not lost.
+    // The level honors the CLI flags first; a config-set verbosity cannot apply retroactively,
+    // so it is reloaded into the filter for the scan phase once the config is merged.
+    let cli_level = log_level(args.quiet, args.verbose);
+    let filter = initialize_tracing(cli_level);
     let prepared = match prepare_scan(args) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -8,31 +13,40 @@ pub(super) async fn run_scan(args: ScanArgs) -> ExitCode {
             return error.exit_code();
         }
     };
-    initialize_tracing(log_level(prepared.args.quiet, prepared.args.verbose));
-    prepared.config_origin.log();
+    let effective_level = log_level(prepared.args.quiet, prepared.args.verbose);
+    if effective_level != cli_level {
+        // A config-set level cannot capture resolution diagnostics retroactively, so the one
+        // origin diagnostic is replayed under the reloaded filter. The level only changes when
+        // no CLI flag was given, so the resolution-time emission was filtered and this stays
+        // a single emission overall.
+        let _ = filter.reload(EnvFilter::new(effective_level));
+        prepared.config_origin.log();
+    }
     finish(scan(prepared).await)
 }
 
 pub(super) async fn run_sync(args: SyncArgs) -> ExitCode {
-    initialize_tracing("warn");
+    let _ = initialize_tracing("warn");
     finish(sync(args).await)
 }
 
 pub(super) fn run_cache(args: CacheArgs) -> ExitCode {
-    initialize_tracing("warn");
+    let _ = initialize_tracing("warn");
     finish(cache_command(args))
 }
 
 pub(super) fn run_completions(shell: CompletionShell) -> ExitCode {
-    initialize_tracing("warn");
+    let _ = initialize_tracing("warn");
     finish(completions(shell).map(|()| AppExit::Clean))
 }
 
-fn initialize_tracing(level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(level))
-        .with_writer(io::stderr)
+fn initialize_tracing(level: &str) -> reload::Handle<EnvFilter, Registry> {
+    let (filter, handle) = reload::Layer::new(EnvFilter::new(level));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
         .init();
+    handle
 }
 
 fn finish(code: Result<AppExit, CliError>) -> ExitCode {

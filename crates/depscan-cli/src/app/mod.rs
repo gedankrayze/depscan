@@ -29,7 +29,9 @@ use std::{
     time::Duration as StdDuration,
 };
 use tracing::{debug, error, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Registry, layer::SubscriberExt as _, reload, util::SubscriberInitExt as _,
+};
 mod commands;
 mod config;
 mod policy;
