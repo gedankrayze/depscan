@@ -8,10 +8,11 @@ mod service;
 mod validation;
 
 pub(crate) use directory::*;
+pub(crate) use download::OsvSyncBoundary;
 pub(crate) use download::OsvSyncConfig;
 pub use download::OsvSyncOptions;
 #[cfg(test)]
-pub(crate) use download::{OsvSyncBoundary, stream_osv_dump_body};
+pub(crate) use download::stream_osv_dump_body;
 pub(crate) use identity::*;
 pub(crate) use publication::*;
 #[cfg(test)]

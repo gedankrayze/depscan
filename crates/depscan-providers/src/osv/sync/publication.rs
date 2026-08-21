@@ -318,15 +318,9 @@ pub(crate) fn publish_osv_pair(
             marker: marker_name,
         },
         previous_archive,
-        || {
-            #[cfg(test)]
-            _config.reach_boundary(OsvSyncBoundary::BeforeArchivePublication);
-            directory.revalidate()
-        },
+        || _config.checkpoint(directory, OsvSyncBoundary::BeforeArchivePublication),
         |temporary, target| {
-            #[cfg(test)]
-            _config.reach_boundary(OsvSyncBoundary::BeforeMarkerPublication);
-            directory.revalidate()?;
+            _config.checkpoint(directory, OsvSyncBoundary::BeforeMarkerPublication)?;
             persist_capability_temp(temporary, target)
         },
     )

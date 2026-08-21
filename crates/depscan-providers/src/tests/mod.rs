@@ -26,6 +26,9 @@ use support::*;
 mod cache;
 mod http;
 mod offline;
+// The `*_cases` names avoid colliding with the production `osv`/`registry`/`sync` modules that
+// the glob import above already binds in this scope; `#[path]` keeps the test files in the
+// directories that mirror the production tree.
 #[path = "osv/mod.rs"]
 mod osv_cases;
 #[path = "registry/mod.rs"]

@@ -107,7 +107,7 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-086](DS-086.md) | P2 | Closed | Prune unused and misplaced dependency declarations |
 | [DS-087](DS-087.md) | P2 | Closed | Remove dead public API and the duplicate ecosystem alias table |
 | [DS-088](DS-088.md) | P2 | Closed | Tighten numeric conversions and remove infallible expect noise |
-| [DS-089](DS-089.md) | P2 | Open | Reduce test-only conditional compilation woven through the sync service |
+| [DS-089](DS-089.md) | P2 | Closed | Reduce test-only conditional compilation woven through the sync service |
 | [DS-090](DS-090.md) | P2 | Closed | Initialize tracing before configuration resolution |
 | [DS-091](DS-091.md) | P1 | Closed | Schedule advisory scanning of depscan's own dependency tree |
 | [DS-092](DS-092.md) | P2 | Closed | Add a SECURITY.md vulnerability disclosure policy |

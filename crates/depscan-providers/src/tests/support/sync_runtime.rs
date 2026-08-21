@@ -25,7 +25,7 @@ pub(crate) async fn assert_sync_boundary_is_capability_confined(
     let hook_swap = swap.clone();
     let external_path = external.path().to_path_buf();
     let mut config = test_sync_config(server.uri());
-    config.boundary_hook = Some(Arc::new(move |observed| {
+    config.hooks.boundary_hook = Some(Arc::new(move |observed| {
         if observed == boundary {
             let mut outcome = hook_swap.lock().unwrap();
             if matches!(*outcome, NamespaceSwap::NotAttempted) {

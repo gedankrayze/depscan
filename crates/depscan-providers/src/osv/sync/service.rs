@@ -76,22 +76,16 @@ pub(crate) async fn sync_osv_dumps_with_config(
                 ))
             })??
         };
-        #[cfg(test)]
-        config.reach_boundary(OsvSyncBoundary::AfterTemporaryCreation);
-        dir.revalidate()?;
+        config.checkpoint(&dir, OsvSyncBoundary::AfterTemporaryCreation)?;
         if let Err(error) = http
             .download_osv_dump(&url, archive_temp.as_file(), config)
             .await
         {
-            #[cfg(test)]
-            config.reach_boundary(OsvSyncBoundary::BeforeHandledErrorCleanup);
-            dir.revalidate()?;
+            config.checkpoint(&dir, OsvSyncBoundary::BeforeHandledErrorCleanup)?;
             return Err(error);
         }
 
-        #[cfg(test)]
-        config.reach_boundary(OsvSyncBoundary::BeforeValidation);
-        dir.revalidate()?;
+        config.checkpoint(&dir, OsvSyncBoundary::BeforeValidation)?;
         let validation_file = archive_temp
             .as_file()
             .try_clone()
@@ -108,9 +102,7 @@ pub(crate) async fn sync_osv_dumps_with_config(
             ))
         })?;
         if let Err(error) = validation {
-            #[cfg(test)]
-            config.reach_boundary(OsvSyncBoundary::BeforeHandledErrorCleanup);
-            dir.revalidate()?;
+            config.checkpoint(&dir, OsvSyncBoundary::BeforeHandledErrorCleanup)?;
             return Err(error);
         }
 
@@ -135,11 +127,9 @@ pub(crate) async fn sync_osv_dumps_with_config(
                 ))
             })??
         };
+        config.checkpoint(&dir, OsvSyncBoundary::BeforeRollbackStaging)?;
         #[cfg(test)]
-        config.reach_boundary(OsvSyncBoundary::BeforeRollbackStaging);
-        dir.revalidate()?;
-        #[cfg(test)]
-        if config.force_rollback_staging_error {
+        if config.hooks.force_rollback_staging_error {
             return Err(ProviderError::Cache(
                 "injected rollback staging failure".to_owned(),
             ));

@@ -96,7 +96,7 @@ async fn rollback_staging_failure_leaves_the_previous_pair_untouched() {
     let client =
         HttpClient::with_timeouts(StdDuration::from_secs(1), StdDuration::from_secs(1)).unwrap();
     let mut config = test_sync_config(base_url);
-    config.force_rollback_staging_error = true;
+    config.hooks.force_rollback_staging_error = true;
 
     let error = sync_osv_dumps_with_config(&client, &cache, &[Ecosystem::Npm], &config)
         .await
