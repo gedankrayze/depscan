@@ -67,7 +67,7 @@ fn future_concurrent_winner_remains_a_non_reusable_cas_generation() {
         .put("registry", "future-conflict", &json!({"revision": 1}), None)
         .unwrap();
     let expected = cache
-        .snapshot("registry", "future-conflict", ttl)
+        .snapshot_blocking("registry", "future-conflict", ttl)
         .expect("initial cache generation");
     cache
         .put("registry", "future-conflict", &json!({"revision": 2}), None)
@@ -80,7 +80,7 @@ fn future_concurrent_winner_remains_a_non_reusable_cas_generation() {
     );
 
     let conflict = cache
-        .put_if_unchanged(
+        .put_if_unchanged_blocking(
             "registry",
             "future-conflict",
             Some(&expected),
@@ -99,6 +99,47 @@ fn future_concurrent_winner_remains_a_non_reusable_cas_generation() {
         read_cache_entry(&cache, "registry", "future-conflict").value,
         current.value
     );
+}
+
+#[tokio::test]
+async fn cache_publication_under_lock_contention_keeps_the_runtime_responsive() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Cache {
+        root: cache_dir.path().to_path_buf(),
+        policy: CachePolicy::default(),
+    };
+    let ttl = Duration::hours(1);
+    let namespace = cache
+        .filename("registry", "contended")
+        .parent()
+        .expect("cache filename has parent")
+        .to_path_buf();
+    fs::create_dir_all(&namespace).unwrap();
+    let lock = fs::File::create(namespace.join(".lock")).unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = fs2::FileExt::unlock(&lock);
+    });
+
+    // On this single-threaded runtime, publication must wait for the contended advisory lock
+    // on the blocking pool; a runtime-blocking wait would also stall the concurrent timer.
+    let published_value = json!({"revision": 1});
+    let publish =
+        cache.put_if_unchanged("registry", "contended", None, &published_value, None, ttl);
+    let timer = async {
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        started.elapsed()
+    };
+    let (commit, timer_elapsed) = tokio::join!(publish, timer);
+
+    assert!(matches!(commit.unwrap(), CacheCommit::Written));
+    assert!(
+        timer_elapsed < std::time::Duration::from_secs(1),
+        "timer stalled for {timer_elapsed:?} behind a blocked cache lock"
+    );
+    holder.join().unwrap();
 }
 
 #[test]

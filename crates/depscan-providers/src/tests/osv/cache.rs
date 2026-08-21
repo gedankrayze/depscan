@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn hydration_cache_keys_never_downgrade_newer_alias_documents() {
+#[tokio::test]
+async fn hydration_cache_keys_never_downgrade_newer_alias_documents() {
     let cache_dir = tempfile::tempdir().unwrap();
     let cache = Cache {
         root: cache_dir.path().to_path_buf(),
@@ -37,6 +37,7 @@ fn hydration_cache_keys_never_downgrade_newer_alias_documents() {
 
     let winner = client
         .publish_hydrated_document(&requested.cache_key(), id, &older_document, None, true)
+        .await
         .unwrap();
 
     assert_eq!(winner.value, newer_document);
@@ -46,8 +47,8 @@ fn hydration_cache_keys_never_downgrade_newer_alias_documents() {
     );
 }
 
-#[test]
-fn cache_bypass_publication_preserves_the_newer_disk_winner() {
+#[tokio::test]
+async fn cache_bypass_publication_preserves_the_newer_disk_winner() {
     let cache_dir = tempfile::tempdir().unwrap();
     let cache = Cache {
         root: cache_dir.path().to_path_buf(),
@@ -86,6 +87,7 @@ fn cache_bypass_publication_preserves_the_newer_disk_winner() {
 
     let reported = client
         .publish_hydrated_document(&revision.cache_key(), id, &network_candidate, None, true)
+        .await
         .unwrap();
 
     assert_eq!(reported.value, cached_newer);

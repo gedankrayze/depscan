@@ -102,7 +102,7 @@ impl RegistryClient {
         max_bytes: Option<usize>,
     ) -> Result<Value, ProviderError> {
         let ttl = Duration::seconds(REGISTRY_TTL_SECS);
-        let mut generation = self.cache.snapshot("registry", namespace, ttl);
+        let mut generation = self.cache.snapshot("registry", namespace, ttl).await;
         let mut cached = self.cache.policy.read.then(|| generation.clone()).flatten();
         let mut force_revalidate = false;
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
@@ -124,14 +124,18 @@ impl RegistryClient {
             };
             match response {
                 Revalidated::Modified { value, etag } => {
-                    match self.cache.put_if_unchanged(
-                        "registry",
-                        namespace,
-                        generation.as_ref(),
-                        &value,
-                        etag,
-                        ttl,
-                    )? {
+                    match self
+                        .cache
+                        .put_if_unchanged(
+                            "registry",
+                            namespace,
+                            generation.clone(),
+                            &value,
+                            etag,
+                            ttl,
+                        )
+                        .await?
+                    {
                         CacheCommit::Written => return Ok(value),
                         CacheCommit::Conflict(current) => {
                             generation = current;
@@ -153,14 +157,18 @@ impl RegistryClient {
                     })?;
                     let value = snapshot.value.clone();
                     let etag = etag.or_else(|| snapshot.etag.clone());
-                    match self.cache.put_if_unchanged(
-                        "registry",
-                        namespace,
-                        generation.as_ref(),
-                        &value,
-                        etag,
-                        ttl,
-                    )? {
+                    match self
+                        .cache
+                        .put_if_unchanged(
+                            "registry",
+                            namespace,
+                            generation.clone(),
+                            &value,
+                            etag,
+                            ttl,
+                        )
+                        .await?
+                    {
                         CacheCommit::Written => return Ok(value),
                         CacheCommit::Conflict(Some(current)) if current.fresh => {
                             if self.cache.policy.read {

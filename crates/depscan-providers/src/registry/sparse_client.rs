@@ -10,7 +10,7 @@ impl RegistryClient {
         url: &str,
     ) -> Result<Vec<CratesIndexEntry>, ProviderError> {
         let ttl = Duration::seconds(REGISTRY_TTL_SECS);
-        let mut generation = self.cache.snapshot("registry", key, ttl);
+        let mut generation = self.cache.snapshot("registry", key, ttl).await;
         let mut force_revalidate = false;
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
             let cached = self.cache.policy.read.then(|| {
@@ -44,14 +44,11 @@ impl RegistryClient {
                         entries: entries.clone(),
                     })
                     .map_err(|error| ProviderError::Cache(error.to_string()))?;
-                    match self.cache.put_if_unchanged(
-                        "registry",
-                        key,
-                        generation.as_ref(),
-                        &value,
-                        etag,
-                        ttl,
-                    )? {
+                    match self
+                        .cache
+                        .put_if_unchanged("registry", key, generation.clone(), &value, etag, ttl)
+                        .await?
+                    {
                         CacheCommit::Written => return Ok(entries),
                         CacheCommit::Conflict(current) => {
                             generation = current;
@@ -73,14 +70,11 @@ impl RegistryClient {
                     let snapshot = generation.as_ref().expect("conditional cache exists");
                     let value = snapshot.value.clone();
                     let etag = etag.or_else(|| snapshot.etag.clone());
-                    match self.cache.put_if_unchanged(
-                        "registry",
-                        key,
-                        Some(snapshot),
-                        &value,
-                        etag,
-                        ttl,
-                    )? {
+                    match self
+                        .cache
+                        .put_if_unchanged("registry", key, generation.clone(), &value, etag, ttl)
+                        .await?
+                    {
                         CacheCommit::Written => return Ok(cached.entries),
                         CacheCommit::Conflict(current) => {
                             generation = current;
