@@ -3,7 +3,7 @@ $ProgressPreference = "SilentlyContinue"
 
 $version = $env:DEPSCAN_ACTION_VERSION
 if ($version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
-    throw "version must be an exact depscan release tag such as v1.2.0"
+    throw "version must be an exact depscan release tag such as v2.0.0"
 }
 if ($env:RUNNER_OS -ne "Windows" -or $env:RUNNER_ARCH -ne "X64") {
     throw "Unsupported depscan runner: $($env:RUNNER_OS)/$($env:RUNNER_ARCH)"

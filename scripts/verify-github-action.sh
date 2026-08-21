@@ -49,6 +49,9 @@ if [[ -z "$workspace_version" || "$action_version" != "v$workspace_version" ]]; 
 fi
 grep -Fq "uses: gedankrayze/depscan@v$workspace_version" README.md
 grep -Fq "version: v$workspace_version" README.md
+grep -Fq "gh release download v$workspace_version" README.md
+grep -Fq "such as v$workspace_version" scripts/github-action/install-depscan.sh
+grep -Fq "such as v$workspace_version" scripts/github-action/install-depscan.ps1
 
 if grep -Eq '^[[:space:]]+run:.*[$][{][{][[:space:]]*inputs\.' action.yml; then
   echo "action inputs must enter fixed environment variables, not shell source" >&2
