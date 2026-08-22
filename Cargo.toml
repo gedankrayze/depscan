@@ -58,7 +58,7 @@ percent-encoding = "2.3.2"
 unicode-general-category = "1.1.0"
 walkdir = "2.5.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
-quick-xml = { version = "0.41.0", features = ["serialize"] }
+quick-xml = { version = "0.42.0", features = ["serialize"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 pep440_rs = "0.7.3"
 pep508_rs = "0.9.2"
