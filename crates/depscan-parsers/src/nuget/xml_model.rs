@@ -59,9 +59,8 @@ pub(crate) struct CentralPackageVersion {
     pub(crate) version: String,
 }
 
-pub(crate) fn xml_local_name(bytes: &[u8]) -> Result<&str, String> {
-    let name = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
-    Ok(name.rsplit(':').next().unwrap_or(name))
+pub(crate) fn xml_local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
 }
 
 pub(crate) fn nuget_item_kind(name: &str) -> Option<NugetXmlItemKind> {
@@ -92,16 +91,15 @@ pub(crate) fn nuget_metadata_kind(name: &str) -> Option<NugetMetadataKind> {
 
 pub(crate) fn parse_nuget_xml_attributes(
     path: &Path,
-    reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
 ) -> Result<HashMap<String, String>, ParseError> {
     let mut attributes = HashMap::new();
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| invalid(path, error))?;
-        let key = xml_local_name(attribute.key.as_ref()).map_err(|error| invalid(path, error))?;
+        let key = xml_local_name(attribute.key.as_ref());
         let key = key.to_ascii_lowercase();
         let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|error| invalid(path, error))?
             .into_owned();
         if attributes.insert(key.clone(), value).is_some() {
@@ -113,11 +111,10 @@ pub(crate) fn parse_nuget_xml_attributes(
 
 pub(crate) fn new_nuget_xml_item(
     path: &Path,
-    reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
     kind: NugetXmlItemKind,
 ) -> Result<NugetXmlItem, ParseError> {
-    let mut attributes = parse_nuget_xml_attributes(path, reader, element)?;
+    let mut attributes = parse_nuget_xml_attributes(path, element)?;
     let identities: Vec<_> = ["include", "update", "id"]
         .into_iter()
         .filter_map(|key| attributes.remove(key).map(|value| (key, value)))

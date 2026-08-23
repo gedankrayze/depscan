@@ -14,8 +14,7 @@ pub(crate) fn parse_nuget_xml_document(path: &Path) -> Result<NugetXmlDocument, 
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(element)) => {
                 let qualified_name = element.name();
-                let name = xml_local_name(qualified_name.as_ref())
-                    .map_err(|error| invalid(path, error))?;
+                let name = xml_local_name(qualified_name.as_ref());
                 if depth == 0 {
                     root = Some(name.to_owned());
                 }
@@ -34,7 +33,7 @@ pub(crate) fn parse_nuget_xml_document(path: &Path) -> Result<NugetXmlDocument, 
                     }
                     open = Some(OpenNugetXmlItem {
                         depth,
-                        item: new_nuget_xml_item(path, &reader, &element, kind)?,
+                        item: new_nuget_xml_item(path, &element, kind)?,
                         captured: None,
                     });
                 } else if let Some(kind) = nuget_metadata_kind(name)
@@ -49,16 +48,15 @@ pub(crate) fn parse_nuget_xml_document(path: &Path) -> Result<NugetXmlDocument, 
                         depth,
                         value: String::new(),
                     });
-                    parse_nuget_xml_attributes(path, &reader, &element)?;
+                    parse_nuget_xml_attributes(path, &element)?;
                 } else {
-                    parse_nuget_xml_attributes(path, &reader, &element)?;
+                    parse_nuget_xml_attributes(path, &element)?;
                 }
                 depth += 1;
             }
             Ok(Event::Empty(element)) => {
                 let qualified_name = element.name();
-                let name = xml_local_name(qualified_name.as_ref())
-                    .map_err(|error| invalid(path, error))?;
+                let name = xml_local_name(qualified_name.as_ref());
                 if depth == 0 {
                     root = Some(name.to_owned());
                 }
@@ -75,7 +73,7 @@ pub(crate) fn parse_nuget_xml_document(path: &Path) -> Result<NugetXmlDocument, 
                     if open.is_some() {
                         return Err(invalid(path, "NuGet package items cannot be nested"));
                     }
-                    let item = new_nuget_xml_item(path, &reader, &element, kind)?;
+                    let item = new_nuget_xml_item(path, &element, kind)?;
                     if let Some(item) = finish_nuget_xml_item(path, item)? {
                         items.push(item);
                     }
@@ -86,15 +84,15 @@ pub(crate) fn parse_nuget_xml_document(path: &Path) -> Result<NugetXmlDocument, 
                 {
                     return Err(invalid(path, "NuGet package metadata cannot be empty"));
                 } else {
-                    parse_nuget_xml_attributes(path, &reader, &element)?;
+                    parse_nuget_xml_attributes(path, &element)?;
                 }
             }
             Ok(Event::Text(text)) => {
-                let text = text.xml10_content().map_err(|error| invalid(path, error))?;
+                let text = text.xml10_content();
                 append_xml_text(path, &mut open, &text)?;
             }
             Ok(Event::CData(text)) => {
-                let text = text.xml10_content().map_err(|error| invalid(path, error))?;
+                let text = text.xml10_content();
                 if let Some(captured) = open.as_mut().and_then(|open| open.captured.as_mut()) {
                     captured.value.push_str(&text);
                 }
@@ -104,8 +102,7 @@ pub(crate) fn parse_nuget_xml_document(path: &Path) -> Result<NugetXmlDocument, 
                     .checked_sub(1)
                     .ok_or_else(|| invalid(path, "unexpected closing XML element"))?;
                 let qualified_name = element.name();
-                let name = xml_local_name(qualified_name.as_ref())
-                    .map_err(|error| invalid(path, error))?;
+                let name = xml_local_name(qualified_name.as_ref());
                 if let Some(open_item) = open.as_mut()
                     && let Some(captured) = open_item.captured.as_ref()
                     && depth == captured.depth

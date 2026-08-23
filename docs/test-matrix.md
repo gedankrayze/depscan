@@ -210,6 +210,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-095 | release-mode package-cache purge followed by five-crate `cargo package --workspace --allow-dirty --locked` verification |
 | DS-096 | stable 1.98.0 full gate and MSRV 1.96.0 workspace/all-target test; protected PR run `32501810914` with native Ubuntu `96832988185`, macOS `96832988535`, Windows `96832988601`, and MSRV `96832988502` jobs |
 | DS-097 | exact workspace/action/README/installer/report/acceptance 2.0.0 alignment, lockfile-only workspace version delta, full release gate, verified cargo-dist `generate --check`, reviewed 16-file `v2.0.0` plan, and read-only immutable-tag-control preflight |
+| DS-098 | NuGet prefixed-name, attribute-normalization, duplicate-attribute, and plain-reader namespace-boundary regressions; parser all-target suite; workspace full gate |
 
 ## Platform and external evidence boundary
 
