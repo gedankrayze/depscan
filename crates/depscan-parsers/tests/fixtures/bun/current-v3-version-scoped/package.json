@@ -1,0 +1,10 @@
+{
+  "name": "depscan-bun-v3-version-scoped-fixture",
+  "private": true,
+  "dependencies": {
+    "is-odd": "3.0.1"
+  },
+  "overrides": {
+    "is-number@<7.0.0": "7.0.0"
+  }
+}

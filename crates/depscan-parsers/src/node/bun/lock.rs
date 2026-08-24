@@ -10,18 +10,8 @@ pub(crate) fn parse_bun_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
             "detected a non-object JSONC document; expected a Bun text lockfile object",
         )
     })?;
-    let lockfile_version = value
-        .get("lockfileVersion")
-        .and_then(Json::as_u64)
-        .ok_or_else(|| invalid(path, "Bun lockfile is missing an integer lockfileVersion"))?;
-    if lockfile_version > 2 {
-        return Err(invalid(
-            path,
-            format!(
-                "unsupported Bun lockfileVersion {lockfile_version}; supported versions are 0, 1, and 2"
-            ),
-        ));
-    }
+    let lockfile_version = BunLockVersion::parse(path, &value)?;
+    validate_bun_config_version(path, &value)?;
 
     let workspace_metadata = parse_bun_workspaces(path, &value)?;
     let mut output = Vec::new();
@@ -31,7 +21,8 @@ pub(crate) fn parse_bun_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
             invalid(
                 path,
                 format!(
-                    "detected Bun lockfileVersion {lockfile_version} without packages; expected a packages object"
+                    "detected Bun lockfileVersion {} without packages; expected a packages object",
+                    lockfile_version.number()
                 ),
             )
         })?
