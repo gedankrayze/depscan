@@ -14,6 +14,26 @@ installer_unix=.github/actions/install-cargo-dist/install-cargo-dist.sh
 installer_windows=.github/actions/install-cargo-dist/install-cargo-dist.ps1
 workspace_manifest=Cargo.toml
 
+workspace_version=$(
+  awk '
+    /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+    /^\[/ { in_workspace_package = 0 }
+    in_workspace_package && /^version = "/ {
+      value = $0
+      sub(/^version = "/, "", value)
+      sub(/".*$/, "", value)
+      print value
+      exit
+    }
+  ' "$workspace_manifest"
+)
+release_tag="v$workspace_version"
+
+if [[ -z "$workspace_version" ]]; then
+  echo "workspace release version is missing" >&2
+  exit 1
+fi
+
 for required_file in \
   "$release_workflow" \
   "$quality_workflow" \
@@ -241,7 +261,11 @@ for mapping in \
     exit 1
   fi
 done
-grep -Fq '          ref: v2.0.0' "$acceptance_workflow"
+if [[ $(grep -Fc "          ref: $release_tag" "$acceptance_workflow") -ne 2 ]] \
+  || [[ $(grep -Fc "      RELEASE_TAG: $release_tag" "$acceptance_workflow") -ne 2 ]]; then
+  echo "release acceptance tag/ref does not match workspace version $workspace_version" >&2
+  exit 1
+fi
 grep -Fq '          persist-credentials: false' "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '[[ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]' "$acceptance_workflow"
@@ -268,7 +292,7 @@ if [[ $(grep -Fc 'uses: ./release-source' "$acceptance_workflow") -ne 1 ]] \
   echo "release acceptance must use the immutable local tag checkout once without a binary override" >&2
   exit 1
 fi
-grep -Fq '          version: v2.0.0' "$acceptance_workflow"
+grep -Fq "          version: $release_tag" "$acceptance_workflow"
 # shellcheck disable=SC2016
 grep -Fq '          output: ${{ runner.temp }}/depscan-published-action-summary.txt' "$acceptance_workflow"
 grep -Fq '          offline: "true"' "$acceptance_workflow"
