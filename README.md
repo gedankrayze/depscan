@@ -1,6 +1,8 @@
 # depscan
 
-`depscan` is a Rust CLI that scans resolved project dependencies for **known vulnerabilities** through [OSV.dev](https://osv.dev) and for **available updates** through the corresponding native package registries. It is designed for local development and CI: reports are deterministic, diagnostics are sent to standard error, and the scanner returns documented exit codes.
+`depscan` is one Rust CLI for scanning resolved dependencies across npm/Bun, Python, .NET, and Rust. It checks **known vulnerabilities** through [OSV.dev](https://osv.dev) and **available updates** through the corresponding native package registries, with the same deterministic reports, air-gapped OSV workflow, SARIF output, and auditable expiring suppressions in every ecosystem.
+
+It is designed for local development and CI. Diagnostics go to standard error, exit codes are documented, and native package-manager audit or remediation commands remain complementary rather than defining a different policy for every project type.
 
 > DepScan is intentionally report-only; it never rewrites lockfiles or upgrades dependencies.
 > Normative corrections to the original development specification are recorded in the [development specification errata](docs/specification-errata.md).
@@ -9,12 +11,14 @@
 
 | Ecosystem | Normal sources | Manifest-only fallback |
 |---|---|---|
-| npm / Bun | `bun.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`; authorized `bun.lockb` extraction | root/workspace `package.json`, including the fallback for unavailable binary-lock extraction |
+| npm / Bun | `bun.lock` v0-v3, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`; authorized `bun.lockb` extraction | root/workspace `package.json`, including the fallback for unavailable binary-lock extraction |
 | Python | `uv.lock`, `poetry.lock`, `Pipfile.lock`, `requirements.txt` | `pyproject.toml` |
 | .NET | `packages.lock.json`, project XML, `packages.config`; authorized SDK transitive enumeration | project XML ranges |
 | Rust | `Cargo.lock` | `Cargo.toml` |
 
 Resolved lockfile versions are preferred. Manifest-only records are marked as range-derived, because they are not an installed dependency resolution.
+
+`bun.lock` versions 0 through 3 are supported. Version 2 and 3 records enforce Bun 1.4's off-registry npm integrity and safe Git-tag rules; version 3 nested and version-scoped overrides use the already-resolved `packages` graph rather than a second DepScan override resolver. `configVersion` is validated separately because it selects Bun's installation linker, not the resolved dependency coordinates. DepScan never walks `node_modules`, so Bun's isolated linker and global virtual store do not change this source boundary.
 
 `package-lock.json` versions 2 and 3 are parsed fail-closed: malformed package records, install locations, field types, aliases, required dependency edges, and registry versions stop the scan instead of being omitted. npm dependency declarations are resolved to their concrete installed locations using Node ancestor lookup and npm's dependency-group precedence, so hoisting and workspaces cannot transfer source provenance or canonical identity between unrelated records. Workspace links use a resource-bounded npm-minimatch-compatible matcher for brace, class, wildcard, negation, component-local UTF-16/Unicode, and suffix/remainder-aware extglob rules. Unsupported npm-valid forms remain visible parse errors: cross-component or unmatched extglobs, non-BMP characters combined with `-` inside a class, repeated extglobs containing a nested empty `@()`, and poisoned POSIX-range classes whose npm fallback swallows a later `/u`-invalid literal. Forms for which npm itself produces an invalid regular expression—including component-local Unicode identity escapes and broadening-negative/empty-quantifier combinations—also fail closed; see [DS-063](docs/issues/DS-063.md). An installed-package link target remains scannable, while a local descriptor is skipped only after its target and workspace identity are validated. Explicit Git, file, URL, alternate-registry, configured-registry, and origin-omitted records remain visible with public npm/OSV enrichment disabled; source-only coordinates are redacted before reporting. If the same normalized coordinate also has a proven canonical-public occurrence, that occurrence keeps the coordinate eligible for enrichment. Legacy version 1 locks remain best-effort because their recursive schema does not provide the same complete package-location contract.
 
@@ -275,6 +279,8 @@ The checked-in [verification matrix](docs/test-matrix.md) maps the development s
 ## Known limitations
 
 The implementation never executes package-manager binaries automatically. Legacy `bun.lockb` resolved-version extraction and .NET transitive enumeration require the explicit `allow-tools` trust decision described above; without it, `bun.lockb` scans visibly degrade to manifest constraints. Registry deprecation/unlisted checks are also intentionally not inferred where the lightweight public endpoint does not expose them.
+
+DepScan remains report-only and does not duplicate package-manager remediation or inventory commands such as Bun 1.4's `bun audit fix`, `bun dedupe`, `bun prune`, `bun pm licenses`, or `bun pm diff`. Those commands are useful for a Bun project after or alongside the cross-ecosystem policy and report produced here.
 
 ## Security
 

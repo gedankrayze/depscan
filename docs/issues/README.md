@@ -116,3 +116,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-095](DS-095.md) | P2 | Closed | Purge stale packaging caches before release-gate verification |
 | [DS-096](DS-096.md) | P2 | Closed | Coordinate the Rust 1.98.0 toolchain and 1.96.0 MSRV refresh |
 | [DS-097](DS-097.md) | P1 | Closed | Align the unreleased breaking API surface to version 2.0.0 |
+| [DS-099](DS-099.md) | P1 | Closed | Support Bun 1.4 lockfile versions and validation |
