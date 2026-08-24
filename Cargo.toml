@@ -9,7 +9,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gedankrayze/depscan"
@@ -22,11 +22,12 @@ categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
 
 [workspace.dependencies]
-depscan-core = { version = "2.0.0", path = "crates/depscan-core" }
-depscan-parsers = { version = "2.0.0", path = "crates/depscan-parsers" }
-depscan-providers = { version = "2.0.0", path = "crates/depscan-providers" }
-depscan-report = { version = "2.0.0", path = "crates/depscan-report" }
+depscan-core = { version = "2.0.1", path = "crates/depscan-core" }
+depscan-parsers = { version = "2.0.1", path = "crates/depscan-parsers" }
+depscan-providers = { version = "2.0.1", path = "crates/depscan-providers" }
+depscan-report = { version = "2.0.1", path = "crates/depscan-report" }
 async-trait = "0.1.92"
+base64 = "0.22.1"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 cap-tempfile = "4.0.2"
@@ -44,7 +45,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-noyalib = { version = "0.0.27", default-features = false, features = ["std"] }
+noyalib = { version = "0.0.28", default-features = false, features = ["std"] }
 js-semver = "0.3.0"
 sha2 = "0.11.0"
 toml = "1.1.4"
@@ -58,7 +59,7 @@ percent-encoding = "2.3.2"
 unicode-general-category = "1.1.0"
 walkdir = "2.5.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
-quick-xml = { version = "0.41.0", features = ["serialize"] }
+quick-xml = { version = "0.42.0", features = ["serialize"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 pep440_rs = "0.7.3"
 pep508_rs = "0.9.2"

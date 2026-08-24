@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "dependencies": { "example": "github:example/repository#main" }
+    }
+  },
+  "packages": {
+    "example": [
+      "example@github:example/repository#main",
+      {},
+      "../outside"
+    ]
+  }
+}

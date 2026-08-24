@@ -58,7 +58,7 @@ fn renders_complete_auditable_sections_and_escapes_untrusted_cells() {
     let rendered = render_markdown(&document);
 
     assert!(rendered.starts_with(
-        "# depscan report\n\n_Gedank Rayze DepScan, v2.0.0, \
+        "# depscan report\n\n_Gedank Rayze DepScan, v2.0.1, \
          [https://github.com/gedankrayze/depscan](https://github.com/gedankrayze/depscan)_\n\n\
          Generated: `2026-08-20T12:00:00+00:00`"
     ));

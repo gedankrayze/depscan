@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "dependencies": { "is-number": "7.0.0" }
+    }
+  },
+  "packages": {
+    "is-number": [
+      "is-number@7.0.0",
+      "https://packages.example.invalid/is-number-7.0.0.tgz",
+      {},
+      "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng=="
+    ]
+  }
+}

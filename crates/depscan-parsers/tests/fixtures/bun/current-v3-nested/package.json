@@ -1,0 +1,13 @@
+{
+  "name": "depscan-bun-v3-nested-fixture",
+  "private": true,
+  "dependencies": {
+    "is-number": "6.0.0",
+    "is-odd": "3.0.1"
+  },
+  "overrides": {
+    "is-odd": {
+      "is-number": "7.0.0"
+    }
+  }
+}

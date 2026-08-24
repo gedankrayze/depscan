@@ -471,7 +471,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "depscan-cli"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -514,8 +514,9 @@ dependencies = [
 
 [[package]]
 name = "depscan-parsers"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
+ "base64",
  "cap-fs-ext",
  "cap-std",
  "depscan-core",
@@ -538,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-providers"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "cap-fs-ext",
@@ -566,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-report"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "chrono",
  "depscan-core",
@@ -1373,9 +1374,9 @@ dependencies = [
 
 [[package]]
 name = "noyalib"
-version = "0.0.27"
+version = "0.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db7cb50aa7b401e6520d3ef64e0f782f010e2c4e0ee4c31a5fce58d2fa322f29"
+checksum = "9f075ef19fa3bcf8697c0ef96c37d5c435d339a40ab8081cae3aac3a4e7fee9a"
 dependencies = [
  "hashbrown",
  "indexmap",
@@ -1521,9 +1522,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
  "serde",
