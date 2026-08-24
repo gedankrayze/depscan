@@ -213,6 +213,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-098 | NuGet prefixed-name, attribute-normalization, duplicate-attribute, and plain-reader namespace-boundary regressions; parser all-target suite; workspace full gate |
 | DS-099 | Bun 1.4.0-generated v2/v3 override fixtures, v2 integrity/Git safety controls, future-version rejection, focused parser/process probes, and the full ordinary-change gate |
 | DS-100 | exact workspace/action/README/installer/report/acceptance 2.0.1 alignment, release-plan parity, full release gate, protected-main publication, and post-release acceptance evidence |
+| DS-101 | base64 0.23.1 with default features disabled, Bun parser regressions, dependency-feature inspection, strict Clippy, and release-candidate verification |
 
 ## Platform and external evidence boundary
 
