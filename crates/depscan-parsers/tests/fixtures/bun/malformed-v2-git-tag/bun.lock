@@ -1,0 +1,16 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "dependencies": { "example": "git+https://github.com/example/repository.git#main" }
+    }
+  },
+  "packages": {
+    "example": [
+      "example@git+https://github.com/example/repository.git#main",
+      {},
+      "../outside"
+    ]
+  }
+}

@@ -29,3 +29,21 @@ The original internal/display/provider separation was implemented under
 that source-preserved casing is necessarily canonical.
 The provider mapping is summarized in the repository
 [README](../README.md#package-identity-and-provider-names).
+
+## E-002: Bun text-lock versions and installer configuration are separate
+
+Section 3.1's general reference to Bun text lockfiles is amended for
+[Bun 1.4](https://bun.com/blog/bun-v1.4):
+
+- DepScan accepts `lockfileVersion` 0, 1, 2, and 3. Version 2 adds strict
+  off-registry npm integrity and Git-tag safety checks; version 3 retains those
+  checks and represents nested or version-scoped overrides.
+- The resolved `packages` object is authoritative. DepScan reads the concrete
+  name and version from each locator, including multiple overridden resolutions
+  of the same package, and does not apply the top-level overrides a second time.
+- `configVersion` is optional installer-layout metadata. It is validated as a
+  non-negative integer but does not select a dependency parser because DepScan
+  does not inspect `node_modules` or Bun's isolated global virtual store.
+
+The executable contract and Bun 1.4.0-generated fixtures are recorded under
+[DS-099](issues/DS-099.md).

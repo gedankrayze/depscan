@@ -6,6 +6,7 @@ pub(crate) enum BunResolution<'a> {
     Workspace { name: &'a str, path: &'a str },
     Path,
     Git,
+    Github,
     Tarball,
     Root,
 }
@@ -53,14 +54,17 @@ pub(crate) fn parse_bun_locator(locator: &str) -> Result<BunResolution<'_>, Stri
         }
         return Ok(BunResolution::Path);
     }
-    if let Some(repository) = resolution
-        .strip_prefix("git+")
-        .or_else(|| resolution.strip_prefix("github:"))
-    {
+    if let Some(repository) = resolution.strip_prefix("git+") {
         if repository.is_empty() {
             return Err("git resolution is empty".to_owned());
         }
         return Ok(BunResolution::Git);
+    }
+    if let Some(repository) = resolution.strip_prefix("github:") {
+        if repository.is_empty() {
+            return Err("github resolution is empty".to_owned());
+        }
+        return Ok(BunResolution::Github);
     }
     if resolution.starts_with("http://")
         || resolution.starts_with("https://")
@@ -108,7 +112,7 @@ pub(crate) fn validate_bun_locator_array(
     package_key: &str,
     items: &[Json],
     resolution: BunResolution<'_>,
-    lockfile_version: u64,
+    lockfile_version: BunLockVersion,
     workspaces: &HashMap<String, String>,
 ) -> Result<(), ParseError> {
     let error = |message: &str| {
@@ -127,21 +131,30 @@ pub(crate) fn validate_bun_locator_array(
                     "registry entries must be [locator, registry, info, integrity]",
                 ));
             }
+            if lockfile_version >= BunLockVersion::V2 {
+                let registry = items[1].as_str().expect("validated registry string");
+                let integrity = items[3].as_str().expect("validated integrity string");
+                if !bun_registry_integrity_is_valid(registry, integrity) {
+                    return Err(error(
+                        "version 2 and 3 off-registry npm entries require a supported integrity hash",
+                    ));
+                }
+            }
         }
         BunResolution::Workspace {
             name,
             path: workspace_path,
         } => {
-            let valid_shape = if lockfile_version == 0 {
+            let valid_shape = if lockfile_version == BunLockVersion::V0 {
                 items.len() == 2 && object_at(1)
             } else {
                 items.len() == 1
             };
             if !valid_shape {
-                return Err(error(if lockfile_version == 0 {
+                return Err(error(if lockfile_version == BunLockVersion::V0 {
                     "version 0 workspace entries must be [locator, info]"
                 } else {
-                    "version 1 and 2 workspace entries must contain only the locator"
+                    "version 1 through 3 workspace entries must contain only the locator"
                 }));
             }
             let Some(workspace_name) = workspaces.get(workspace_path) else {
@@ -165,7 +178,7 @@ pub(crate) fn validate_bun_locator_array(
                 ));
             }
         }
-        BunResolution::Git => {
+        tag @ (BunResolution::Git | BunResolution::Github) => {
             if !(items.len() == 3 || items.len() == 4)
                 || !object_at(1)
                 || !string_at(2)
@@ -174,6 +187,12 @@ pub(crate) fn validate_bun_locator_array(
                 return Err(error(
                     "git entries must be [locator, info, resolved] with optional integrity",
                 ));
+            }
+            let resolved = items[2].as_str().expect("validated git tag string");
+            let enforce_safe_tag =
+                tag == BunResolution::Github || lockfile_version >= BunLockVersion::V2;
+            if enforce_safe_tag && !is_safe_bun_git_tag(resolved) {
+                return Err(error("git resolved tag must be one safe path component"));
             }
         }
         BunResolution::Root => {

@@ -1,0 +1,7 @@
+{
+  "name": "depscan-bun-v2-fixture",
+  "private": true,
+  "dependencies": {
+    "is-number": "7.0.0"
+  }
+}

@@ -47,13 +47,31 @@ fn parses_nuget_project_with_normalized_identity_and_preserved_case() {
 }
 
 #[test]
+fn parses_prefixed_nuget_xml_and_normalizes_attribute_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("prefixed.csproj");
+    fs::write(
+        &project,
+        r#"<msb:Project xmlns:msb="urn:test"><msb:ItemGroup><msb:PackageReference msb:Include="Example&amp;Tools" msb:Version=" 1.2.3&#x9;" /></msb:ItemGroup></msb:Project>"#,
+    )
+    .unwrap();
+
+    let result = parse_nuget_project(&project).unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "example&tools");
+    assert_eq!(result[0].display_name, "Example&Tools");
+    assert_eq!(result[0].version, "1.2.3");
+}
+
+#[test]
 fn rejects_duplicate_nuget_attributes_after_large_attribute_set() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("duplicate-attributes.csproj");
     let mut attributes = String::from(r#"Include="First.Package" Version="1.2.3""#);
-    // quick-xml 0.41 switches duplicate detection to its linear-time hash path
-    // after 32 attributes. Keep the duplicate beyond that boundary so this
-    // exercises depscan's real `attributes()` call through the patched path.
+    // Keep the duplicate after a large attribute set so this exercises
+    // depscan's real checked `attributes()` iterator rather than a local
+    // duplicate detector.
     for index in 0..40 {
         attributes.push_str(&format!(r#" data-{index}="value""#));
     }
@@ -75,7 +93,7 @@ fn plain_nuget_reader_accepts_more_than_namespace_resolver_limit() {
     let project = dir.path().join("namespace-declarations.csproj");
     let mut namespaces = String::new();
     // RUSTSEC-2026-0195 affects NsReader's namespace resolver. depscan uses
-    // plain Reader, so even an element above NsReader's 256-declaration cap
+    // plain Reader, so even an element above NsReader's declaration cap
     // is handled as ordinary attributes without a resolver-side allocation.
     for index in 0..300 {
         namespaces.push_str(&format!(r#" xmlns:p{index}="urn:test:{index}""#));
