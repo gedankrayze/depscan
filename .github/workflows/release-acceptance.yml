@@ -16,13 +16,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_REPOSITORY: gedankrayze/depscan
-      RELEASE_TAG: v2.0.0
+      RELEASE_TAG: v2.0.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: v2.0.0
+          ref: v2.0.1
           path: release-source
       - id: release
         name: Verify immutable tag ancestry and public inventory
@@ -112,14 +112,14 @@ jobs:
       RELEASE_ASSET: ${{ matrix.asset }}
       RELEASE_COMMIT: ${{ needs.preflight.outputs.release-commit }}
       RELEASE_REPOSITORY: gedankrayze/depscan
-      RELEASE_TAG: v2.0.0
+      RELEASE_TAG: v2.0.1
       RELEASE_TARGET: ${{ matrix.target }}
       EXPECTED_OFFLINE_SUMMARY: "depscan: 4 packages | 0 vulns | 0 withdrawn | 0 outdated (0 major, 0 yanked) | 0 suppressed | 0 expired ignores | 3 soft failures"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: v2.0.0
+          ref: v2.0.1
           path: release-source
       - name: Download, authenticate, and extract the Unix archive
         if: runner.os != 'Windows'
@@ -304,7 +304,7 @@ jobs:
         name: Run the immutable tagged action without a binary override
         uses: ./release-source
         with:
-          version: v2.0.0
+          version: v2.0.1
           path: release-source/fixtures/e2e/cargo
           ecosystem: cargo
           format: summary

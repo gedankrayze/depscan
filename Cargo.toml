@@ -9,7 +9,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gedankrayze/depscan"
@@ -22,10 +22,10 @@ categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
 
 [workspace.dependencies]
-depscan-core = { version = "2.0.0", path = "crates/depscan-core" }
-depscan-parsers = { version = "2.0.0", path = "crates/depscan-parsers" }
-depscan-providers = { version = "2.0.0", path = "crates/depscan-providers" }
-depscan-report = { version = "2.0.0", path = "crates/depscan-report" }
+depscan-core = { version = "2.0.1", path = "crates/depscan-core" }
+depscan-parsers = { version = "2.0.1", path = "crates/depscan-parsers" }
+depscan-providers = { version = "2.0.1", path = "crates/depscan-providers" }
+depscan-report = { version = "2.0.1", path = "crates/depscan-report" }
 async-trait = "0.1.92"
 base64 = "0.22.1"
 cap-fs-ext = "4.0.2"
