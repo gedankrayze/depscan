@@ -27,7 +27,7 @@ depscan-parsers = { version = "2.0.1", path = "crates/depscan-parsers" }
 depscan-providers = { version = "2.0.1", path = "crates/depscan-providers" }
 depscan-report = { version = "2.0.1", path = "crates/depscan-report" }
 async-trait = "0.1.92"
-base64 = "0.22.1"
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 cap-tempfile = "4.0.2"
