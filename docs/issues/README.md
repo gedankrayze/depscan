@@ -120,3 +120,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-099](DS-099.md) | P1 | Closed | Support Bun 1.4 lockfile versions and validation |
 | [DS-100](DS-100.md) | P1 | Closed | Prepare the v2.0.1 maintenance release |
 | [DS-101](DS-101.md) | P2 | Closed | Update base64 without enabling its SIMD unsafe default |
+| [DS-102](DS-102.md) | P1 | Closed | Prepare the v2.0.2 dependency-maintenance release |
