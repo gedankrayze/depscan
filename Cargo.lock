@@ -1270,9 +1270,9 @@ dependencies = [
 
 [[package]]
 name = "js-semver"
-version = "0.4.1"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5c71cd3a2be6b6af79b2372225ba4630fc010bcf64c20bdadd20ae08f0b13d2"
+checksum = "b45bf431971205e414201e87a76bdd4c75316dc44c890e9df4d9006ee5d2896c"
 
 [[package]]
 name = "js-sys"
@@ -2138,7 +2138,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
