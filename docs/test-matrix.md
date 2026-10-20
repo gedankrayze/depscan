@@ -223,6 +223,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-108 | `sarif::tests` absent/invalid help links and encoded relative, Unicode, Unix, and Windows paths; report snapshots |
 | DS-109 | `pypi_candidates` empty/malformed release-file controls; existing yanked, partial-yanked, stable/prerelease, and matching-version tests |
 | DS-110 | `http_body` GET/POST, chunked, gzip-expansion, exact-limit, interrupted-body, and redaction tests; existing timeout/status/backoff regressions |
+| DS-111 | v2.0.3 workspace/action/README/installer/report/acceptance alignment, cargo-dist generation and exact asset plan, release gate, Rust 1.96.0 suite, and advisory audit; publication evidence remains separate |
 
 ## Platform and external evidence boundary
 
