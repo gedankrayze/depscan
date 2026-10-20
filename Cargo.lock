@@ -453,9 +453,9 @@ dependencies = [
 
 [[package]]
 name = "cvss"
-version = "2.2.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7fb220d3ce1b565af39cee5b89e47fd8dd1dab162900ee4363c8ee4169ee8a2"
+checksum = "11147ff68f855ef1b74c07e9b64489d0967baf41047e82505e13f0a96cf41360"
 
 [[package]]
 name = "deadpool"
