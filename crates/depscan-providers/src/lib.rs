@@ -74,6 +74,7 @@ const CACHE_SENTINEL_SCHEMA_VERSION: u32 = 1;
 const CACHE_SENTINEL_OWNER: &str = "depscan";
 const CACHE_CONTENT_DIRECTORIES: [&str; 3] = ["offline", "osv", "registry"];
 const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const HTTP_MAX_JSON_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const HTTP_MAX_RETRIES: usize = 3;
 const HTTP_ATTEMPTS: usize = HTTP_MAX_RETRIES + 1;
 const HTTP_BACKOFF_BASE: StdDuration = StdDuration::from_millis(200);

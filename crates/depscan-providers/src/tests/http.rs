@@ -16,6 +16,7 @@ fn retry_status_classification_is_exact() {
 fn production_network_budgets_match_the_documented_contract() {
     let http = HttpClient::new().unwrap();
     assert_eq!(http.request_timeout, StdDuration::from_secs(10));
+    assert_eq!(http.max_json_bytes, 64 * 1024 * 1024);
     assert_eq!(http.retry_settings.attempts, 4);
     assert_eq!(
         http.retry_settings.backoff_base,

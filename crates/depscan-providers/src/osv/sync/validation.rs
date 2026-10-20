@@ -50,7 +50,12 @@ where
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| {
+                context.invalid(format_args!("invalid filename at entry {index}: {error}"))
+            })?
+            .into_owned();
         if !name.ends_with(".json") {
             return Err(context.invalid(format_args!("unexpected non-JSON entry {name:?}")));
         }

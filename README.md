@@ -32,6 +32,8 @@ Vulnerability checks for a manifest range use that same `latest_matching` releas
 
 Python lock provenance is format-aware. `uv.lock` schema version 1 uses project/workspace dependency edges to classify direct, transitive, optional, and development-group reachability. Poetry lock versions 1.0, 1.1, 2.0, and 2.1 use category/group metadata when the lock records it and, when present, the sibling `pyproject.toml` for directness; Poetry 2.0 packages without category/group metadata retain unknown development scope. Only packages resolved from the canonical PyPI index are enriched; Git, URL, path, directory, editable, file, and alternate-registry coordinates remain visible without being sent to PyPI or OSV as registry packages.
 
+`Pipfile.lock` uses `_meta.sources` and package index/source fields to establish public PyPI identity. Missing or ambiguous index evidence disables enrichment; custom package categories remain visible with unknown development scope. pnpm resolution metadata similarly prevents private tarball, Git, and directory records from becoming public npm coordinates; explicit public tarballs must match the locked name and version.
+
 For Poetry manifest-only scans, the reserved `python` interpreter constraint and extra names are metadata, not packages. PEP 508 `project.dependencies`, `project.optional-dependencies`, PEP 735 dependency groups, legacy development dependencies, and Poetry named groups are parsed explicitly, including group inclusions. Poetry strings and expanded tables support extras, optional and environment metadata, and git, URL, path, or named repository sources. Caret, tilde, wildcard, exact, and PEP 440 constraints retain their original spelling while using an equivalent PEP 440 range for release matching; conditional declarations are conservatively reported because a scan has no target installation environment. Repository priority is applied before enrichment, so ambiguous custom primary or supplemental origins and explicitly named non-PyPI sources remain visible but are never queried as public PyPI or OSV coordinates. Environment-dependent multiple-constraint arrays, per-dependency `allow-prereleases` policy that the current package model cannot represent, and malformed declarations fail with a source-qualified error instead of producing guessed packages.
 
 `requirements.txt` uses the current PEP 508 grammar for names, extras, version specifiers, markers, and named direct URLs. It accepts pip's separated and attached `-r`/`--requirement` forms, applies `-c`/`--constraint` bounds without treating constraints as installed packages, joins continuations before stripping comments, and validates per-requirement hashes and configuration settings. Environment markers are conservatively assumed true and logged as warnings. Unpinned/ranged entries remain range-derived; URLs, editables, local artifacts, alternate indexes, and `--find-links` entries remain visible but are never queried as public PyPI coordinates. Options that alter pip's candidate policy, such as `--pre` or binary-selection flags, disable range freshness when their semantics cannot be represented safely.
@@ -151,6 +153,8 @@ SOURCE_DATE_EPOCH=1700000000 depscan scan . --format json --output depscan.json
 
 In that mode, equivalent scan results have canonical package, vulnerability, alias, fix, reference, suppression, and error ordering. An invalid or out-of-range epoch is a configuration error and exits with code `10`.
 
+`SOURCE_DATE_EPOCH` changes report time only. Suppression expiry always uses the real UTC scan date, so reproducing an older report cannot reactivate an expired exception. SARIF omits unavailable advisory help links and URI-encodes source paths, including native Windows paths.
+
 The current JSON report schema is version `4`. Version `1` represented `results[].suppressed` as advisory-ID strings; version `2` replaced those strings with audit objects containing the complete vulnerability, whether the suppression was active, and every matching rule's ID/alias, CLI/config source, reason, expiry, and active/expired state. Version `3` adds `results[].package.direct_known` and `dev_known` so unknown classifications are no longer serialized as apparent facts. Version `4` adds `results[].package.manifest_constraint`, retaining both its source spelling (`raw`) and registry-standard evaluator form (`normalized`). Consumers must branch on `schema_version`. Only matching suppression and manifest-constraint fields are emitted—other configuration values are never copied into a report.
 
 | Exit code | Meaning |
@@ -163,6 +167,8 @@ The current JSON report schema is version `4`. Version `1` represented `results[
 | 30 | A provider or scan operation failed. |
 
 An installed version reported as yanked or deprecated is an independent freshness risk: it is shown even when version ordering classifies it as current, contributes once to the outdated total, and triggers exit code `2` for any active `--fail-on-outdated` threshold (`patch`, `minor`, or `major`). Use `never` to report without failing. The `yanked` field always describes the installed version, not `latest_stable`; PyPI releases are considered yanked only when every published file for that release is yanked.
+
+PyPI latest/range candidates must have at least one non-yanked distribution file; empty release lists are not installable candidates. Online JSON responses from OSV and package registries are limited to 64 MiB after decompression; oversized responses fail visibly without being retried.
 
 ## Configuration and suppressions
 
@@ -228,7 +234,7 @@ Version freshness is evaluated from cached registry metadata when a usable entry
 
 ## Development
 
-The pinned toolchain is the latest verified stable patch (Rust 1.98.0 as of 2026-08-21). The supported MSRV follows an N−2 stable policy and is currently Rust 1.96.0. On each stable Rust release, refresh the pin, move the MSRV to the new N−2 release, update CI, and verify both toolchains before merging.
+The pinned toolchain is Rust 1.99.1 (verified on 2026-10-20), with a supported MSRV of Rust 1.96.0 retained for compatibility. The N−2 stable policy remains the target for scheduled MSRV reviews; this update does not raise the supported floor. Toolchain updates must coordinate native CI pins, release-quality commands, and the digest-pinned static builder image, then verify both stable and MSRV before merging.
 
 The workspace is divided at its architectural boundaries:
 
