@@ -82,4 +82,18 @@ if [[ -n "$stray_toolchains" ]]; then
   exit 1
 fi
 
+release_toolchains=$(grep -nE 'cargo \+|rustup toolchain install ' .github/workflows/release-quality.yml || true)
+stray_release_toolchains=$(grep -Fv -e "cargo +${toolchain_channel} " -e "rustup toolchain install ${toolchain_channel} " <<<"$release_toolchains" || true)
+if [[ -z "$release_toolchains" || -n "$stray_release_toolchains" ]]; then
+  echo "release-quality commands must use Rust ${toolchain_channel}: $stray_release_toolchains" >&2
+  exit 1
+fi
+static_image=$(sed -n 's/^ *RUST_IMAGE: //p' "$static_workflow")
+static_prefix="rust:${toolchain_channel}-alpine@sha256:"
+static_digest=${static_image#"$static_prefix"}
+if [[ "$static_image" != "$static_prefix"* || ! "$static_digest" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "static Rust image must pin Rust ${toolchain_channel} and an image digest" >&2
+  exit 1
+fi
+
 printf 'CI policy verified: canonical PR evidence, path-scoped heavy workflows, and consistent toolchain pins\n'
