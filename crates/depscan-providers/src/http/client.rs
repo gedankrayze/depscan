@@ -4,6 +4,7 @@ use super::*;
 pub struct HttpClient {
     pub(crate) inner: Client,
     pub(crate) request_timeout: StdDuration,
+    pub(crate) max_json_bytes: usize,
     pub(crate) retry_runtime: Arc<dyn RetryRuntime>,
     pub(crate) retry_settings: RetrySettings,
 }
@@ -11,6 +12,7 @@ impl std::fmt::Debug for HttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpClient")
             .field("request_timeout", &self.request_timeout)
+            .field("max_json_bytes", &self.max_json_bytes)
             .field("retry_settings", &self.retry_settings)
             .finish_non_exhaustive()
     }
@@ -50,6 +52,7 @@ impl HttpClient {
         Ok(Self {
             inner: client,
             request_timeout,
+            max_json_bytes: HTTP_MAX_JSON_RESPONSE_BYTES,
             retry_runtime,
             retry_settings,
         })
@@ -100,23 +103,31 @@ impl HttpClient {
                         .get(ETAG)
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_owned);
-                    match response.json::<Value>().await {
-                        Ok(value) => return Ok(Revalidated::Modified { value, etag }),
-                        Err(error) if retryable_transport(&error) => {
+                    match read_body(response, self.max_json_bytes).await {
+                        Ok(bytes) => {
+                            let value = serde_json::from_slice(&bytes).map_err(|_| {
+                                ProviderError::InvalidResponse(format!(
+                                    "{context}: invalid JSON response"
+                                ))
+                            })?;
+                            return Ok(Revalidated::Modified { value, etag });
+                        }
+                        Err(BodyError::Transport(error)) => {
                             let final_error = transport_attempt_error(
                                 &context,
                                 &error,
                                 attempt,
                                 settings.attempts,
                             );
-                            if attempt == settings.attempts {
+                            if !retryable_transport(&error) || attempt == settings.attempts {
                                 return Err(final_error);
                             }
                             self.wait_before_retry(None, attempt_index, settings).await;
                         }
-                        Err(_) => {
+                        Err(BodyError::TooLarge) => {
                             return Err(ProviderError::InvalidResponse(format!(
-                                "{context}: invalid JSON response"
+                                "{context}: response exceeds the {}-byte limit",
+                                self.max_json_bytes
                             )));
                         }
                     }
@@ -197,7 +208,7 @@ impl HttpClient {
         let settings = self.retry_settings;
         let method = reqwest::Method::GET;
         let context = request_context(&method, url);
-        'request: for attempt_index in 0..settings.attempts {
+        for attempt_index in 0..settings.attempts {
             let attempt = attempt_index + 1;
             let response = match self
                 .inner
@@ -246,48 +257,22 @@ impl HttpClient {
                     .await;
                 continue;
             }
-            let mut response = response;
-            let content_length = response.content_length();
-            if content_length.is_some_and(|length| length > max_bytes as u64) {
-                return Err(ProviderError::InvalidResponse(format!(
-                    "{context}: response exceeds the {max_bytes}-byte limit"
-                )));
-            }
-
-            let initial_capacity = content_length
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or_default()
-                .min(max_bytes);
-            let mut bytes = Vec::with_capacity(initial_capacity);
-            loop {
-                let chunk = match response.chunk().await {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        let final_error =
-                            transport_attempt_error(&context, &error, attempt, settings.attempts);
-                        if !retryable_transport(&error) || attempt == settings.attempts {
-                            return Err(final_error);
-                        }
-                        self.wait_before_retry(None, attempt_index, settings).await;
-                        continue 'request;
-                    }
-                };
-                let Some(chunk) = chunk else {
-                    break;
-                };
-                let Some(new_len) = bytes.len().checked_add(chunk.len()) else {
-                    return Err(ProviderError::InvalidResponse(format!(
-                        "{context}: response size overflowed"
-                    )));
-                };
-                if new_len > max_bytes {
+            match read_body(response, max_bytes).await {
+                Ok(bytes) => return Ok(Revalidated::Modified { value: bytes, etag }),
+                Err(BodyError::TooLarge) => {
                     return Err(ProviderError::InvalidResponse(format!(
                         "{context}: response exceeds the {max_bytes}-byte limit"
                     )));
                 }
-                bytes.extend_from_slice(&chunk);
+                Err(BodyError::Transport(error)) => {
+                    let final_error =
+                        transport_attempt_error(&context, &error, attempt, settings.attempts);
+                    if !retryable_transport(&error) || attempt == settings.attempts {
+                        return Err(final_error);
+                    }
+                    self.wait_before_retry(None, attempt_index, settings).await;
+                }
             }
-            return Ok(Revalidated::Modified { value: bytes, etag });
         }
         Err(ProviderError::Network(format!(
             "{context}: retry policy allowed no attempts"
