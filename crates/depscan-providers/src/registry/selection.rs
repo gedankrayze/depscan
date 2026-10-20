@@ -78,6 +78,18 @@ pub(crate) fn pypi_version_result(
         .ok_or_else(|| {
             ProviderError::InvalidResponse("PyPI response lacked releases".to_owned())
         })?;
+    for files in releases.values() {
+        let files = files.as_array().ok_or_else(|| {
+            ProviderError::InvalidResponse("PyPI release files must be an array".to_owned())
+        })?;
+        if files.iter().any(|file| {
+            !file.is_object() || file.get("yanked").is_some_and(|value| !value.is_boolean())
+        }) {
+            return Err(ProviderError::InvalidResponse(
+                "PyPI release files contain invalid metadata".to_owned(),
+            ));
+        }
+    }
     let latest = select_pypi_release(releases, &package.version).ok_or_else(|| {
         ProviderError::InvalidResponse(format!("PyPI has no suitable release for {}", package.name))
     })?;
@@ -88,7 +100,7 @@ pub(crate) fn pypi_version_result(
         package,
         releases
             .iter()
-            .filter(|(_, files)| !pypi_release_is_yanked(files))
+            .filter(|(_, files)| pypi_release_is_available(files))
             .map(|(version, _)| version.as_str()),
     )?;
     Ok(version_result(package, latest, matching, yanked))
@@ -179,7 +191,7 @@ pub(crate) fn select_pypi_release(
         .filter(|(version, files)| {
             let valid_candidate = pypi_version_is_stable(version)
                 || (allow_prerelease && pypi_version_is_prerelease(version));
-            valid_candidate && !pypi_release_is_yanked(files)
+            valid_candidate && pypi_release_is_available(files)
         })
         .map(|(version, _)| version.as_str())
         .max_by(|a, b| compare_versions(Ecosystem::PyPI, a, b))
@@ -192,6 +204,14 @@ pub(crate) fn pypi_release_is_yanked(files: &Value) -> bool {
             && files
                 .iter()
                 .all(|file| file.get("yanked").and_then(Value::as_bool).unwrap_or(false))
+    })
+}
+
+fn pypi_release_is_available(files: &Value) -> bool {
+    files.as_array().is_some_and(|files| {
+        files.iter().any(|file| {
+            file.is_object() && file.get("yanked").and_then(Value::as_bool) != Some(true)
+        })
     })
 }
 

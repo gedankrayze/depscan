@@ -40,6 +40,7 @@ pub(super) async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         confined_output,
     } = prepared;
     let generated_at = scan_timestamp()?;
+    let policy_date = Utc::now().date_naive();
     let max_cache_age = args.max_cache_age.map(|age| age.0);
     let mut suppression_rules = args
         .ignore
@@ -53,10 +54,7 @@ pub(super) async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         })
         .collect::<Vec<_>>();
     for ignored in configured_ignores {
-        let state = if ignored
-            .expires
-            .is_some_and(|date| date < generated_at.date_naive())
-        {
+        let state = if ignored.expires.is_some_and(|date| date < policy_date) {
             warn!(id = %ignored.id, reason = ?ignored.reason, "ignore has expired and will not be applied");
             SuppressionState::Expired
         } else {

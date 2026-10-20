@@ -96,6 +96,7 @@ pub(crate) fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
             .transpose()?;
         let exact_locator = key.trim_start_matches('/');
         let mut package = Package::new(Ecosystem::Npm, name, version, path.to_path_buf());
+        package.enrichable = pnpm_public_resolution(path, entry, name, version)?;
         package.dev = dev.unwrap_or(false);
         package.dev_known = dev.is_some();
         if let Some(direct) = direct_references.get(exact_locator) {
@@ -112,6 +113,43 @@ pub(crate) fn parse_pnpm_lock(path: &Path) -> Result<Vec<Package>, ParseError> {
         out.push(package);
     }
     Ok(dedup(out))
+}
+
+fn pnpm_public_resolution(
+    path: &Path,
+    entry: &noyalib::Mapping,
+    name: &str,
+    version: &str,
+) -> Result<bool, ParseError> {
+    let Some(resolution) = entry.get("resolution") else {
+        return Ok(false);
+    };
+    let resolution = resolution
+        .as_mapping()
+        .ok_or_else(|| invalid(path, "pnpm resolution must be a mapping"))?;
+    for field in ["tarball", "repo", "type", "directory"] {
+        if let Some(value) = resolution.get(field)
+            && !value.as_str().is_some_and(|value| !value.is_empty())
+        {
+            return Err(invalid(
+                path,
+                format!("pnpm resolution {field} must be a nonempty string"),
+            ));
+        }
+    }
+    if ["repo", "type", "directory"]
+        .iter()
+        .any(|field| resolution.contains_key(field))
+    {
+        return Ok(false);
+    }
+    match resolution.get("tarball").and_then(Yaml::as_str) {
+        Some(tarball) => Ok(npm_public_tarball_matches(tarball, name, version)),
+        None => Ok(resolution
+            .get("integrity")
+            .and_then(Yaml::as_str)
+            .is_some_and(|value| !value.is_empty())),
+    }
 }
 
 #[derive(Default)]

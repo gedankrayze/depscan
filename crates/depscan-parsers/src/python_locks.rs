@@ -122,7 +122,11 @@ fn optional_version(
         .transpose()
 }
 
-fn validate_version(version: &str, path: &Path, context: &str) -> Result<(), ParseError> {
+pub(super) fn validate_version(
+    version: &str,
+    path: &Path,
+    context: &str,
+) -> Result<(), ParseError> {
     version
         .parse::<Pep440Version>()
         .map(|_| ())
@@ -134,7 +138,11 @@ fn validate_version(version: &str, path: &Path, context: &str) -> Result<(), Par
         })
 }
 
-fn normalized_name(name: &str, path: &Path, context: &str) -> Result<String, ParseError> {
+pub(super) fn normalized_name(
+    name: &str,
+    path: &Path,
+    context: &str,
+) -> Result<String, ParseError> {
     let first = name.chars().next();
     let last = name.chars().last();
     if !first.is_some_and(|character| character.is_ascii_alphanumeric())
@@ -151,6 +159,6 @@ fn normalized_name(name: &str, path: &Path, context: &str) -> Result<String, Par
     Ok(normalize_name(Ecosystem::PyPI, name))
 }
 
-fn is_pypi_index(url: &str) -> bool {
+pub(super) fn is_pypi_index(url: &str) -> bool {
     url.trim_end_matches('/').eq_ignore_ascii_case(PYPI_INDEX)
 }
