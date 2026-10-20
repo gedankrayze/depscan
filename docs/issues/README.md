@@ -2,6 +2,8 @@
 
 This directory is the authoritative ledger for defects and specification gaps found during the 2026-08-19 code, runtime, dependency, and release audit. Later reviews append new issues to the same ledger; DS-077 onward come from the 2026-08-21 code, async-runtime, API-surface, and CI-posture review.
 
+DS-103–DS-110 come from the [2026-10-20 fresh review and PR triage](../reviews/2026-10-20.md), which records incoming PR dispositions, reviewed heads, and verification boundaries.
+
 ## Workflow
 
 1. Select or create one `Open` or `In progress` `DS-*` issue in the working tree.
@@ -121,3 +123,12 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-100](DS-100.md) | P1 | Closed | Prepare the v2.0.1 maintenance release |
 | [DS-101](DS-101.md) | P2 | Closed | Update base64 without enabling its SIMD unsafe default |
 | [DS-102](DS-102.md) | P1 | Closed | Prepare the v2.0.2 dependency-maintenance release |
+| [DS-103](DS-103.md) | P2 | Closed | Coordinate Rust 1.99.1 across native, release, and static builds |
+| [DS-104](DS-104.md) | P1 | Closed | Remove newly disclosed RustSec findings and adapt the ZIP 9 reader |
+| [DS-105](DS-105.md) | P1 | Closed | Evaluate suppression expiry independently of report reproducibility |
+| [DS-106](DS-106.md) | P1 | Closed | Preserve Pipfile.lock sources and custom package categories |
+| [DS-107](DS-107.md) | P1 | Closed | Respect pnpm tarball and Git source provenance |
+| [DS-108](DS-108.md) | P1 | Closed | Emit valid optional SARIF properties and artifact URIs |
+| [DS-109](DS-109.md) | P1 | Closed | Exclude PyPI releases with no downloadable files |
+| [DS-110](DS-110.md) | P2 | Closed | Bound decompressed online JSON responses |
+| [DS-111](DS-111.md) | P1 | Closed | Prepare the v2.0.3 corrective maintenance release |

@@ -47,7 +47,7 @@ jobs:
             platform: linux/arm64
     env:
       CARGO_TARGET: ${{ matrix.target }}
-      RUST_IMAGE: rust:1.98.0-alpine@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a02cf1d6ea424dce
+      RUST_IMAGE: rust:1.99.1-alpine@sha256:557a94c82b485a14b569120e00867267108c734efe33f10cc31ca0cd5dd1eca9
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,7 +108,7 @@ jobs:
           install -m 0755 "target/$CARGO_TARGET/release/depscan" "$artifact_dir/depscan"
           cd "$artifact_dir"
           sha256sum depscan > depscan.sha256
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: depscan-${{ matrix.target }}
           path: |

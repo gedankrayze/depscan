@@ -188,7 +188,11 @@ fn offline_dump_enforces_entry_aggregate_count_and_actual_decompression_limits()
     let error = scan_offline_archive(&forged, limits).unwrap_err();
     let message = error.to_string();
     assert!(message.contains("TEST-ACTUAL.json"), "{message}");
-    assert!(message.contains("actual uncompressed"), "{message}");
+    assert!(
+        message.contains("actual uncompressed")
+            || message.contains("File is larger than its declared uncompressed size"),
+        "{message}"
+    );
 }
 
 #[test]

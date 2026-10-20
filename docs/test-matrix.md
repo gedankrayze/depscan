@@ -7,16 +7,16 @@ This document is the durable index from the version 0.1 development specificatio
 Run the deterministic suite without public network access:
 
 ```bash
-cargo +1.98.0 fmt --all -- --check
-cargo +1.98.0 test --workspace --all-targets --locked
-cargo +1.98.0 clippy --all-targets -- -D warnings
+cargo +1.99.1 fmt --all -- --check
+cargo +1.99.1 test --workspace --all-targets --locked
+cargo +1.99.1 clippy --all-targets -- -D warnings
 cargo +1.96.0 test --workspace --all-targets --locked
 ```
 
 The ignored live provider suite is deliberately opt-in and belongs in the scheduled workflow, not pull-request CI:
 
 ```bash
-DEPSCAN_RUN_LIVE=1 cargo +1.98.0 test --locked -p depscan-cli \
+DEPSCAN_RUN_LIVE=1 cargo +1.99.1 test --locked -p depscan-cli \
   --test e2e_matrix live_provider_matrix_for_every_ecosystem \
   -- --exact --ignored --nocapture
 ```
@@ -215,6 +215,15 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-100 | exact workspace/action/README/installer/report/acceptance 2.0.1 alignment, release-plan parity, full release gate, protected-main publication, and post-release acceptance evidence |
 | DS-101 | base64 0.23.1 with default features disabled, Bun parser regressions, dependency-feature inspection, strict Clippy, and release-candidate verification |
 | DS-102 | exact workspace/action/README/installer/report/acceptance 2.0.2 alignment, dependency PR processing, release-plan parity, and protected-main release verification |
+| DS-103 | Rust 1.99.1 stable/action/release/static alignment; CI-policy negative controls for release-command and static-image drift; Rust 1.96.0 MSRV retained and tested |
+| DS-104 | Patched ZIP/rustls/quinn-proto lockfile; fresh RustSec audit; provider publication/offline forged-size tests and decoded archive-name identity regression |
+| DS-105 | `exit_codes::suppression_time` backdated/future report-epoch process regressions; existing reproducible-report and suppression tests |
+| DS-106 | `pipfile_provenance` parser controls for public/private/missing/ambiguous indexes, duplicate sources, custom categories, exact pins, and source-only coordinates |
+| DS-107 | `pnpm_provenance` public/private/wrong-identity tarball, Git, and malformed-resolution controls; existing directness/scope fixtures |
+| DS-108 | `sarif::tests` absent/invalid help links and encoded relative, Unicode, Unix, and Windows paths; report snapshots |
+| DS-109 | `pypi_candidates` empty/malformed release-file controls; existing yanked, partial-yanked, stable/prerelease, and matching-version tests |
+| DS-110 | `http_body` GET/POST, chunked, gzip-expansion, exact-limit, interrupted-body, and redaction tests; existing timeout/status/backoff regressions |
+| DS-111 | v2.0.3 workspace/action/README/installer/report/acceptance alignment, cargo-dist generation and exact asset plan, release gate, Rust 1.96.0 suite, and advisory audit; publication evidence remains separate |
 
 ## Platform and external evidence boundary
 

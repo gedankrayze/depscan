@@ -350,7 +350,10 @@ fn dump_validation_requires_complete_bounded_osv_documents() {
     limited.max_entry_bytes = valid.len() as u64 - 1;
     let error = validate_osv_dump(&path, Ecosystem::Npm, &limited).unwrap_err();
     assert!(
-        error.to_string().contains("actual uncompressed"),
+        error.to_string().contains("actual uncompressed")
+            || error
+                .to_string()
+                .contains("File is larger than its declared uncompressed size"),
         "unexpected forged-size error: {error}"
     );
 }

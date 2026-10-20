@@ -1,7 +1,12 @@
 use crate::formatting::suppression_match_details;
 use depscan_core::{ScanDocument, ScanResult, Severity, SuppressionState, Vulnerability};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::Path;
+
+#[cfg(test)]
+mod tests;
 
 pub fn render_sarif(document: &ScanDocument) -> Value {
     let mut rules = BTreeMap::<String, Value>::new();
@@ -71,7 +76,7 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
                         suppression_match_details(matched)
                     )},
                     "locations": [{"physicalLocation": {"artifactLocation": {
-                        "uri": result.package.source_file.to_string_lossy()
+                        "uri": artifact_uri(&result.package.source_file)
                     }}}],
                     "properties": {
                         "ecosystem": result.package.ecosystem.osv_name(),
@@ -101,7 +106,7 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
                     latest.latest_stable
                 )},
                 "locations": [{"physicalLocation": {"artifactLocation": {
-                    "uri": result.package.source_file.to_string_lossy()
+                    "uri": artifact_uri(&result.package.source_file)
                 }}}],
                 "properties": {
                     "ecosystem": result.package.ecosystem.osv_name(),
@@ -134,7 +139,7 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
                     error.message
                 )},
                 "locations": [{"physicalLocation": {"artifactLocation": {
-                    "uri": result.package.source_file.to_string_lossy()
+                    "uri": artifact_uri(&result.package.source_file)
                 }}}],
                 "properties": {
                     "ecosystem": result.package.ecosystem.osv_name(),
@@ -151,11 +156,14 @@ pub fn render_sarif(document: &ScanDocument) -> Value {
 
 fn insert_vulnerability_rule(rules: &mut BTreeMap<String, Value>, vulnerability: &Vulnerability) {
     rules.entry(vulnerability.id.clone()).or_insert_with(|| {
-        json!({
+        let mut rule = json!({
             "id": vulnerability.id,
-            "shortDescription": {"text": vulnerability.summary},
-            "helpUri": vulnerability.references.first()
-        })
+            "shortDescription": {"text": if vulnerability.summary.is_empty() { &vulnerability.id } else { &vulnerability.summary }},
+        });
+        if let Some(uri) = vulnerability.references.iter().find_map(|reference| url::Url::parse(reference).ok()) {
+            rule["helpUri"] = json!(uri.as_str());
+        }
+        rule
     });
 }
 
@@ -176,7 +184,7 @@ fn sarif_vulnerability_result(result: &ScanResult, vulnerability: &Vulnerability
             vulnerability.summary
         )},
         "locations": [{"physicalLocation": {"artifactLocation": {
-            "uri": result.package.source_file.to_string_lossy()
+            "uri": artifact_uri(&result.package.source_file)
         }}}],
         "properties": {
             "ecosystem": result.package.ecosystem.osv_name(),
@@ -186,4 +194,36 @@ fn sarif_vulnerability_result(result: &ScanResult, vulnerability: &Vulnerability
             "withdrawn": vulnerability.withdrawn
         }
     })
+}
+
+fn artifact_uri(path: &Path) -> String {
+    const PATH_CHARACTERS: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'/')
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let path = path.to_string_lossy();
+    let windows_path = cfg!(windows)
+        || path.starts_with(r"\\")
+        || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic());
+    let path = if windows_path {
+        path.replace('\\', "/")
+    } else {
+        path.into_owned()
+    };
+    let encoded = utf8_percent_encode(&path, PATH_CHARACTERS).to_string();
+    if path.starts_with("//") {
+        format!("file:{encoded}")
+    } else if path.starts_with('/') {
+        format!("file://{encoded}")
+    } else if path.as_bytes().get(1..3) == Some(b":/") && path.as_bytes()[0].is_ascii_alphabetic() {
+        format!(
+            "file:///{}:{}",
+            &path[..1],
+            utf8_percent_encode(&path[2..], PATH_CHARACTERS)
+        )
+    } else {
+        encoded
+    }
 }
