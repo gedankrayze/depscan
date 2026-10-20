@@ -577,8 +577,10 @@ version = "2.0.2"
 dependencies = [
  "chrono",
  "depscan-core",
+ "percent-encoding",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
