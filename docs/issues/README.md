@@ -133,3 +133,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-110](DS-110.md) | P2 | Closed | Bound decompressed online JSON responses |
 | [DS-111](DS-111.md) | P1 | Closed | Prepare the v2.0.3 corrective maintenance release |
 | [DS-112](DS-112.md) | P1 | Closed | Distrust compromised eMudhra certificate chains |
+| [DS-113](DS-113.md) | P1 | Closed | Remove the yanked Tokio interval race release |
