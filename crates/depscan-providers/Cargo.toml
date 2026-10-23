@@ -34,11 +34,19 @@ tokio.workspace = true
 tracing.workspace = true
 percent-encoding.workspace = true
 zip.workspace = true
+# RUSTSEC-2026-0382: constrain the shared verifier even for consumers with an older lockfile.
+webpki.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# RUSTSEC-2026-0383: preserve a patched floor for the verifier's bundled-root edge.
+webpki-root-certs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net"] }
 wiremock = "0.6.5"
+webpki-root-certs.workspace = true
+rustls-pki-types.workspace = true
 
 [lints]
 workspace = true
