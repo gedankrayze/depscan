@@ -26,6 +26,8 @@ mod cache;
 mod http;
 mod http_body;
 mod offline;
+mod runtime;
+mod tls;
 // The `*_cases` names avoid colliding with the production `osv`/`registry`/`sync` modules that
 // the glob import above already binds in this scope; `#[path]` keeps the test files in the
 // directories that mirror the production tree.

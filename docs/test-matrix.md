@@ -224,6 +224,10 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-109 | `pypi_candidates` empty/malformed release-file controls; existing yanked, partial-yanked, stable/prerelease, and matching-version tests |
 | DS-110 | `http_body` GET/POST, chunked, gzip-expansion, exact-limit, interrupted-body, and redaction tests; existing timeout/status/backoff regressions |
 | DS-111 | v2.0.3 workspace/action/README/installer/report/acceptance alignment, cargo-dist generation and exact asset plan, release gate, Rust 1.96.0 suite, and advisory audit; publication evidence remains separate |
+| DS-112 | 14 offline incident-chain rejections with old roots explicitly trusted, valid/untrusted control chain, four removed root fingerprints, and before-fix acceptance proof |
+| DS-113 | 1,024 interval tick/cancellation/recreation cycles on four runtime workers, provider regressions, patched Tokio floor, and clean advisory audit |
+| DS-114 | Latest-compatible and incompatible-stable manifest checks, full lockfile refresh/dry-run, retained-MSRV suite, and documented upstream constraints |
+| DS-115 | v2.0.4 version/README/action/report/acceptance alignment, release gate, exact five-target/16-asset plan, and separate immutable public-artifact acceptance |
 
 ## Platform and external evidence boundary
 
