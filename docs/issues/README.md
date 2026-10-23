@@ -138,3 +138,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-112](DS-112.md) | P1 | Closed | Distrust compromised eMudhra certificate chains |
 | [DS-113](DS-113.md) | P1 | Closed | Remove the yanked Tokio interval race release |
 | [DS-114](DS-114.md) | P2 | Closed | Refresh the complete product dependency graph |
+| [DS-115](DS-115.md) | P1 | Closed | Prepare the v2.0.4 security release |
