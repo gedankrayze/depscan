@@ -217,7 +217,9 @@ fn pypi_release_is_available(files: &Value) -> bool {
 
 pub(crate) fn is_prerelease(eco: Ecosystem, version: &str) -> bool {
     match eco {
-        Ecosystem::Npm | Ecosystem::CratesIo => version.contains('-'),
+        Ecosystem::Npm | Ecosystem::CratesIo => {
+            semver::Version::parse(version).is_ok_and(|version| !version.pre.is_empty())
+        }
         Ecosystem::NuGet => {
             NuGetVersion::parse(version).is_ok_and(|version| version.is_prerelease())
         }

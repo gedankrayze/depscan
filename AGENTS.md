@@ -13,6 +13,12 @@
   If it reports incoming pull requests, process all of them with the PR-triage workflow
   and rerun the check successfully before pushing. The `develop` -> `main` integration PR
   is outgoing and is therefore excluded from this incoming-PR sweep.
+- The same pre-push check must verify current stable crate requirements, the complete
+  compatible lockfile, and a fresh advisory audit. Never substitute a previous run or
+  silently accept a failed/offline freshness check; document upstream constraints.
+- After a successful push and its required CI/artifact acceptance, inventory and remove
+  unused task-owned images, build artifacts, caches, temporary files, and worktrees.
+  Follow `docs/maintenance.md`; preserve stashes, unrelated resources, and release evidence.
 - Preserve unrelated work. Inspect the worktree before editing and stage explicit paths.
 - Treat release workflows, action installers, capability-safe filesystem code, frozen
   fixtures, snapshots, and security-boundary tests as sensitive review surfaces.
@@ -39,6 +45,8 @@
 
 ## Repository workflows
 
+- Keep individual issue records near a 500-word soft cap. Link detailed historical
+  evidence or review notes instead of repeating logs; preserve IDs, status, and evidence.
 - Use the matching project skill under `.agents/skills/` for normal changes, PR triage,
   or releases.
 - Project hooks are guardrails, not authorization or complete security boundaries.

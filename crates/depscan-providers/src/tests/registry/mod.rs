@@ -1,5 +1,6 @@
 use super::*;
 
+mod build_metadata;
 mod cache;
 mod conflicts;
 mod crates;
