@@ -569,6 +569,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.3",
  "reqwest",
+ "rustls",
  "rustls-pki-types",
  "rustls-webpki",
  "semver",

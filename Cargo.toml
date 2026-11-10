@@ -43,6 +43,7 @@ httpdate = "1.0.3"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip", "json", "http2", "stream"] }
 webpki = { package = "rustls-webpki", version = "0.103.16", default-features = false }
+rustls = { version = "0.23.46", default-features = false }
 webpki-root-certs = "1.0.11"
 rustls-pki-types = "1.15.1"
 semver = { version = "1.0.28", features = ["serde"] }
