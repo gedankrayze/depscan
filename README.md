@@ -94,13 +94,14 @@ Cargo-dist 0.34.0 generates the release plan and MSI definition. The checked-in 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v2.0.4 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v2.0.5 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
 
-Security updates require a new binary: v2.0.4 includes the eMudhra intermediate-key
-distrust fix and patched Tokio. Keep operating-system and CI-runner trust stores
+Security updates require a new binary: v2.0.5 retains the eMudhra intermediate-key
+distrust fix and patched Tokio, and enforces a patched native Rustls dependency floor.
+Keep operating-system and CI-runner trust stores
 updated too; release installers use the runner's HTTPS client before DepScan starts.
 
 ## Usage
@@ -130,9 +131,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v2.0.4
+    uses: gedankrayze/depscan@v2.0.5
     with:
-      version: v2.0.4
+      version: v2.0.5
       path: .
       format: sarif
       output: depscan.sarif

@@ -486,7 +486,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "depscan-cli"
-version = "2.0.4"
+version = "2.0.5"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-core"
-version = "2.0.4"
+version = "2.0.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-parsers"
-version = "2.0.4"
+version = "2.0.5"
 dependencies = [
  "base64 0.23.1",
  "cap-fs-ext",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-providers"
-version = "2.0.4"
+version = "2.0.5"
 dependencies = [
  "async-trait",
  "cap-fs-ext",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-report"
-version = "2.0.4"
+version = "2.0.5"
 dependencies = [
  "chrono",
  "depscan-core",
