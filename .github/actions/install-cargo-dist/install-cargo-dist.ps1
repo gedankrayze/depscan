@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$version = "0.32.0"
+$version = "0.34.0"
 if ($env:RUNNER_OS -ne "Windows" -or $env:RUNNER_ARCH -ne "X64") {
     throw "Unsupported cargo-dist runner: $($env:RUNNER_OS)/$($env:RUNNER_ARCH)"
 }
@@ -13,7 +13,7 @@ if ([string]::IsNullOrWhiteSpace($env:GITHUB_PATH)) {
 }
 
 $asset = "cargo-dist-x86_64-pc-windows-msvc.zip"
-$expectedSha256 = "26e845cabff12a92911ce960af73a86c8f9b2b2d9072b01dfe5b662acf044fa3"
+$expectedSha256 = "7bb53fbc998321f77a3bbb044084a52747c8ed041cf6d6a604802aa57b9c80c6"
 $downloadDir = Join-Path $env:RUNNER_TEMP ("depscan-cargo-dist-download-" + [Guid]::NewGuid().ToString("N"))
 $installDir = Join-Path $env:RUNNER_TEMP ("depscan-cargo-dist-bin-" + [Guid]::NewGuid().ToString("N"))
 

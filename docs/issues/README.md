@@ -141,3 +141,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-114](DS-114.md) | P2 | Closed | Refresh the complete product dependency graph |
 | [DS-115](DS-115.md) | P1 | Closed | Prepare the v2.0.4 security release |
 | [DS-116](DS-116.md) | P2 | Closed | Refresh dependencies and revalidate known CVE exposure |
+| [DS-119](DS-119.md) | P2 | Closed | Refresh verified release tooling and action pins |

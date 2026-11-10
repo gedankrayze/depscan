@@ -1,5 +1,5 @@
 name: Install verified cargo-dist
-description: Install cargo-dist 0.32.0 after verifying its reviewed SHA-256 checksum
+description: Install cargo-dist 0.34.0 after verifying its reviewed SHA-256 checksum
 
 runs:
   using: composite
