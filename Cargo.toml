@@ -9,7 +9,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "2.0.4"
+version = "2.0.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gedankrayze/depscan"
@@ -22,10 +22,10 @@ categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
 
 [workspace.dependencies]
-depscan-core = { version = "2.0.4", path = "crates/depscan-core" }
-depscan-parsers = { version = "2.0.4", path = "crates/depscan-parsers" }
-depscan-providers = { version = "2.0.4", path = "crates/depscan-providers" }
-depscan-report = { version = "2.0.4", path = "crates/depscan-report" }
+depscan-core = { version = "2.0.5", path = "crates/depscan-core" }
+depscan-parsers = { version = "2.0.5", path = "crates/depscan-parsers" }
+depscan-providers = { version = "2.0.5", path = "crates/depscan-providers" }
+depscan-report = { version = "2.0.5", path = "crates/depscan-report" }
 async-trait = "0.1.92"
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 cap-fs-ext = "4.0.3"
@@ -43,15 +43,16 @@ httpdate = "1.0.3"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip", "json", "http2", "stream"] }
 webpki = { package = "rustls-webpki", version = "0.103.16", default-features = false }
+rustls = { version = "0.23.46", default-features = false }
 webpki-root-certs = "1.0.11"
 rustls-pki-types = "1.15.1"
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-noyalib = { version = "0.0.58", default-features = false, features = ["std"] }
+noyalib = { version = "0.0.60", default-features = false, features = ["std"] }
 js-semver = "1.0.1"
 sha2 = "0.11.1"
-toml = "1.1.8"
+toml = "1.2.1"
 thiserror = "2.0.21"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
@@ -63,7 +64,7 @@ unicode-general-category = "1.1.0"
 walkdir = "2.5.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 quick-xml = { version = "0.42.0", features = ["serialize"] }
-zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+zip = { version = "9.5.0", default-features = false, features = ["deflate"] }
 pep440_rs = "0.7.3"
 pep508_rs = "0.9.2"
 
@@ -81,7 +82,7 @@ inherits = "release"
 [workspace.metadata.dist]
 dist = true
 allow-dirty = ["ci"] # release.yml contains reviewed permission, gating, and lint hardening
-cargo-dist-version = "0.32.0"
+cargo-dist-version = "0.34.0"
 ci = "github"
 installers = ["shell", "msi"]
 checksum = "sha256"
@@ -100,10 +101,10 @@ targets = [
 
 [workspace.metadata.dist.github-action-commits]
 "actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
-"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7.0.1
-"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8.0.1
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7.0.2
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8.0.2
 "actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2
-"actions/setup-node" = "48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e" # v6.4.0
+"actions/setup-node" = "949feb2413d6458794dcd2491c4babbbce0c15c1" # v7.1.0
 
 [workspace.metadata.release]
 shared-version = true

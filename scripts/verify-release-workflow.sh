@@ -75,8 +75,8 @@ release_action_uses=$(
 )
 for expected in \
   'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1:6' \
-  'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a:4' \
-  'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c:4' \
+  'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9:4' \
+  'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333:4' \
   'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6:1'; do
   action_ref=${expected%:*}
   expected_count=${expected##*:}
@@ -206,11 +206,11 @@ grep -Fq 'https://github.com/axodotdev/cargo-dist/releases/download/v${version}/
 # shellcheck disable=SC2016
 grep -Fq 'https://github.com/axodotdev/cargo-dist/releases/download/v$version/$asset' "$installer_windows"
 for expected_sha256 in \
-  aa343b2ff78ec2981f17a65140250c5ad6062c74072163f68c5c2686d94763a7 \
-  d29bcffeb3f8b0c517b4ce0dd2470926ed5cb0bb29d78c6bdd5f88d76ee14a6a \
-  6243464a8389e006b9256ee548bc795638f1a17113c1b6669c0e05ce89fd05c5 \
-  26e845cabff12a92911ce960af73a86c8f9b2b2d9072b01dfe5b662acf044fa3 \
-  eb52f9fae0d0506774e9f1801c1168f87fa2c87a45e2d64d3ae7c89401929946; do
+  d1eec30e63eed23e5a5bd48fe96eae314799811bffca254ec1d2264638ba1890 \
+  58efb33edf01342875bfd0c3ce2befa9d73075579ca1b3e5dd75b98c88f92e83 \
+  6aa89bb1e7c18f51ae8b148ce2fc6ab00ac46ed8173d4f2ed9afa12101218773 \
+  7bb53fbc998321f77a3bbb044084a52747c8ed041cf6d6a604802aa57b9c80c6 \
+  7fee44ff3ff71ed0064b32d4ec62fee6b58bd37c5887b12a86aedddc5af0c7b5; do
   if ! grep -Fq "$expected_sha256" "$installer_unix" "$installer_windows"; then
     echo "missing reviewed cargo-dist checksum: $expected_sha256" >&2
     exit 1

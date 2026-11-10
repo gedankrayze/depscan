@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=0.32.0
+version=0.34.0
 
 case "${RUNNER_OS:-}/${RUNNER_ARCH:-}" in
   Linux/X64)
     asset=cargo-dist-x86_64-unknown-linux-gnu.tar.xz
-    expected_sha256=eb52f9fae0d0506774e9f1801c1168f87fa2c87a45e2d64d3ae7c89401929946
+    expected_sha256=7fee44ff3ff71ed0064b32d4ec62fee6b58bd37c5887b12a86aedddc5af0c7b5
     ;;
   Linux/ARM64)
     asset=cargo-dist-aarch64-unknown-linux-gnu.tar.xz
-    expected_sha256=d29bcffeb3f8b0c517b4ce0dd2470926ed5cb0bb29d78c6bdd5f88d76ee14a6a
+    expected_sha256=58efb33edf01342875bfd0c3ce2befa9d73075579ca1b3e5dd75b98c88f92e83
     ;;
   macOS/X64)
     asset=cargo-dist-x86_64-apple-darwin.tar.xz
-    expected_sha256=6243464a8389e006b9256ee548bc795638f1a17113c1b6669c0e05ce89fd05c5
+    expected_sha256=6aa89bb1e7c18f51ae8b148ce2fc6ab00ac46ed8173d4f2ed9afa12101218773
     ;;
   macOS/ARM64)
     asset=cargo-dist-aarch64-apple-darwin.tar.xz
-    expected_sha256=aa343b2ff78ec2981f17a65140250c5ad6062c74072163f68c5c2686d94763a7
+    expected_sha256=d1eec30e63eed23e5a5bd48fe96eae314799811bffca254ec1d2264638ba1890
     ;;
   *)
     echo "unsupported cargo-dist runner: ${RUNNER_OS:-unset}/${RUNNER_ARCH:-unset}" >&2

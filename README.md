@@ -85,22 +85,23 @@ The tag-driven release workflow publishes this platform matrix:
 | `aarch64-apple-darwin` | Apple-silicon macOS | Native tar.xz archive |
 | `x86_64-pc-windows-msvc` | Windows x86-64 | Native ZIP archive and MSI installer |
 
-Windows ARM64 is not published because the pinned cargo-dist 0.32.0 target matrix does not support it. It must not be added until the release tool and a Windows ARM64 CI run have both been verified.
+Windows ARM64 is not published. It must not be added until release-tool support and a native Windows ARM64 CI run have both been verified.
 
 The static-Linux workflow builds each Linux target natively on its matching GitHub runner, rejects any ELF dynamic-library requirement with `file` and `readelf`, executes `--help`, and runs an offline Cargo fixture in a read-only `scratch` container with networking disabled. The uploaded CI artifact includes the binary and its SHA-256 checksum.
 
-Cargo-dist 0.32.0 generates the release plan and MSI definition. The checked-in workflow pins every external action by commit, runs formatting, all-target tests, strict Clippy, `cargo package --workspace --locked`, and a release-binary startup check before artifact jobs, then publishes the shell installer, Windows MSI, archives, source, and SHA-256 files. Host-phase GitHub artifact attestations bind every published file to the tag workflow. A release tag must resolve to the current protected `main` tip; release operations additionally require an active repository tag ruleset that prevents matching `v*` tags from being updated or deleted, and the host re-peels the remote tag before both draft creation and publication. The host verifies the complete checksum-bound inventory, creates a complete draft, and only then publishes it so repository-level release immutability can lock the tag and assets together. Workflow permissions default to read-only; only the host job receives `contents: write`, `id-token: write`, and `attestations: write`. `scripts/verify-release-workflow.sh` guards those pins, permissions, attestation scope, tag-target and remote-tag checks, immutable-ready publication order, and quality dependency.
+Cargo-dist 0.34.0 generates the release plan and MSI definition. The checked-in workflow pins every external action by commit, runs formatting, all-target tests, strict Clippy, `cargo package --workspace --locked`, and a release-binary startup check before artifact jobs, then publishes the shell installer, Windows MSI, archives, source, and SHA-256 files. Host-phase GitHub artifact attestations bind every published file to the tag workflow. A release tag must resolve to the current protected `main` tip; release operations additionally require an active repository tag ruleset that prevents matching `v*` tags from being updated or deleted, and the host re-peels the remote tag before both draft creation and publication. The host verifies the complete checksum-bound inventory, creates a complete draft, and only then publishes it so repository-level release immutability can lock the tag and assets together. Workflow permissions default to read-only; only the host job receives `contents: write`, `id-token: write`, and `attestations: write`. `scripts/verify-release-workflow.sh` guards those pins, permissions, attestation scope, tag-target and remote-tag checks, immutable-ready publication order, and quality dependency.
 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v2.0.4 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v2.0.5 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
 
-Security updates require a new binary: v2.0.4 includes the eMudhra intermediate-key
-distrust fix and patched Tokio. Keep operating-system and CI-runner trust stores
+Security updates require a new binary: v2.0.5 retains the eMudhra intermediate-key
+distrust fix and patched Tokio, and enforces a patched native Rustls dependency floor.
+Keep operating-system and CI-runner trust stores
 updated too; release installers use the runner's HTTPS client before DepScan starts.
 
 ## Usage
@@ -130,9 +131,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v2.0.4
+    uses: gedankrayze/depscan@v2.0.5
     with:
-      version: v2.0.4
+      version: v2.0.5
       path: .
       format: sarif
       output: depscan.sarif

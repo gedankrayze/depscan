@@ -37,6 +37,10 @@ zip.workspace = true
 # RUSTSEC-2026-0382: constrain the shared verifier even for consumers with an older lockfile.
 webpki.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# RUSTSEC-2026-0285/0346-0349: constrain native TLS for downstream stale locks.
+rustls.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # RUSTSEC-2026-0383: preserve a patched floor for the verifier's bundled-root edge.
 webpki-root-certs.workspace = true

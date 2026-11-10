@@ -43,3 +43,4 @@ if [[ -n "$incoming" ]]; then
 fi
 
 printf 'Pre-push PR check passed for %s: no incoming pull requests\n' "$repository"
+bash "$(dirname "$0")/check-dependency-freshness.sh"
