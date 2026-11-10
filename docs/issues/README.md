@@ -143,3 +143,4 @@ Allowed status values are `Open`, `In progress`, `Blocked`, and `Closed`. Do not
 | [DS-116](DS-116.md) | P2 | Closed | Refresh dependencies and revalidate known CVE exposure |
 | [DS-119](DS-119.md) | P2 | Closed | Refresh verified release tooling and action pins |
 | [DS-120](DS-120.md) | P1 | Closed | Enforce a patched Rustls floor for downstream locks |
+| [DS-121](DS-121.md) | P2 | Closed | Do not mistake SemVer build metadata for prereleases |

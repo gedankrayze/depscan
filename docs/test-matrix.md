@@ -231,6 +231,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-116 | Complete stable dependency refresh, fresh RustSec/live OSV checks, retained-MSRV suite, and untouched frozen fixtures |
 | DS-119 | Verified cargo-dist 0.34 bootstrap, current SHA-pinned actions, exact five-target/16-file plan, and local release gate |
 | DS-120 | Production security-floor guard, stale Rustls resolver/audit reproduction, and patched-floor conflict control |
+| DS-121 | Stable SemVer build metadata, real prerelease/yanked exclusions, and mocked sparse HTTP selection for WASI-style versions |
 
 ## Platform and external evidence boundary
 
