@@ -146,6 +146,7 @@ preserves access to the complete originals of 39 condensed closed records.
 | [DS-114](DS-114.md) | P2 | Closed | Refresh the complete product dependency graph |
 | [DS-115](DS-115.md) | P1 | Closed | Prepare the v2.0.4 security release |
 | [DS-116](DS-116.md) | P2 | Closed | Refresh dependencies and revalidate known CVE exposure |
+| [DS-117](DS-117.md) | P2 | Closed | Require fresh dependency checks and scoped post-push cleanup |
 | [DS-118](DS-118.md) | P2 | Closed | Keep issue records below a 500-word soft cap |
 | [DS-119](DS-119.md) | P2 | Closed | Refresh verified release tooling and action pins |
 | [DS-120](DS-120.md) | P1 | Closed | Enforce a patched Rustls floor for downstream locks |

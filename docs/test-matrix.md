@@ -229,6 +229,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-114 | Latest-compatible and incompatible-stable manifest checks, full lockfile refresh/dry-run, retained-MSRV suite, and documented upstream constraints |
 | DS-115 | v2.0.4 version/README/action/report/acceptance alignment, release gate, exact five-target/16-asset plan, and separate immutable public-artifact acceptance |
 | DS-116 | Complete stable dependency refresh, fresh RustSec/live OSV checks, retained-MSRV suite, and untouched frozen fixtures |
+| DS-117 | Ordered pre-push freshness, failure/offline/incoming-PR controls, real stale-file rejection, and scoped post-push cleanup policy |
 | DS-118 | 500/501-word soft-boundary controls, complete issue-size sweep, preserved historical identities and immutable full-record links |
 | DS-119 | Verified cargo-dist 0.34 bootstrap, current SHA-pinned actions, exact five-target/16-file plan, and local release gate |
 | DS-120 | Production security-floor guard, stale Rustls resolver/audit reproduction, and patched-floor conflict control |
