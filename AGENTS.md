@@ -39,6 +39,8 @@
 
 ## Repository workflows
 
+- Keep individual issue records near a 500-word soft cap. Link detailed historical
+  evidence or review notes instead of repeating logs; preserve IDs, status, and evidence.
 - Use the matching project skill under `.agents/skills/` for normal changes, PR triage,
   or releases.
 - Project hooks are guardrails, not authorization or complete security boundaries.

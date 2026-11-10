@@ -11,6 +11,7 @@ required_files=(
   .agents/skills/depscan-release/SKILL.md
   scripts/dev-gate.sh
   scripts/pre-push-check.sh
+  scripts/check-issue-size.py
   scripts/verify-ci-policy.sh
 )
 for required_file in "${required_files[@]}"; do
@@ -24,6 +25,8 @@ python3 -m json.tool .codex/hooks.json >/dev/null
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .codex/hooks/tests
 bash -n scripts/dev-gate.sh
 bash -n scripts/pre-push-check.sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-issue-size.py
 
 python3 - .agents/skills/*/SKILL.md <<'PY'
 import pathlib
