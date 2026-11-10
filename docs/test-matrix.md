@@ -228,6 +228,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-113 | 1,024 interval tick/cancellation/recreation cycles on four runtime workers, provider regressions, patched Tokio floor, and clean advisory audit |
 | DS-114 | Latest-compatible and incompatible-stable manifest checks, full lockfile refresh/dry-run, retained-MSRV suite, and documented upstream constraints |
 | DS-115 | v2.0.4 version/README/action/report/acceptance alignment, release gate, exact five-target/16-asset plan, and separate immutable public-artifact acceptance |
+| DS-116 | Complete stable dependency refresh, fresh RustSec/live OSV checks, retained-MSRV suite, and untouched frozen fixtures |
 
 ## Platform and external evidence boundary
 
