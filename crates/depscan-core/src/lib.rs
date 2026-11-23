@@ -10,6 +10,7 @@ mod osv;
 mod package;
 mod providers;
 mod scan;
+mod time;
 mod version;
 
 pub use constraint::{VersionConstraintError, latest_matching_version};
@@ -28,6 +29,7 @@ pub use osv::{
 pub use package::{ManifestConstraint, Package, dedup_packages};
 pub use providers::{EcosystemParser, VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome};
 pub use scan::{ScanDocument, ScanResult};
+pub use time::{Date, Duration, Timestamp, TimestampError};
 pub use version::{
     classify_staleness, compare_versions, pypi_version_is_prerelease, pypi_version_is_stable,
 };

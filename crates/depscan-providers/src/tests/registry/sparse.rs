@@ -77,7 +77,12 @@ async fn stale_sparse_index_revalidates_with_etag_and_refreshes_on_304() {
             Some("\"sparse-1\"".to_owned()),
         )
         .unwrap();
-    age_cache_entry(&cache, "registry", "crates:fixture", Duration::hours(7));
+    age_cache_entry(
+        &cache,
+        "registry",
+        "crates:fixture",
+        Duration::from_hours(7),
+    );
     let before = read_cache_entry(&cache, "registry", "crates:fixture").stored_at;
     let client = RegistryClient::with_crates_index_base_url(
         HttpClient::new().unwrap(),
@@ -131,7 +136,7 @@ async fn future_sparse_index_revalidates_before_reuse() {
             Some("\"sparse-future\"".to_owned()),
         )
         .unwrap();
-    let future = Utc::now() + Duration::days(1);
+    let future = Timestamp::now() + Duration::from_hours(24);
     set_cache_entry_timestamp(&cache, "registry", "crates:fixture", future);
     let client = RegistryClient::with_crates_index_base_url(
         HttpClient::new().unwrap(),
@@ -144,7 +149,7 @@ async fn future_sparse_index_revalidates_before_reuse() {
     assert_eq!(latest.latest.latest_stable, "2.0.0");
     let refreshed = read_cache_entry(&cache, "registry", "crates:fixture");
     assert!(refreshed.stored_at < future);
-    assert!(refreshed.stored_at <= Utc::now());
+    assert!(refreshed.stored_at <= Timestamp::now());
     assert_eq!(refreshed.etag.as_deref(), Some("\"sparse-future\""));
     server.verify().await;
 }
@@ -197,7 +202,12 @@ async fn late_sparse_304_cannot_overwrite_a_concurrent_changed_index() {
             Some("\"sparse-1\"".to_owned()),
         )
         .unwrap();
-    age_cache_entry(&cache, "registry", "crates:fixture", Duration::hours(7));
+    age_cache_entry(
+        &cache,
+        "registry",
+        "crates:fixture",
+        Duration::from_hours(7),
+    );
     let slow_client = RegistryClient::with_crates_index_base_url(
         HttpClient::new().unwrap(),
         cache.clone(),

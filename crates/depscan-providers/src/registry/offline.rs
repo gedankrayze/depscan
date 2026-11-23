@@ -3,14 +3,14 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct RegistryOffline {
     pub(crate) cache: Cache,
-    pub(crate) now: DateTime<Utc>,
+    pub(crate) now: Timestamp,
 }
 
 impl RegistryOffline {
     pub fn new(cache: Cache) -> Self {
         Self {
             cache,
-            now: Utc::now(),
+            now: Timestamp::now(),
         }
     }
 
@@ -26,7 +26,7 @@ impl RegistryOffline {
     pub(crate) fn cached_value_at(
         &self,
         package: &Package,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<Value, ProviderError> {
         let key = Self::cache_key(package);
         if !self.cache.policy.read {
@@ -98,13 +98,13 @@ impl RegistryOffline {
             .cache
             .policy
             .max_age
-            .unwrap_or_else(|| Duration::seconds(REGISTRY_TTL_SECS));
+            .unwrap_or_else(|| Duration::from_secs(REGISTRY_TTL_SECS));
         if age > max_age {
             return Err(ProviderError::Offline(format!(
                 "registry metadata for {} is unknown because the cached entry is stale ({} seconds old; maximum {} seconds)",
                 package.display_name,
-                age.num_seconds(),
-                max_age.num_seconds()
+                age.as_secs(),
+                max_age.as_secs()
             )));
         }
         Ok(entry.value)
@@ -113,7 +113,7 @@ impl RegistryOffline {
     pub(crate) fn latest_at(
         &self,
         package: &Package,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<LatestVersions, ProviderError> {
         let value = self.cached_value_at(package, now)?;
         let result = (|| -> Result<LatestVersions, ProviderError> {

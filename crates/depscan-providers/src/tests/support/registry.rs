@@ -57,9 +57,7 @@ pub(crate) fn pypi_package(name: &str) -> Package {
 pub(crate) fn cache_osv_document(cache: &Cache, package: &Package, id: &str) {
     let revision = OsvVulnerabilityRevision {
         id: id.to_owned(),
-        modified: DateTime::parse_from_rfc3339(TEST_OSV_MODIFIED)
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse(TEST_OSV_MODIFIED).unwrap(),
     };
     cache
         .put(

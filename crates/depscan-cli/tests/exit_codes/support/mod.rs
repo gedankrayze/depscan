@@ -1,4 +1,4 @@
-pub(crate) use chrono::Utc;
+pub(crate) use depscan_core::Timestamp;
 pub(crate) use sha2::{Digest, Sha256};
 pub(crate) use std::{
     collections::BTreeSet,
@@ -138,12 +138,7 @@ checksum = "1111111111111111111111111111111111111111111111111111111111111111""#
         seed_empty_cargo_dump(&self.cache);
     }
 
-    pub(crate) fn set_cache_timestamp(
-        &self,
-        namespace: &str,
-        digest: &str,
-        timestamp: chrono::DateTime<Utc>,
-    ) {
+    pub(crate) fn set_cache_timestamp(&self, namespace: &str, digest: &str, timestamp: Timestamp) {
         let path = self.cache.join(namespace).join(format!("{digest}.json"));
         let mut entry: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("read cache fixture"))
@@ -227,7 +222,7 @@ checksum = "1111111111111111111111111111111111111111111111111111111111111111""#
         fs::create_dir_all(&directory).expect("create cache namespace");
         let entry = format!(
             r#"{{"stored_at":"{}","etag":null,"value":{value}}}"#,
-            Utc::now().to_rfc3339()
+            Timestamp::now().to_rfc3339()
         );
         fs::write(directory.join(format!("{digest}.json")), entry).expect("write cache fixture");
     }

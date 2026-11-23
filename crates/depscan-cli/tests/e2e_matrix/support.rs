@@ -1,4 +1,4 @@
-use chrono::Utc;
+use depscan_core::Timestamp;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -227,7 +227,7 @@ fn seed_empty_dump(cache: &Path, dump_name: &str) {
     .expect("finish empty OSV fixture archive");
     fs::write(
         offline.join(format!("{dump_name}.synced-at")),
-        Utc::now().to_rfc3339(),
+        Timestamp::now().to_rfc3339(),
     )
     .expect("write offline archive timestamp");
 }

@@ -40,7 +40,7 @@ pub(super) async fn scan(prepared: PreparedScan) -> Result<AppExit, CliError> {
         confined_output,
     } = prepared;
     let generated_at = scan_timestamp()?;
-    let policy_date = Utc::now().date_naive();
+    let policy_date = Timestamp::now().date();
     let max_cache_age = args.max_cache_age.map(|age| age.0);
     let mut suppression_rules = args
         .ignore
@@ -233,10 +233,10 @@ fn suppression_matches(
     matches
 }
 
-fn scan_timestamp() -> Result<DateTime<Utc>, CliError> {
+fn scan_timestamp() -> Result<Timestamp, CliError> {
     let value = match std::env::var("SOURCE_DATE_EPOCH") {
         Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(Utc::now()),
+        Err(std::env::VarError::NotPresent) => return Ok(Timestamp::now()),
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(CliError::usage(
                 "SOURCE_DATE_EPOCH must be a UTF-8 integer number of seconds since the Unix epoch",
@@ -248,7 +248,7 @@ fn scan_timestamp() -> Result<DateTime<Utc>, CliError> {
             "SOURCE_DATE_EPOCH must be an integer number of seconds since the Unix epoch",
         )
     })?;
-    let timestamp = DateTime::<Utc>::from_timestamp(seconds, 0).ok_or_else(|| {
+    let timestamp = Timestamp::from_timestamp(seconds, 0).ok_or_else(|| {
         CliError::usage("SOURCE_DATE_EPOCH is outside the supported UTC timestamp range")
     })?;
     debug!(%timestamp, "reproducible scan timestamp selected from SOURCE_DATE_EPOCH");

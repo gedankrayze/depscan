@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use crate::Date;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
@@ -70,7 +70,7 @@ pub struct SuppressionMatch {
     pub matched_id: String,
     pub source: SuppressionSource,
     pub reason: Option<String>,
-    pub expires: Option<NaiveDate>,
+    pub expires: Option<Date>,
     pub state: SuppressionState,
 }
 

@@ -16,7 +16,7 @@ impl Default for CachePolicy {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct CacheEntry {
-    pub(crate) stored_at: DateTime<Utc>,
+    pub(crate) stored_at: Timestamp,
     pub(crate) etag: Option<String>,
     pub(crate) value: Value,
 }
@@ -154,13 +154,13 @@ impl Cache {
         serde_json::from_str(&text).ok()
     }
     pub(crate) fn lookup_from_entry(&self, entry: CacheEntry, ttl: Duration) -> CacheLookup {
-        self.lookup_from_entry_at(entry, ttl, Utc::now())
+        self.lookup_from_entry_at(entry, ttl, Timestamp::now())
     }
     pub(crate) fn lookup_from_entry_at(
         &self,
         entry: CacheEntry,
         ttl: Duration,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> CacheLookup {
         let limit = self
             .policy
@@ -187,7 +187,7 @@ impl Cache {
         etag: Option<String>,
     ) -> Result<(), ProviderError> {
         let entry = CacheEntry {
-            stored_at: Utc::now(),
+            stored_at: Timestamp::now(),
             etag,
             value: value.clone(),
         };

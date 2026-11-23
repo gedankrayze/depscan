@@ -5,7 +5,7 @@ fn report_epoch_cannot_reactivate_an_expired_suppression() {
     let project = TestProject::rust("suppression-wall-clock");
     project.seed_clean("1.0.0");
     project.seed_vulnerability();
-    let yesterday = chrono::Utc::now().date_naive().pred_opt().unwrap();
+    let yesterday = depscan_core::Timestamp::now().date().yesterday().unwrap();
     let config = project.directory.path().join("policy.toml");
     fs::write(
         &config,
@@ -35,7 +35,7 @@ fn future_report_epoch_does_not_expire_an_active_suppression() {
     let project = TestProject::rust("suppression-future-report");
     project.seed_clean("1.0.0");
     project.seed_vulnerability();
-    let tomorrow = chrono::Utc::now().date_naive().succ_opt().unwrap();
+    let tomorrow = depscan_core::Timestamp::now().date().tomorrow().unwrap();
     let config = project.directory.path().join("policy.toml");
     fs::write(
         &config,

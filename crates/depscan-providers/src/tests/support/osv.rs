@@ -74,7 +74,7 @@ pub(crate) fn write_fixture_archives(root: &Path, fixtures: &[OsvRangeFixture]) 
                 "{}.synced-at",
                 ecosystem.osv_name().replace('.', "_")
             )),
-            Utc::now().to_rfc3339(),
+            Timestamp::now().to_rfc3339(),
         )
         .unwrap();
     }

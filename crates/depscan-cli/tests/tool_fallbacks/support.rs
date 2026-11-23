@@ -1,4 +1,4 @@
-use chrono::Utc;
+use depscan_core::Timestamp;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -179,7 +179,7 @@ impl Fixture {
         .expect("finish empty OSV dump");
         fs::write(
             offline.join(format!("{ecosystem}.synced-at")),
-            Utc::now().to_rfc3339(),
+            Timestamp::now().to_rfc3339(),
         )
         .expect("write dump timestamp");
     }
@@ -214,7 +214,7 @@ impl Fixture {
         fs::write(
             directory.join(format!("{filename}.json")),
             serde_json::to_vec(&serde_json::json!({
-                "stored_at": Utc::now().to_rfc3339(),
+                "stored_at": Timestamp::now().to_rfc3339(),
                 "etag": null,
                 "value": value,
             }))

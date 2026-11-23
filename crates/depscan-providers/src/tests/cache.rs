@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn common_cache_freshness_rejects_future_timestamps_and_honors_boundaries() {
-    fn entry(stored_at: DateTime<Utc>) -> CacheEntry {
+    fn entry(stored_at: Timestamp) -> CacheEntry {
         CacheEntry {
             stored_at,
             etag: None,
@@ -11,7 +11,7 @@ fn common_cache_freshness_rejects_future_timestamps_and_honors_boundaries() {
     }
 
     let now = test_timestamp("2026-08-19T12:00:00Z");
-    let ttl = Duration::hours(1);
+    let ttl = Duration::from_hours(1);
     let cache = Cache {
         root: PathBuf::new(),
         policy: CachePolicy::default(),
@@ -21,16 +21,16 @@ fn common_cache_freshness_rejects_future_timestamps_and_honors_boundaries() {
     assert!(cache.lookup_from_entry_at(entry(now - ttl), ttl, now).fresh);
     assert!(
         !cache
-            .lookup_from_entry_at(entry(now - ttl - Duration::nanoseconds(1)), ttl, now)
+            .lookup_from_entry_at(entry(now - ttl - Duration::new(0, 1)), ttl, now)
             .fresh
     );
     assert!(
         !cache
-            .lookup_from_entry_at(entry(now + Duration::nanoseconds(1)), ttl, now)
+            .lookup_from_entry_at(entry(now + Duration::new(0, 1)), ttl, now)
             .fresh
     );
 
-    let max_age = Duration::minutes(30);
+    let max_age = Duration::from_mins(30);
     let strict = Cache {
         root: PathBuf::new(),
         policy: CachePolicy {
@@ -45,12 +45,12 @@ fn common_cache_freshness_rejects_future_timestamps_and_honors_boundaries() {
     );
     assert!(
         !strict
-            .lookup_from_entry_at(entry(now - max_age - Duration::nanoseconds(1)), ttl, now,)
+            .lookup_from_entry_at(entry(now - max_age - Duration::new(0, 1)), ttl, now,)
             .fresh
     );
     assert!(
         !strict
-            .lookup_from_entry_at(entry(now + Duration::nanoseconds(1)), ttl, now)
+            .lookup_from_entry_at(entry(now + Duration::new(0, 1)), ttl, now)
             .fresh
     );
 }
@@ -62,7 +62,7 @@ fn future_concurrent_winner_remains_a_non_reusable_cas_generation() {
         root: cache_dir.path().to_path_buf(),
         policy: CachePolicy::default(),
     };
-    let ttl = Duration::hours(1);
+    let ttl = Duration::from_hours(1);
     cache
         .put("registry", "future-conflict", &json!({"revision": 1}), None)
         .unwrap();
@@ -76,7 +76,7 @@ fn future_concurrent_winner_remains_a_non_reusable_cas_generation() {
         &cache,
         "registry",
         "future-conflict",
-        Utc::now() + Duration::days(1),
+        Timestamp::now() + Duration::from_hours(24),
     );
 
     let conflict = cache
@@ -108,7 +108,7 @@ async fn cache_publication_under_lock_contention_keeps_the_runtime_responsive() 
         root: cache_dir.path().to_path_buf(),
         policy: CachePolicy::default(),
     };
-    let ttl = Duration::hours(1);
+    let ttl = Duration::from_hours(1);
     let namespace = cache
         .filename("registry", "contended")
         .parent()

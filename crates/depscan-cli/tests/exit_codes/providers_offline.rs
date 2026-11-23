@@ -126,7 +126,7 @@ fn offline_registry_stale_and_missing_entries_are_unknown_with_reasons() {
     stale.set_cache_timestamp(
         "registry",
         REGISTRY_DIGEST,
-        Utc::now() - chrono::Duration::days(2),
+        Timestamp::now() - depscan_core::Duration::from_hours(48),
     );
 
     let stale_output = stale.run(&[
@@ -204,7 +204,7 @@ fn offline_dump_warns_after_seven_days_and_max_age_rejects_it() {
     let marker = project.cache.join("offline/crates_io.synced-at");
     fs::write(
         &marker,
-        (Utc::now() - chrono::Duration::days(8)).to_rfc3339(),
+        (Timestamp::now() - depscan_core::Duration::from_hours(192)).to_rfc3339(),
     )
     .expect("age offline marker");
 

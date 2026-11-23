@@ -114,7 +114,7 @@ pub(crate) async fn sync_osv_dumps_with_config(
                 let mut marker_temp =
                     CapabilityTempFile::new(&marker_dir, &prefix, ".synced-at.tmp")?;
                 marker_temp
-                    .write_all(Utc::now().to_rfc3339().as_bytes())
+                    .write_all(Timestamp::now().to_rfc3339().as_bytes())
                     .and_then(|_| marker_temp.as_file().sync_all())
                     .map_err(|error| ProviderError::Cache(error.to_string()))?;
                 Ok::<_, ProviderError>(marker_temp)
