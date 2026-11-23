@@ -1,0 +1,6 @@
+# Ubuntu 26.04 is a GitHub-hosted production image; actionlint 1.7.12's
+# built-in label list predates it. Extend only the verified missing label.
+# https://github.com/actions/runner-images/issues/14747
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

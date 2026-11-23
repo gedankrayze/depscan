@@ -94,12 +94,12 @@ Cargo-dist 0.34.0 generates the release plan and MSI definition. The checked-in 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v2.0.5 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v3.0.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
 
-Security updates require a new binary: v2.0.5 retains the eMudhra intermediate-key
+Security updates require a new binary: v3.0.0 retains the eMudhra intermediate-key
 distrust fix and patched Tokio, and enforces a patched native Rustls dependency floor.
 Keep operating-system and CI-runner trust stores
 updated too; release installers use the runner's HTTPS client before DepScan starts.
@@ -131,9 +131,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v2.0.5
+    uses: gedankrayze/depscan@v3.0.0
     with:
-      version: v2.0.5
+      version: v3.0.0
       path: .
       format: sarif
       output: depscan.sarif
@@ -240,6 +240,11 @@ Every archive is revalidated while it is scanned, using the same ZIP, OSV docume
 Version freshness is evaluated from cached registry metadata when a usable entry exists. The normal six-hour registry TTL applies by default; an explicit `--max-cache-age` selects the age that an offline scan is willing to tolerate. Missing, stale, future-dated, corrupt, or `--no-cache` entries produce an `Unknown` freshness result and an explicit per-package reason in the report. No registry request is attempted in any of those cases.
 
 ## Development
+
+The [v3.0.0 migration and release notes](docs/releases/v3.0.0.md) describe the
+public Rust time-type changes from Chrono to `depscan_core::{Timestamp, Date,
+Duration}`. CLI commands and JSON schema 4 retain their existing contracts;
+unsupported timestamp inputs now fail explicitly as documented above.
 
 The pinned toolchain is Rust 1.100.0 (verified on 2026-11-23), with a supported MSRV of Rust 1.96.0 retained for compatibility. The N−2 stable policy remains the target for scheduled MSRV reviews; this update does not raise the supported floor. Toolchain updates must coordinate native CI pins, release-quality commands, and the digest-pinned static builder image, then verify both stable and MSRV before merging.
 

@@ -238,6 +238,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-123 | const-oid 0.10.3 and rustls-pki-types 1.16.0 graph/MSRV checks, TLS incident and control-chain regressions, full deterministic suite/strict Clippy, fresh dependency audit, and hosted native/MSRV checks |
 | DS-124 | Coordinated Rust 1.100.0 pins/image, external executable validation, combined incoming dependency graph, and retained MSRV |
 | DS-125 | Maintained time dependency, timestamp/cache wire compatibility, actual-clock suppression/TTL boundaries, and warning-free fresh audit |
+| DS-126 | v3.0.0 workspace/action/README/report/acceptance alignment, Rust API migration notes, release/MSRV/freshness gates, exact asset plan, and separate immutable/native public acceptance |
 
 ## Platform and external evidence boundary
 
