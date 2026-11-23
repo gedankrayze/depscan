@@ -194,7 +194,7 @@ async fn paginates_queries_independently_and_caches_complete_deduplicated_ids() 
             .get(
                 "osv/query",
                 &osv_query_cache_key(package),
-                Duration::seconds(OSV_QUERY_TTL_SECS),
+                Duration::from_secs(OSV_QUERY_TTL_SECS),
             )
             .expect("complete paginated query cache entry");
         assert_eq!(cached, expected);
@@ -237,7 +237,7 @@ async fn rejects_a_regressing_osv_query_revision_without_downgrading_cache() {
             None,
         )
         .unwrap();
-    age_cache_entry(&cache, "osv/query", &query_key, Duration::hours(2));
+    age_cache_entry(&cache, "osv/query", &query_key, Duration::from_hours(2));
     let before = read_cache_entry(&cache, "osv/query", &query_key);
     let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
 

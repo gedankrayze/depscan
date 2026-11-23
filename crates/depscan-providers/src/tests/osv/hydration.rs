@@ -331,9 +331,7 @@ async fn hydration_and_evaluation_failures_preserve_other_advisories() {
     }));
     let failed_revision = OsvVulnerabilityRevision {
         id: hydration_failure.to_owned(),
-        modified: DateTime::parse_from_rfc3339(TEST_OSV_MODIFIED)
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse(TEST_OSV_MODIFIED).unwrap(),
     };
     assert!(
         !cache

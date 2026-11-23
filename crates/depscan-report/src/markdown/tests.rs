@@ -1,6 +1,6 @@
 use super::*;
 use crate::OutputFormat;
-use chrono::{TimeZone, Utc};
+use depscan_core::Timestamp;
 use depscan_core::{
     Ecosystem, EnrichError, LatestVersions, Package, Severity, Staleness, SuppressedFinding,
     SuppressionMatch, SuppressionSource, Vulnerability,
@@ -52,13 +52,13 @@ fn renders_complete_auditable_sections_and_escapes_untrusted_cells() {
                 }],
             }],
         }],
-        Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap(),
+        Timestamp::parse("2026-08-20T12:00:00Z").unwrap(),
     );
 
     let rendered = render_markdown(&document);
 
     assert!(rendered.starts_with(
-        "# depscan report\n\n_Gedank Rayze DepScan, v2.0.5, \
+        "# depscan report\n\n_Gedank Rayze DepScan, v3.0.0, \
          [https://github.com/gedankrayze/depscan](https://github.com/gedankrayze/depscan)_\n\n\
          Generated: `2026-08-20T12:00:00+00:00`"
     ));
@@ -81,7 +81,7 @@ fn renders_complete_auditable_sections_and_escapes_untrusted_cells() {
 
 #[test]
 fn empty_document_names_every_empty_audit_section() {
-    let document = ScanDocument::at(vec![], Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap());
+    let document = ScanDocument::at(vec![], Timestamp::parse("2026-08-20T12:00:00Z").unwrap());
 
     let rendered = render_markdown(&document);
 

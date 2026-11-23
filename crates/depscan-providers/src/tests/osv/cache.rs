@@ -15,9 +15,7 @@ async fn hydration_cache_keys_never_downgrade_newer_alias_documents() {
     let id = "TEST-HYDRATION-MONOTONIC-1";
     let requested = OsvVulnerabilityRevision {
         id: id.to_owned(),
-        modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse("2026-08-18T00:00:00Z").unwrap(),
     };
     let newer_document = json!({
         "id": id,
@@ -65,9 +63,7 @@ async fn cache_bypass_publication_preserves_the_newer_disk_winner() {
     let id = "TEST-HYDRATION-BYPASS-1";
     let revision = OsvVulnerabilityRevision {
         id: id.to_owned(),
-        modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse("2026-08-18T00:00:00Z").unwrap(),
     };
     let cached_newer = json!({
         "id": id,
@@ -103,15 +99,11 @@ async fn newer_hydration_is_reused_under_the_requested_revision_without_etag_ali
     let id = "TEST-HYDRATION-ALIAS-1";
     let requested = OsvVulnerabilityRevision {
         id: id.to_owned(),
-        modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse("2026-08-18T00:00:00Z").unwrap(),
     };
     let actual = OsvVulnerabilityRevision {
         id: id.to_owned(),
-        modified: DateTime::parse_from_rfc3339("2026-08-19T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse("2026-08-19T00:00:00Z").unwrap(),
     };
     let document = json!({
         "id": id,
@@ -190,7 +182,7 @@ async fn future_hydration_entry_is_not_reused_without_network_validation() {
         &cache,
         "osv/vuln",
         &revision.cache_key(),
-        Utc::now() + Duration::days(1),
+        Timestamp::now() + Duration::from_hours(24),
     );
     let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
 
@@ -212,15 +204,11 @@ async fn cache_bypass_returns_network_hydration_but_aliases_the_newer_disk_winne
     let id = "TEST-HYDRATION-BYPASS-ALIAS-1";
     let requested = OsvVulnerabilityRevision {
         id: id.to_owned(),
-        modified: DateTime::parse_from_rfc3339("2026-08-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse("2026-08-18T00:00:00Z").unwrap(),
     };
     let actual = OsvVulnerabilityRevision {
         id: id.to_owned(),
-        modified: DateTime::parse_from_rfc3339("2026-08-19T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        modified: Timestamp::parse("2026-08-19T00:00:00Z").unwrap(),
     };
     let network_document = json!({
         "id": id,
@@ -324,7 +312,7 @@ async fn cache_bypass_ignores_a_future_dated_stale_osv_revision() {
         &cache,
         "osv/query",
         &query_key,
-        Utc::now() + Duration::days(1),
+        Timestamp::now() + Duration::from_hours(24),
     );
     let client = OsvClient::with_base_url(HttpClient::new().unwrap(), cache.clone(), server.uri());
 

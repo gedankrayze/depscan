@@ -41,9 +41,9 @@ fn certificates(pem: &str) -> Vec<CertificateDer<'static>> {
 }
 
 fn verification_time() -> UnixTime {
-    let seconds = chrono::DateTime::parse_from_rfc3339("2026-10-23T12:00:00Z")
+    let seconds = depscan_core::Timestamp::parse("2026-10-23T12:00:00Z")
         .unwrap()
-        .timestamp();
+        .as_second();
     UnixTime::since_unix_epoch(Duration::from_secs(seconds.try_into().unwrap()))
 }
 

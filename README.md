@@ -94,12 +94,12 @@ Cargo-dist 0.34.0 generates the release plan and MSI definition. The checked-in 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v2.0.5 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v3.0.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
 
-Security updates require a new binary: v2.0.5 retains the eMudhra intermediate-key
+Security updates require a new binary: v3.0.0 retains the eMudhra intermediate-key
 distrust fix and patched Tokio, and enforces a patched native Rustls dependency floor.
 Keep operating-system and CI-runner trust stores
 updated too; release installers use the runner's HTTPS client before DepScan starts.
@@ -131,9 +131,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v2.0.5
+    uses: gedankrayze/depscan@v3.0.0
     with:
-      version: v2.0.5
+      version: v3.0.0
       path: .
       format: sarif
       output: depscan.sarif
@@ -159,6 +159,8 @@ SOURCE_DATE_EPOCH=1700000000 depscan scan . --format json --output depscan.json
 In that mode, equivalent scan results have canonical package, vulnerability, alias, fix, reference, suppression, and error ordering. An invalid or out-of-range epoch is a configuration error and exits with code `10`.
 
 `SOURCE_DATE_EPOCH` changes report time only. Suppression expiry always uses the real UTC scan date, so reproducing an older report cannot reactivate an expired exception. SARIF omits unavailable advisory help links and URI-encodes source paths, including native Windows paths.
+
+Shared timestamps use maintained Jiff time types while retaining the existing UTC report/cache encoding and nanosecond precision. Inputs require seconds and an explicit RFC 3339 offset; unsupported years, leap seconds, and fractions longer than nine digits are rejected rather than silently normalized. Suppression expiry remains a date (`YYYY-MM-DD`).
 
 The current JSON report schema is version `4`. Version `1` represented `results[].suppressed` as advisory-ID strings; version `2` replaced those strings with audit objects containing the complete vulnerability, whether the suppression was active, and every matching rule's ID/alias, CLI/config source, reason, expiry, and active/expired state. Version `3` adds `results[].package.direct_known` and `dev_known` so unknown classifications are no longer serialized as apparent facts. Version `4` adds `results[].package.manifest_constraint`, retaining both its source spelling (`raw`) and registry-standard evaluator form (`normalized`). Consumers must branch on `schema_version`. Only matching suppression and manifest-constraint fields are emitted—other configuration values are never copied into a report.
 
@@ -239,7 +241,12 @@ Version freshness is evaluated from cached registry metadata when a usable entry
 
 ## Development
 
-The pinned toolchain is Rust 1.99.1 (verified on 2026-10-20), with a supported MSRV of Rust 1.96.0 retained for compatibility. The N−2 stable policy remains the target for scheduled MSRV reviews; this update does not raise the supported floor. Toolchain updates must coordinate native CI pins, release-quality commands, and the digest-pinned static builder image, then verify both stable and MSRV before merging.
+The [v3.0.0 migration and release notes](docs/releases/v3.0.0.md) describe the
+public Rust time-type changes from Chrono to `depscan_core::{Timestamp, Date,
+Duration}`. CLI commands and JSON schema 4 retain their existing contracts;
+unsupported timestamp inputs now fail explicitly as documented above.
+
+The pinned toolchain is Rust 1.100.0 (verified on 2026-11-23), with a supported MSRV of Rust 1.96.0 retained for compatibility. The N−2 stable policy remains the target for scheduled MSRV reviews; this update does not raise the supported floor. Toolchain updates must coordinate native CI pins, release-quality commands, and the digest-pinned static builder image, then verify both stable and MSRV before merging.
 
 The workspace is divided at its architectural boundaries:
 

@@ -144,7 +144,7 @@ pub(crate) fn seed_empty_osv_dump(cache: &Path, ecosystem: &str) {
     .expect("finish empty offline dump");
     fs::write(
         offline.join(format!("{ecosystem}.synced-at")),
-        Utc::now().to_rfc3339(),
+        Timestamp::now().to_rfc3339(),
     )
     .expect("write offline dump timestamp");
 }
@@ -170,8 +170,11 @@ pub(crate) fn seed_cargo_dump_entry(cache: &Path, name: &str, contents: &[u8]) {
         .write_all(contents)
         .expect("write offline advisory entry");
     archive.finish().expect("finish malformed offline dump");
-    fs::write(offline.join("crates_io.synced-at"), Utc::now().to_rfc3339())
-        .expect("write offline dump timestamp");
+    fs::write(
+        offline.join("crates_io.synced-at"),
+        Timestamp::now().to_rfc3339(),
+    )
+    .expect("write offline dump timestamp");
 }
 
 pub(crate) fn report_packages(report: &serde_json::Value) -> &[serde_json::Value] {

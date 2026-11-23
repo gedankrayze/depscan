@@ -8,12 +8,11 @@ use cap_std::{
     ambient_authority,
     fs::{Dir as CapDir, OpenOptions as CapOpenOptions},
 };
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use cvss::Cvss;
 use depscan_core::{
-    Ecosystem, EnrichError, FileIdentity, LatestVersions, NuGetVersion, Package, ProviderError,
-    RegistryEnrichment, Severity, VersionProvider, VulnMap, VulnProvider, VulnQueryOutcome,
-    Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
+    Duration, Ecosystem, EnrichError, FileIdentity, LatestVersions, NuGetVersion, Package,
+    ProviderError, RegistryEnrichment, Severity, Timestamp, VersionProvider, VulnMap, VulnProvider,
+    VulnQueryOutcome, Vulnerability, classify_staleness, compare_versions, evaluate_osv_affected,
     latest_matching_version, normalize_name, osv_affected_identity_matches,
     pypi_version_is_prerelease, pypi_version_is_stable,
 };

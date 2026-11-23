@@ -1,11 +1,10 @@
-use chrono::{DateTime, Utc};
-use depscan_core::ProviderError;
+use depscan_core::{ProviderError, Timestamp};
 use serde_json::{Map, Value};
 
 #[derive(Debug)]
 pub(super) struct ValidatedOsvDocument<'a> {
     pub(super) id: &'a str,
-    pub(super) modified: DateTime<Utc>,
+    pub(super) modified: Timestamp,
     pub(super) affected: &'a [Value],
     pub(super) withdrawn: bool,
 }
@@ -49,19 +48,17 @@ fn string_field<'a>(
     Ok(value)
 }
 
-fn timestamp(value: &Value, path: &str) -> Result<DateTime<Utc>, String> {
+fn timestamp(value: &Value, path: &str) -> Result<Timestamp, String> {
     let raw = value
         .as_str()
         .ok_or_else(|| format!("{path} must be an RFC 3339 string"))?;
-    DateTime::parse_from_rfc3339(raw)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|_| format!("{path} must be a valid RFC 3339 timestamp"))
+    Timestamp::parse(raw).map_err(|_| format!("{path} must be a valid RFC 3339 timestamp"))
 }
 
 fn optional_timestamp(
     object: &Map<String, Value>,
     field: &str,
-) -> Result<Option<DateTime<Utc>>, String> {
+) -> Result<Option<Timestamp>, String> {
     object
         .get(field)
         .map(|value| timestamp(value, field))

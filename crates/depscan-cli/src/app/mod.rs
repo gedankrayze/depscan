@@ -3,13 +3,12 @@ use crate::{
     secure_fs::{ConfinedOutput, ScanRoot, read_config_nofollow},
     vulnerability_resolution::{OsvIdentityPolicy, VulnerabilityQueryPlan},
 };
-use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::{generate, shells};
 use depscan_core::{
-    Ecosystem, EnrichError, LatestVersions, Package, RegistryEnrichment, ScanDocument, ScanResult,
-    Severity, Staleness, SuppressedFinding, SuppressionMatch, SuppressionSource, SuppressionState,
-    VersionProvider, VulnProvider, Vulnerability,
+    Date, Duration, Ecosystem, EnrichError, LatestVersions, Package, RegistryEnrichment,
+    ScanDocument, ScanResult, Severity, Staleness, SuppressedFinding, SuppressionMatch,
+    SuppressionSource, SuppressionState, Timestamp, VersionProvider, VulnProvider, Vulnerability,
 };
 use depscan_parsers::{ParserSet, parse_bun_manifest_fallback};
 use depscan_providers::{
@@ -202,19 +201,24 @@ impl FromStr for CacheAge {
         let amount = value[..split]
             .parse::<i64>()
             .map_err(|_| format!("duration {value:?} is outside the supported range"))?;
-        let duration = match &value[split..] {
-            "s" => Duration::try_seconds(amount),
-            "m" => Duration::try_minutes(amount),
-            "h" => Duration::try_hours(amount),
-            "d" => Duration::try_days(amount),
+        let seconds_per_unit = match &value[split..] {
+            "s" => 1,
+            "m" => 60,
+            "h" => 60 * 60,
+            "d" => 24 * 60 * 60,
             _ => {
                 return Err(format!(
                     "duration {value:?} has an invalid unit; use values such as 30m, 24h, or 7d"
                 ));
             }
-        }
-        .ok_or_else(|| format!("duration {value:?} is outside the supported range"))?;
-        Ok(Self(duration))
+        };
+        // Retain the established i64-millisecond bound even though Jiff can
+        // represent larger durations. Never overflow while scaling user input.
+        let milliseconds = amount
+            .checked_mul(seconds_per_unit)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .ok_or_else(|| format!("duration {value:?} is outside the supported range"))?;
+        Ok(Self(Duration::from_millis(milliseconds)))
     }
 }
 

@@ -1,5 +1,4 @@
 use super::*;
-use chrono::{DateTime, NaiveDate, Utc};
 use std::{cmp::Ordering, path::PathBuf};
 
 #[test]
@@ -254,7 +253,7 @@ fn scan_document_uses_an_injected_clock_and_canonical_collection_order() {
                         matched_id: "Z-SUPPRESSED".to_owned(),
                         source: SuppressionSource::Config,
                         reason: Some("temporary exception".to_owned()),
-                        expires: NaiveDate::from_ymd_opt(2030, 1, 1),
+                        expires: Date::new(2030, 1, 1).ok(),
                         state: SuppressionState::Active,
                     },
                     SuppressionMatch {
@@ -269,7 +268,7 @@ fn scan_document_uses_an_injected_clock_and_canonical_collection_order() {
         }
     }
 
-    let timestamp = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let timestamp = Timestamp::from_timestamp(1_700_000_000, 0).unwrap();
     let first = ScanDocument::at(
         vec![
             result("z-package", &["Z-ALIAS", "A-ALIAS"]),
@@ -306,11 +305,11 @@ fn scan_document_uses_an_injected_clock_and_canonical_collection_order() {
 
 #[test]
 fn scan_document_new_uses_a_current_utc_timestamp() {
-    let before = Utc::now();
+    let before = Timestamp::now();
     let document = ScanDocument::new(Vec::new());
-    let after = Utc::now();
+    let after = Timestamp::now();
 
     assert!(document.generated_at >= before);
     assert!(document.generated_at <= after);
-    assert_eq!(document.generated_at.timezone(), Utc);
+    assert!(document.generated_at.to_rfc3339_z().ends_with('Z'));
 }

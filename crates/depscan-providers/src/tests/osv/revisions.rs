@@ -1,5 +1,32 @@
 use super::*;
 
+#[test]
+fn legacy_fractional_revision_cache_keys_remain_stable() {
+    let revisions = canonical_osv_revisions(json!([
+        {"id": "GHSA-TEST", "modified": "2026-08-20T14:00:00.1+02:00"},
+        {"id": "GHSA-TEST", "modified": "2026-08-20T12:00:00.100000000Z"}
+    ]))
+    .unwrap();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(
+        revisions[0].cache_key(),
+        "GHSA-TEST@2026-08-20T12:00:00.100Z"
+    );
+    assert_eq!(
+        serde_json::to_value(&revisions).unwrap(),
+        json!([
+            {"id": "GHSA-TEST", "modified": "2026-08-20T12:00:00.100Z"}
+        ])
+    );
+    assert!(
+        canonical_osv_revisions(json!([
+            {"id": "GHSA-TEST", "modified": "2016-12-31T23:59:60Z"}
+        ]))
+        .is_none()
+    );
+    assert!(parse_osv_modified(&json!("2016-12-31T23:59:60Z"), "test").is_err());
+}
+
 #[tokio::test]
 async fn concurrent_osv_query_refresh_retries_instead_of_publishing_stale_results() {
     let server = MockServer::start().await;
@@ -80,7 +107,7 @@ async fn concurrent_osv_query_refresh_retries_instead_of_publishing_stale_result
             None,
         )
         .unwrap();
-    age_cache_entry(&cache, "osv/query", &query_key, Duration::hours(2));
+    age_cache_entry(&cache, "osv/query", &query_key, Duration::from_hours(2));
     let slow_client = OsvClient::with_base_url(
         HttpClient::new().unwrap(),
         cache.clone(),
@@ -215,7 +242,7 @@ async fn query_revisions_invalidate_legacy_and_changed_hydrated_advisories() {
         &cache,
         "osv/query",
         &osv_query_cache_key(&package),
-        Duration::hours(2),
+        Duration::from_hours(2),
     );
     let second_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -257,7 +284,7 @@ async fn query_revisions_invalidate_legacy_and_changed_hydrated_advisories() {
         &cache,
         "osv/query",
         &osv_query_cache_key(&package),
-        Duration::hours(2),
+        Duration::from_hours(2),
     );
     let unchanged_server = MockServer::start().await;
     Mock::given(method("POST"))

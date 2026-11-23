@@ -107,7 +107,12 @@ async fn conflicting_fresh_winner_is_adopted_without_a_second_request() {
     cache
         .put("registry", "conflict-budget", &json!({"revision": 1}), None)
         .unwrap();
-    age_cache_entry(&cache, "registry", "conflict-budget", Duration::hours(7));
+    age_cache_entry(
+        &cache,
+        "registry",
+        "conflict-budget",
+        Duration::from_hours(7),
+    );
     let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
 
     // While the single fetch is in flight, a concurrent writer publishes a fresh winner. The

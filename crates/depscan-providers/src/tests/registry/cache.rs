@@ -23,7 +23,7 @@ async fn stale_registry_metadata_revalidates_with_etag_and_refreshes_on_304() {
             Some("\"revision-1\"".to_owned()),
         )
         .unwrap();
-    age_cache_entry(&cache, "registry", "etag-304", Duration::hours(7));
+    age_cache_entry(&cache, "registry", "etag-304", Duration::from_hours(7));
     let before = read_cache_entry(&cache, "registry", "etag-304").stored_at;
     let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
 
@@ -67,7 +67,7 @@ async fn future_registry_metadata_revalidates_before_reuse() {
             Some("\"revision-future\"".to_owned()),
         )
         .unwrap();
-    let future = Utc::now() + Duration::days(1);
+    let future = Timestamp::now() + Duration::from_hours(24);
     set_cache_entry_timestamp(&cache, "registry", "future-etag", future);
     let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
 
@@ -83,7 +83,7 @@ async fn future_registry_metadata_revalidates_before_reuse() {
     assert_eq!(value, json!({"revision": 1}));
     let refreshed = read_cache_entry(&cache, "registry", "future-etag");
     assert!(refreshed.stored_at < future);
-    assert!(refreshed.stored_at <= Utc::now());
+    assert!(refreshed.stored_at <= Timestamp::now());
     assert_eq!(refreshed.etag.as_deref(), Some("\"revision-future\""));
     server.verify().await;
 }
@@ -127,7 +127,12 @@ async fn late_registry_304_cannot_overwrite_a_concurrent_changed_response() {
             Some("\"revision-1\"".to_owned()),
         )
         .unwrap();
-    age_cache_entry(&cache, "registry", "revalidation-race", Duration::hours(7));
+    age_cache_entry(
+        &cache,
+        "registry",
+        "revalidation-race",
+        Duration::from_hours(7),
+    );
     let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
     let slow_client = client.clone();
     let slow_url = format!("{}/slow-not-modified", server.uri());
@@ -186,7 +191,7 @@ async fn changed_registry_etag_replaces_the_cached_body_atomically() {
             Some("\"revision-1\"".to_owned()),
         )
         .unwrap();
-    age_cache_entry(&cache, "registry", "etag-changed", Duration::hours(7));
+    age_cache_entry(&cache, "registry", "etag-changed", Duration::from_hours(7));
     let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
 
     let value = client
@@ -222,7 +227,7 @@ async fn missing_registry_etag_forces_an_unconditional_refresh() {
     cache
         .put("registry", "missing-etag", &json!({"revision": 1}), None)
         .unwrap();
-    age_cache_entry(&cache, "registry", "missing-etag", Duration::hours(7));
+    age_cache_entry(&cache, "registry", "missing-etag", Duration::from_hours(7));
     let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());
 
     let value = client
@@ -271,7 +276,7 @@ async fn failed_registry_revalidation_preserves_the_stale_cache_entry() {
         &cache,
         "registry",
         "failed-revalidation",
-        Duration::hours(7),
+        Duration::from_hours(7),
     );
     let before = read_cache_entry(&cache, "registry", "failed-revalidation");
     let client = RegistryClient::new(HttpClient::new().unwrap(), cache.clone());

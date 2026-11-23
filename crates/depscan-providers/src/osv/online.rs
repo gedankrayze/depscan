@@ -3,7 +3,7 @@ use super::*;
 #[async_trait]
 impl VulnProvider for OsvClient {
     async fn query(&self, packages: &[Package]) -> Result<VulnQueryOutcome, ProviderError> {
-        let query_ttl = Duration::seconds(OSV_QUERY_TTL_SECS);
+        let query_ttl = Duration::from_secs(OSV_QUERY_TTL_SECS);
         let mut revisions_by_package = HashMap::<String, Vec<OsvVulnerabilityRevision>>::new();
         let mut errors = HashMap::<String, Vec<EnrichError>>::new();
         let mut first_failure = None;

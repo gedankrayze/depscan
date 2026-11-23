@@ -49,10 +49,7 @@ pub struct OsvOffline {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OsvDumpAge {
     Current,
-    Warn {
-        synced_at: DateTime<Utc>,
-        age: Duration,
-    },
+    Warn { synced_at: Timestamp, age: Duration },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +87,7 @@ impl OsvOffline {
         marker_path: &Path,
         marker: &mut File,
         ecosystem: Ecosystem,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<OsvDumpAge, ProviderError> {
         marker.rewind().map_err(|error| {
             ProviderError::Offline(format!(
@@ -105,15 +102,13 @@ impl OsvOffline {
                 marker_path.display()
             ))
         })?;
-        let synced_at = DateTime::parse_from_rfc3339(raw.trim())
-            .map(|timestamp| timestamp.with_timezone(&Utc))
-            .map_err(|error| {
-                ProviderError::Offline(format!(
-                    "invalid OSV dump timestamp {}: {error}; run `depscan sync --ecosystem {}`",
-                    marker_path.display(),
-                    ecosystem.display_name()
-                ))
-            })?;
+        let synced_at = Timestamp::parse(raw.trim()).map_err(|error| {
+            ProviderError::Offline(format!(
+                "invalid OSV dump timestamp {}: {error}; run `depscan sync --ecosystem {}`",
+                marker_path.display(),
+                ecosystem.display_name()
+            ))
+        })?;
         if synced_at > now {
             return Err(ProviderError::Offline(format!(
                 "OSV dump timestamp {} is in the future ({synced_at} > {now}); run `depscan sync --ecosystem {}`",
@@ -127,14 +122,14 @@ impl OsvOffline {
                 return Err(ProviderError::Offline(format!(
                     "OSV dump {} is stale: its age of {} seconds exceeds --max-cache-age ({} seconds); run `depscan sync --ecosystem {}`",
                     archive_path.display(),
-                    age.num_seconds(),
-                    max_age.num_seconds(),
+                    age.as_secs(),
+                    max_age.as_secs(),
                     ecosystem.display_name()
                 )));
             }
             return Ok(OsvDumpAge::Current);
         }
-        if age > Duration::seconds(OSV_DUMP_DEFAULT_WARNING_AGE_SECS) {
+        if age > Duration::from_secs(OSV_DUMP_DEFAULT_WARNING_AGE_SECS) {
             Ok(OsvDumpAge::Warn { synced_at, age })
         } else {
             Ok(OsvDumpAge::Current)
@@ -146,7 +141,7 @@ impl OsvOffline {
         &self,
         archive_path: &Path,
         ecosystem: Ecosystem,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<OsvDumpAge, ProviderError> {
         let directory =
             OfflineDirectory::open(self.cache.root()).map_err(offline_capability_error)?;
@@ -164,7 +159,7 @@ impl OsvOffline {
     pub(crate) fn query_blocking_at(
         &self,
         packages: &[Package],
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<VulnMap, ProviderError> {
         self.query_blocking_at_with_hook(packages, now, |_| {})
     }
@@ -172,7 +167,7 @@ impl OsvOffline {
     pub(crate) fn query_blocking_at_with_hook<F>(
         &self,
         packages: &[Package],
-        now: DateTime<Utc>,
+        now: Timestamp,
         hook: F,
     ) -> Result<VulnMap, ProviderError>
     where
@@ -217,7 +212,7 @@ impl OsvOffline {
                     ecosystem = ecosystem.osv_name(),
                     path = %dump.archive_path.display(),
                     %synced_at,
-                    age_seconds = age.num_seconds(),
+                    age_seconds = age.as_secs(),
                     warning_age_seconds = OSV_DUMP_DEFAULT_WARNING_AGE_SECS,
                     "OSV dump is older than the default seven-day warning age; run `depscan sync`"
                 );
@@ -259,7 +254,7 @@ impl OsvOffline {
     }
 
     pub(crate) fn query_blocking(&self, packages: &[Package]) -> Result<VulnMap, ProviderError> {
-        self.query_blocking_at(packages, Utc::now())
+        self.query_blocking_at(packages, Timestamp::now())
     }
 }
 #[async_trait]

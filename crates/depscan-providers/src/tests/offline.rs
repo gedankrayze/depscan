@@ -24,14 +24,14 @@ fn offline_dump_age_handles_fresh_stale_missing_malformed_and_future_markers() {
         provider
             .validate_dump_age_at(&archive, Ecosystem::Npm, now)
             .unwrap(),
-        OsvDumpAge::Warn { age, .. } if age == Duration::seconds(8 * 24 * 60 * 60 + 1)
+        OsvDumpAge::Warn { age, .. } if age == Duration::from_secs(8 * 24 * 60 * 60 + 1)
     ));
 
     let strict = OsvOffline::new(Cache {
         root: cache.root.clone(),
         policy: CachePolicy {
             read: true,
-            max_age: Some(Duration::days(7)),
+            max_age: Some(Duration::from_hours(168)),
         },
     });
     let stale = strict
@@ -209,7 +209,7 @@ fn offline_registry_reuses_valid_cached_metadata_for_every_ecosystem() {
     let cache = Cache::from_root(directory.path().join("cache"), CachePolicy::default()).unwrap();
     let provider = RegistryOffline::new(cache.clone());
     let now = test_timestamp("2026-08-19T12:00:00Z");
-    let stored_at = now - Duration::hours(1);
+    let stored_at = now - Duration::from_hours(1);
     let fixtures = [
         (
             Package::new(
@@ -294,7 +294,7 @@ fn offline_registry_reports_cache_age_and_integrity_failures_without_network() {
         "registry",
         &key,
         &CacheEntry {
-            stored_at: now - Duration::days(2),
+            stored_at: now - Duration::from_hours(48),
             etag: None,
             value: value.clone(),
         },
@@ -307,7 +307,7 @@ fn offline_registry_reports_cache_age_and_integrity_failures_without_network() {
         root: cache.root.clone(),
         policy: CachePolicy {
             read: true,
-            max_age: Some(Duration::days(7)),
+            max_age: Some(Duration::from_hours(168)),
         },
     });
     assert_eq!(
@@ -339,7 +339,7 @@ fn offline_registry_reports_cache_age_and_integrity_failures_without_network() {
         "registry",
         &key,
         &CacheEntry {
-            stored_at: now + Duration::seconds(1),
+            stored_at: now + Duration::from_secs(1),
             etag: None,
             value,
         },

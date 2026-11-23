@@ -152,3 +152,7 @@ preserves access to the complete originals of 39 condensed closed records.
 | [DS-120](DS-120.md) | P1 | Closed | Enforce a patched Rustls floor for downstream locks |
 | [DS-121](DS-121.md) | P2 | Closed | Do not mistake SemVer build metadata for prereleases |
 | [DS-122](DS-122.md) | P1 | Closed | Align the v2.0.5 maintenance release |
+| [DS-123](DS-123.md) | P2 | Closed | Refresh const-oid and compatible PKI types |
+| [DS-124](DS-124.md) | P2 | Closed | Coordinate Rust 1.100.0 and incoming PR qualification |
+| [DS-125](DS-125.md) | P2 | Closed | Remove the unmaintained Chrono dependency |
+| [DS-126](DS-126.md) | P1 | Closed | Align and qualify the v3.0.0 release |

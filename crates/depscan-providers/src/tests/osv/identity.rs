@@ -78,7 +78,7 @@ fn offline_nuget_matching_is_case_insensitive() {
     archive.finish().unwrap();
     fs::write(
         archive_path.with_extension("synced-at"),
-        Utc::now().to_rfc3339(),
+        Timestamp::now().to_rfc3339(),
     )
     .unwrap();
 

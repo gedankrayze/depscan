@@ -13,6 +13,54 @@ fn scan_args(arguments: &[&str]) -> ScanArgs {
     }
 }
 
+#[test]
+fn duration_options_preserve_limits_and_reject_scaling_overflow() {
+    assert_eq!(
+        "9223372036854775s".parse::<CacheAge>().unwrap().0.as_secs(),
+        9_223_372_036_854_775
+    );
+    for raw in [
+        "9223372036854776s",
+        "9223372036854775807d",
+        "-1s",
+        "1.5s",
+        "1w",
+    ] {
+        assert!(raw.parse::<CacheAge>().is_err(), "accepted {raw}");
+    }
+    assert!(parse_sync_timeout("0s").is_err());
+    assert_eq!(
+        parse_sync_timeout("2h").unwrap(),
+        StdDuration::from_secs(7_200)
+    );
+}
+
+#[test]
+fn suppression_expiry_accepts_only_valid_calendar_dates() {
+    for expires in ["2024-02-29", "\"2024-02-29\""] {
+        let config = loaded_config(
+            &format!("[[ignore]]\nid = 'test'\nexpires = {expires}"),
+            true,
+        );
+        let prepared =
+            merge_scan_config(scan_args(&["--config", "policy.toml", "."]), config).unwrap();
+        assert_eq!(
+            prepared.configured_ignores[0].expires,
+            Some(Date::new(2024, 2, 29).unwrap())
+        );
+    }
+    for expires in [
+        "\"2023-02-29\"",
+        "\"2024-2-29\"",
+        "\"2024-02-29T00:00:00Z\"",
+    ] {
+        assert!(
+            toml::from_str::<Config>(&format!("[[ignore]]\nid = 'test'\nexpires = {expires}"))
+                .is_err()
+        );
+    }
+}
+
 fn loaded_config(contents: &str, explicit: bool) -> LoadedConfig {
     LoadedConfig {
         value: toml::from_str(contents).expect("parse test config"),
@@ -77,7 +125,7 @@ expires = 2099-01-01
     assert!(prepared.args.no_cache);
     assert_eq!(
         prepared.args.max_cache_age.map(|age| age.0),
-        Duration::try_days(7)
+        Some(Duration::from_hours(7 * 24))
     );
     assert!(prepared.args.include_withdrawn);
     assert!(prepared.args.allow_tools);
@@ -148,7 +196,7 @@ id = "CONFIG-ID"
     assert!(prepared.args.no_cache);
     assert_eq!(
         prepared.args.max_cache_age.map(|age| age.0),
-        Duration::try_hours(2)
+        Some(Duration::from_hours(2))
     );
     assert!(prepared.args.include_withdrawn);
     assert!(prepared.args.allow_tools);

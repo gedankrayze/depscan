@@ -1,4 +1,4 @@
-use chrono::Utc;
+use depscan_core::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf, process::Command};
@@ -91,7 +91,7 @@ impl NugetProject {
         let directory = self.cache.join(namespace);
         fs::create_dir_all(&directory).expect("create cache namespace");
         let entry = json!({
-            "stored_at": Utc::now().to_rfc3339(),
+            "stored_at": Timestamp::now().to_rfc3339(),
             "etag": null,
             "value": value,
         });
