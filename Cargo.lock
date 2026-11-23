@@ -1286,9 +1286,9 @@ dependencies = [
 
 [[package]]
 name = "js-semver"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b45bf431971205e414201e87a76bdd4c75316dc44c890e9df4d9006ee5d2896c"
+checksum = "2b3aefc67794613205d63d536c22cf4bd2e5311b028f49a5f6f573082f42294d"
 
 [[package]]
 name = "js-sys"
