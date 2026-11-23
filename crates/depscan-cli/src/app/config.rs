@@ -27,7 +27,7 @@ pub(super) struct IgnoreConfig {
     pub(super) id: String,
     pub(super) reason: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_date")]
-    pub(super) expires: Option<NaiveDate>,
+    pub(super) expires: Option<Date>,
 }
 
 #[derive(Debug)]
@@ -69,7 +69,7 @@ pub(super) struct PreparedScan {
     pub(super) confined_output: Option<ConfinedOutput>,
 }
 
-fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -86,7 +86,12 @@ where
             )));
         }
     };
-    NaiveDate::parse_from_str(&raw, "%Y-%m-%d")
+    if raw.len() != 10 || raw.as_bytes()[4] != b'-' || raw.as_bytes()[7] != b'-' {
+        return Err(serde::de::Error::custom(format!(
+            "invalid suppression expiry date {raw:?}"
+        )));
+    }
+    raw.parse::<Date>()
         .map(Some)
         .map_err(|_| serde::de::Error::custom(format!("invalid suppression expiry date {raw:?}")))
 }
@@ -96,7 +101,7 @@ pub(super) struct SuppressionRule {
     pub(super) id: String,
     pub(super) source: SuppressionSource,
     pub(super) reason: Option<String>,
-    pub(super) expires: Option<NaiveDate>,
+    pub(super) expires: Option<Date>,
     pub(super) state: SuppressionState,
 }
 
@@ -337,11 +342,10 @@ where
 
 pub(super) fn parse_sync_timeout(value: &str) -> Result<StdDuration, String> {
     let CacheAge(timeout) = value.parse()?;
-    if timeout == Duration::zero() {
+    if timeout == Duration::ZERO {
         return Err("sync transfer timeout must be greater than zero".to_owned());
     }
-    timeout
-        .to_std()
+    StdDuration::try_from(timeout)
         .map_err(|_| format!("sync transfer timeout {value:?} is outside the supported range"))
 }
 fn determine_format(args: &ScanArgs) -> Result<OutputFormat, String> {

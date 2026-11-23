@@ -241,7 +241,7 @@ async fn valid_empty_osv_batch_results_preserve_alignment_and_are_cached() {
             .get(
                 "osv/query",
                 &osv_query_cache_key(package),
-                Duration::seconds(OSV_QUERY_TTL_SECS),
+                Duration::from_secs(OSV_QUERY_TTL_SECS),
             )
             .unwrap();
         assert_eq!(cached, json!([]));

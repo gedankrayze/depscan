@@ -1,8 +1,7 @@
 use crate::{
-    Ecosystem, EnrichError, LatestVersions, Package, SCHEMA_VERSION, SuppressedFinding,
+    Ecosystem, EnrichError, LatestVersions, Package, SCHEMA_VERSION, SuppressedFinding, Timestamp,
     Vulnerability, compare_versions,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -21,19 +20,19 @@ pub struct ScanResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanDocument {
     pub schema_version: u32,
-    pub generated_at: DateTime<Utc>,
+    pub generated_at: Timestamp,
     pub results: Vec<ScanResult>,
 }
 
 impl ScanDocument {
     pub fn new(results: Vec<ScanResult>) -> Self {
-        Self::at(results, Utc::now())
+        Self::at(results, Timestamp::now())
     }
 
     /// Build a scan document with an orchestration-supplied timestamp and canonical collection
     /// ordering. Supplying the time makes byte-reproducible JSON possible without weakening the
     /// default, real-time timestamp used by [`Self::new`].
-    pub fn at(mut results: Vec<ScanResult>, generated_at: DateTime<Utc>) -> Self {
+    pub fn at(mut results: Vec<ScanResult>, generated_at: Timestamp) -> Self {
         for result in &mut results {
             for vulnerability in &mut result.vulns {
                 canonicalize_vulnerability(vulnerability, result.package.ecosystem);

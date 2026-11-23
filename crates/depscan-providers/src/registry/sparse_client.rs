@@ -15,7 +15,7 @@ impl RegistryClient {
         expected_name: &str,
         url: &str,
     ) -> Result<Vec<CratesIndexEntry>, ProviderError> {
-        let ttl = Duration::seconds(REGISTRY_TTL_SECS);
+        let ttl = Duration::from_secs(REGISTRY_TTL_SECS);
         let mut generation = self.cache.snapshot("registry", key, ttl).await;
         let cached = self
             .cache

@@ -45,7 +45,7 @@ impl OsvClient {
         batch: &[Package],
     ) -> Vec<Result<Vec<OsvVulnerabilityRevision>, ProviderError>> {
         let url = format!("{}/v1/querybatch", self.base_url);
-        let mut revisions = vec![BTreeMap::<String, DateTime<Utc>>::new(); batch.len()];
+        let mut revisions = vec![BTreeMap::<String, Timestamp>::new(); batch.len()];
         let mut failures = vec![None::<ProviderError>; batch.len()];
         let mut seen_tokens = vec![BTreeSet::new(); batch.len()];
         let mut pages_seen = vec![0usize; batch.len()];
@@ -163,7 +163,7 @@ impl OsvClient {
         candidate_reusable: bool,
     ) -> Result<PublishedHydration, ProviderError> {
         let candidate_modified = validate_osv_document(value, Some(id))?.modified;
-        let ttl = Duration::hours(24 * 3650);
+        let ttl = Duration::from_hours(24 * 3650);
         let mut generation = self.cache.snapshot("osv/vuln", cache_key, ttl).await;
         for _ in 0..CACHE_COMMIT_ATTEMPTS {
             if let Some(current) = &generation
@@ -208,7 +208,7 @@ impl OsvClient {
         let cache_key = revision.cache_key();
         if let Some((value, _)) = self
             .cache
-            .get_if_fresh("osv/vuln", &cache_key, Duration::hours(24 * 3650))
+            .get_if_fresh("osv/vuln", &cache_key, Duration::from_hours(24 * 3650))
             .await
         {
             match validate_osv_document(&value, Some(&revision.id)) {

@@ -236,6 +236,8 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-121 | Stable SemVer build metadata, real prerelease/yanked exclusions, and mocked sparse HTTP selection for WASI-style versions |
 | DS-122 | v2.0.5 workspace/action/README/report/acceptance alignment, release gate, retained MSRV, exact asset plan, and separate immutable public-artifact/native acceptance |
 | DS-123 | const-oid 0.10.3 and rustls-pki-types 1.16.0 graph/MSRV checks, TLS incident and control-chain regressions, full deterministic suite/strict Clippy, fresh dependency audit, and hosted native/MSRV checks |
+| DS-124 | Coordinated Rust 1.100.0 pins/image, external executable validation, combined incoming dependency graph, and retained MSRV |
+| DS-125 | Maintained time dependency, timestamp/cache wire compatibility, actual-clock suppression/TTL boundaries, and warning-free fresh audit |
 
 ## Platform and external evidence boundary
 

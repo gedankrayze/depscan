@@ -56,7 +56,7 @@ fn future_empty_osv_query_cache_cannot_turn_a_total_outage_clean() {
     project.set_cache_timestamp(
         "osv/query",
         QUERY_DIGEST,
-        Utc::now() + chrono::Duration::days(1),
+        Timestamp::now() + depscan_core::Duration::from_hours(24),
     );
 
     let output = command(&project.cache)
@@ -86,7 +86,7 @@ fn future_empty_osv_query_failure_is_soft_beside_a_trustworthy_cached_result() {
     project.set_cache_timestamp(
         "osv/query",
         QUERY_DIGEST,
-        Utc::now() + chrono::Duration::days(1),
+        Timestamp::now() + depscan_core::Duration::from_hours(24),
     );
     project.add_rust_package("trusted-cache");
     project.seed_empty_osv_query("trusted-cache");

@@ -1,5 +1,5 @@
 use super::*;
-use chrono::NaiveDate;
+use depscan_core::Date;
 use depscan_core::{
     Ecosystem, EnrichError, LatestVersions, Package, ScanResult, Severity, Staleness,
     SuppressedFinding, SuppressionMatch, SuppressionSource, SuppressionState, Vulnerability,
@@ -114,7 +114,7 @@ fn suppression_document(active: bool) -> ScanDocument {
         matched_id: "CVE-2099-0001".to_owned(),
         source: SuppressionSource::Config,
         reason: Some("accepted until the next release".to_owned()),
-        expires: NaiveDate::from_ymd_opt(2099, 1, 1),
+        expires: Date::new(2099, 1, 1).ok(),
         state: if active {
             SuppressionState::Active
         } else {
@@ -126,7 +126,7 @@ fn suppression_document(active: bool) -> ScanDocument {
             matched_id: "GHSA-SUPPRESSED".to_owned(),
             source: SuppressionSource::Config,
             reason: Some("old exception".to_owned()),
-            expires: NaiveDate::from_ymd_opt(2020, 1, 1),
+            expires: Date::new(2020, 1, 1).ok(),
             state: SuppressionState::Expired,
         });
     }

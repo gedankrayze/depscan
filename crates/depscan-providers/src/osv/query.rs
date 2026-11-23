@@ -60,22 +60,18 @@ pub(crate) fn invalid_osv_batch_response(message: impl Into<String>) -> Provider
 #[serde(deny_unknown_fields)]
 pub(crate) struct OsvVulnerabilityRevision {
     pub(crate) id: String,
-    pub(crate) modified: DateTime<Utc>,
+    pub(crate) modified: Timestamp,
 }
 
 impl OsvVulnerabilityRevision {
     pub(crate) fn cache_key(&self) -> String {
-        format!(
-            "{}@{}",
-            self.id,
-            self.modified.to_rfc3339_opts(SecondsFormat::AutoSi, true)
-        )
+        format!("{}@{}", self.id, self.modified.to_rfc3339_z())
     }
 }
 
 pub(crate) fn canonical_osv_revisions(value: Value) -> Option<Vec<OsvVulnerabilityRevision>> {
     let parsed = serde_json::from_value::<Vec<OsvVulnerabilityRevision>>(value).ok()?;
-    let mut revisions = BTreeMap::<String, DateTime<Utc>>::new();
+    let mut revisions = BTreeMap::<String, Timestamp>::new();
     for revision in parsed {
         if !valid_osv_id(&revision.id) {
             return None;
@@ -96,15 +92,13 @@ pub(crate) fn canonical_osv_revisions(value: Value) -> Option<Vec<OsvVulnerabili
 pub(crate) fn parse_osv_modified(
     value: &Value,
     context: impl std::fmt::Display,
-) -> Result<DateTime<Utc>, ProviderError> {
+) -> Result<Timestamp, ProviderError> {
     let raw = value.as_str().ok_or_else(|| {
         invalid_osv_batch_response(format!("{context} has no string modified timestamp"))
     })?;
-    DateTime::parse_from_rfc3339(raw)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|_| {
-            invalid_osv_batch_response(format!("{context} has an invalid modified timestamp"))
-        })
+    Timestamp::parse(raw).map_err(|_| {
+        invalid_osv_batch_response(format!("{context} has an invalid modified timestamp"))
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]

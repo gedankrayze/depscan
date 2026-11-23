@@ -132,7 +132,7 @@ impl RegistryClient {
         headers: HeaderMap,
         max_bytes: Option<usize>,
     ) -> Result<Value, ProviderError> {
-        let ttl = Duration::seconds(REGISTRY_TTL_SECS);
+        let ttl = Duration::from_secs(REGISTRY_TTL_SECS);
         let mut generation = self.cache.snapshot("registry", namespace, ttl).await;
         let cached = self.cache.policy.read.then(|| generation.clone()).flatten();
         if let Some(cached) = &cached

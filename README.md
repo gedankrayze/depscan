@@ -160,6 +160,8 @@ In that mode, equivalent scan results have canonical package, vulnerability, ali
 
 `SOURCE_DATE_EPOCH` changes report time only. Suppression expiry always uses the real UTC scan date, so reproducing an older report cannot reactivate an expired exception. SARIF omits unavailable advisory help links and URI-encodes source paths, including native Windows paths.
 
+Shared timestamps use maintained Jiff time types while retaining the existing UTC report/cache encoding and nanosecond precision. Inputs require seconds and an explicit RFC 3339 offset; unsupported years, leap seconds, and fractions longer than nine digits are rejected rather than silently normalized. Suppression expiry remains a date (`YYYY-MM-DD`).
+
 The current JSON report schema is version `4`. Version `1` represented `results[].suppressed` as advisory-ID strings; version `2` replaced those strings with audit objects containing the complete vulnerability, whether the suppression was active, and every matching rule's ID/alias, CLI/config source, reason, expiry, and active/expired state. Version `3` adds `results[].package.direct_known` and `dev_known` so unknown classifications are no longer serialized as apparent facts. Version `4` adds `results[].package.manifest_constraint`, retaining both its source spelling (`raw`) and registry-standard evaluator form (`normalized`). Consumers must branch on `schema_version`. Only matching suppression and manifest-constraint fields are emitted—other configuration values are never copied into a report.
 
 | Exit code | Meaning |
@@ -239,7 +241,7 @@ Version freshness is evaluated from cached registry metadata when a usable entry
 
 ## Development
 
-The pinned toolchain is Rust 1.99.1 (verified on 2026-10-20), with a supported MSRV of Rust 1.96.0 retained for compatibility. The N−2 stable policy remains the target for scheduled MSRV reviews; this update does not raise the supported floor. Toolchain updates must coordinate native CI pins, release-quality commands, and the digest-pinned static builder image, then verify both stable and MSRV before merging.
+The pinned toolchain is Rust 1.100.0 (verified on 2026-11-23), with a supported MSRV of Rust 1.96.0 retained for compatibility. The N−2 stable policy remains the target for scheduled MSRV reviews; this update does not raise the supported floor. Toolchain updates must coordinate native CI pins, release-quality commands, and the digest-pinned static builder image, then verify both stable and MSRV before merging.
 
 The workspace is divided at its architectural boundaries:
 

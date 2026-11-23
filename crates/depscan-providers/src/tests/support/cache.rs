@@ -25,7 +25,7 @@ pub(crate) fn write_cache_entry(cache: &Cache, namespace: &str, key: &str, entry
 
 pub(crate) fn age_cache_entry(cache: &Cache, namespace: &str, key: &str, age: Duration) {
     let mut entry = read_cache_entry(cache, namespace, key);
-    entry.stored_at = Utc::now() - age;
+    entry.stored_at = Timestamp::now() - age;
     write_cache_entry(cache, namespace, key, &entry);
 }
 
@@ -33,15 +33,13 @@ pub(crate) fn set_cache_entry_timestamp(
     cache: &Cache,
     namespace: &str,
     key: &str,
-    stored_at: DateTime<Utc>,
+    stored_at: Timestamp,
 ) {
     let mut entry = read_cache_entry(cache, namespace, key);
     entry.stored_at = stored_at;
     write_cache_entry(cache, namespace, key, &entry);
 }
 
-pub(crate) fn test_timestamp(value: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(value)
-        .unwrap()
-        .with_timezone(&Utc)
+pub(crate) fn test_timestamp(value: &str) -> Timestamp {
+    Timestamp::parse(value).unwrap()
 }
