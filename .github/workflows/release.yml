@@ -46,11 +46,13 @@ on:
       - 'Cargo.toml'
       - 'action.yml'
       - 'crates/*/Cargo.toml'
+      - 'crates/depscan-cli/wix/**'
       - 'rust-toolchain.toml'
       - 'scripts/github-action/**'
       - 'scripts/verify-github-action.sh'
       - 'scripts/verify-release-assets.sh'
       - 'scripts/verify-release-workflow.sh'
+      - 'scripts/windows-msi/**'
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
@@ -176,6 +178,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
+      - name: Build native MSI PATH helper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-msi/build-path-helper.ps1 -OutputDirectory target/msi-helper
       - name: Build artifacts
         shell: bash
         run: |

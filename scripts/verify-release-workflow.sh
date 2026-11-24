@@ -369,5 +369,6 @@ fi
 
 shellcheck "$asset_verifier"
 shellcheck "$static_verifier"
+python3 scripts/windows-msi/check-source.py
 
 echo "release workflow pins, verified bootstrap, and permissions verified"

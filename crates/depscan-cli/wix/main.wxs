@@ -79,8 +79,23 @@
             />
 
         <MajorUpgrade
-            Schedule='afterInstallInitialize'
+            Schedule='afterInstallExecute'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <!-- MSI owns PATH entries. This helper preserves only the registry value type. -->
+        <!-- cargo-dist stages application binaries separately; the helper stays in target. -->
+        <Binary Id='DepscanPathType' SourceFile='$(var.CargoTargetDir)\msi-helper\depscan-msi-path.dll'/>
+        <CustomAction Id='DepscanCapturePathType' BinaryKey='DepscanPathType'
+            DllEntry='CapturePathType' Execute='immediate' Return='check'/>
+        <CustomAction Id='DepscanRollbackPathType' BinaryKey='DepscanPathType'
+            DllEntry='RestorePathType' Execute='rollback' Impersonate='no' Return='check'/>
+        <CustomAction Id='DepscanRestorePathType' BinaryKey='DepscanPathType'
+            DllEntry='RestorePathType' Execute='deferred' Impersonate='no' Return='check'/>
+        <InstallExecuteSequence>
+            <Custom Action='DepscanCapturePathType' Before='InstallInitialize'>1</Custom>
+            <Custom Action='DepscanRollbackPathType' After='InstallInitialize'>1</Custom>
+            <Custom Action='DepscanRestorePathType' After='RemoveExistingProducts'>1</Custom>
+        </InstallExecuteSequence>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
         <Property Id='DiskPrompt' Value='depscan-cli Installation'/>

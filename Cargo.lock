@@ -85,9 +85,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.52"
+version = "0.4.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ad47a740fb906fffdd891e8b6d5fde2511600f7bfaebd68939fa08a14999459"
+checksum = "7bde8322bfc31ade96978b8d3c06be0fd60401192e7ddb9a0b2de5e215d22e61"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -457,7 +457,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "depscan-cli"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-core"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "async-trait",
  "jiff",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-parsers"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "base64 0.23.1",
  "cap-fs-ext",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-providers"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "async-trait",
  "cap-fs-ext",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "depscan-report"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "depscan-core",
  "percent-encoding",
@@ -932,9 +932,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.12.0"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
+checksum = "229c6ff5584df4c6becbfe00567128bac768c8cd32ebc8a8366bd81ed072e8f3"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1381,9 +1381,9 @@ dependencies = [
 
 [[package]]
 name = "noyalib"
-version = "0.0.63"
+version = "0.0.64"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f132f5ea38d74a519b65995b2f7dc7714a8b34df53952eb744107af7c1645a87"
+checksum = "c3cf2ffa70c599216d9382e0d5c6be46e487ca311ad32d330b7e331246eea0ae"
 dependencies = [
  "hashbrown",
  "indexmap",
