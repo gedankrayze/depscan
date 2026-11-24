@@ -156,4 +156,5 @@ preserves access to the complete originals of 39 condensed closed records.
 | [DS-124](DS-124.md) | P2 | Closed | Coordinate Rust 1.100.0 and incoming PR qualification |
 | [DS-125](DS-125.md) | P2 | Closed | Remove the unmaintained Chrono dependency |
 | [DS-126](DS-126.md) | P1 | Closed | Align and qualify the v3.0.0 release |
-| [DS-127](DS-127.md) | P2 | Open | Preserve machine PATH registry type across MSI operations |
+| [DS-127](DS-127.md) | P2 | Closed | Preserve machine PATH registry type across MSI operations |
+| [DS-128](DS-128.md) | P2 | Closed | Align and qualify the v3.0.1 MSI maintenance release |

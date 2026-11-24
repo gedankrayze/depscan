@@ -93,18 +93,18 @@ Cargo-dist 0.34.0 generates the release plan; the MSI definition is maintained s
 
 Windows CI checks MSI installation, repair, upgrades, uninstall, rollback, and PATH
 registry-type preservation. See [native MSI verification](docs/maintenance.md#windows-msi-verification)
-for the local procedure. The published v3.0.0 MSI remains affected by
-[DS-127](docs/issues/DS-127.md); its fix requires a new release.
+for the local procedure. v3.0.1 fixes [DS-127](docs/issues/DS-127.md); the immutable
+v3.0.0 MSI remains affected. See the [v3.0.1 release notes](docs/releases/v3.0.1.md).
 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v3.0.0 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v3.0.1 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
 
-Security updates require a new binary: v3.0.0 retains the eMudhra intermediate-key
+Security updates require a new binary: v3.0.1 retains the eMudhra intermediate-key
 distrust fix and patched Tokio, and enforces a patched native Rustls dependency floor.
 Keep operating-system and CI-runner trust stores
 updated too; release installers use the runner's HTTPS client before DepScan starts.
@@ -136,9 +136,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v3.0.0
+    uses: gedankrayze/depscan@v3.0.1
     with:
-      version: v3.0.0
+      version: v3.0.1
       path: .
       format: sarif
       output: depscan.sarif

@@ -240,6 +240,7 @@ Pull-request CI runs the complete deterministic suite on Linux, macOS, and Windo
 | DS-125 | Maintained time dependency, timestamp/cache wire compatibility, actual-clock suppression/TTL boundaries, and warning-free fresh audit |
 | DS-126 | v3.0.0 workspace/action/README/report/acceptance alignment, Rust API migration notes, release/MSRV/freshness gates, exact asset plan, and separate immutable/native public acceptance |
 | DS-127 | Native MSI install/repair/uninstall, both PATH types and expansion references, upgrade/failed-upgrade rollback, isolated registry byte/type tests, compiled MSI contract and cargo-dist source guards; [review](reviews/2026-11-24-native-msi.md) |
+| DS-128 | v3.0.1 version/action/README/report/acceptance alignment, PR #96, frozen release/freshness gates and separate immutable/public native MSI acceptance |
 
 ## Platform and external evidence boundary
 
