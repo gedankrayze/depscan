@@ -43,6 +43,14 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Build CLI
         run: cargo build --release --locked -p depscan-cli
+      - name: Verify native Windows MSI lifecycle and rollback
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/windows-msi/verify.ps1 `
+            -BinaryDirectory target/release `
+            -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'depscan-msi-regression') `
+            -ExercisePathFixtures
       - name: Verify Windows action runner ignores a workspace executable decoy
         if: runner.os == 'Windows'
         shell: pwsh

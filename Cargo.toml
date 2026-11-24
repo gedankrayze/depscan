@@ -80,7 +80,7 @@ inherits = "release"
 
 [workspace.metadata.dist]
 dist = true
-allow-dirty = ["ci"] # release.yml contains reviewed permission, gating, and lint hardening
+allow-dirty = ["ci", "msi"] # Reviewed workflow/MSI overrides; checked by verify-release-workflow.sh
 cargo-dist-version = "0.34.0"
 ci = "github"
 installers = ["shell", "msi"]
