@@ -6,9 +6,15 @@
 - The integration path is `ticket/*` -> `develop` -> `main`. Do not push directly to `main`.
 - Do not commit, push, merge, create or move tags, publish releases, or change remote
   repository settings without the user's explicit permission for that action.
+- Keep GitHub's "Automatically delete head branches" setting enabled for merged PR
+  branches in this repository. Always preserve `main` and `develop`, locally and remotely,
+  including after a `develop` -> `main` merge. Keep the "Preserve main and develop"
+  deletion-only ruleset active with no bypass actors; never disable or bypass it
+  for cleanup.
 - After a local integration, prove the ticket branch is an ancestor of the target branch,
-  then delete the merged local ticket branch. Delete a remote branch only with explicit
-  permission and after separately verifying its merged state.
+  then delete the merged local ticket branch. Manual remote branch deletion still
+  requires explicit permission and a fresh check that its current tip belongs to
+  the merged PR.
 - Immediately before every authorized remote push, run `bash scripts/pre-push-check.sh`.
   If it reports incoming pull requests, process all of them with the PR-triage workflow
   and rerun the check successfully before pushing. The `develop` -> `main` integration PR
