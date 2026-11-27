@@ -14,12 +14,20 @@ description: Inspect and process incoming DepScan pull requests and GitHub Actio
    test, workflow, runner, and external-service causes. Do not rerun blindly.
 5. Reject automated changes to intentionally vulnerable or frozen fixtures unless the
    fixture contract itself is being changed deliberately.
-6. Do not edit, close, merge, label, comment, rerun, or delete branches until the user
-   authorizes those remote mutations.
+6. Do not edit, close, merge, label, comment, rerun, or manually delete remote branches
+   until the user authorizes those mutations.
 7. Before an authorized merge, require current-head required checks, verify the source
    branch and review state again, and ensure the local worktree has no unpublished scope.
-8. Before any later remote push, run `bash scripts/pre-push-check.sh`. Process every
+8. Let GitHub's "Automatically delete head branches" setting clean up merged PR heads
+   in this repository. Always preserve `main` and `develop`, locally and remotely;
+   never use `--delete-branch` when merging `develop` into `main`. Keep the
+   "Preserve main and develop" deletion-only ruleset active with no bypass actors.
+   Check whether the merged head is already gone before attempting manual cleanup.
+   Remove only its stale `origin/...` tracking reference after verifying the merged
+   PR, remote absence, and that the cached tip matches the merged PR head. Preserve
+   any changed or unmerged tip.
+9. Before any later remote push, run `bash scripts/pre-push-check.sh`. Process every
    reported incoming PR first, then rerun the check until it passes. The outgoing
    `develop` -> `main` integration PR is excluded from the sweep.
-9. Report one compact run inventory with exact run/job links or IDs, then the recommended
-   disposition for each PR.
+10. Report one compact run inventory with exact run/job links or IDs, then the recommended
+    disposition for each PR.
