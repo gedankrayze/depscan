@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -43,10 +44,19 @@ def main() -> int:
     root_text = git(Path.cwd(), "rev-parse", "--show-toplevel")
     if root_text is None:
         return 0
+    root = Path(root_text)
+    setup_note = ""
+    try:
+        subprocess.run(
+            [sys.executable, str(root / "scripts/setup-project.py")], cwd=root,
+            check=True, capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        setup_note = " Snapshot exclusion setup failed; run python3 scripts/setup-project.py to diagnose."
     output = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": context(Path(root_text)),
+            "additionalContext": context(root) + setup_note,
         }
     }
     print(json.dumps(output))

@@ -1,8 +1,9 @@
-# Rust build artifacts
+# BEGIN DepScan build artifacts
 /target/
 **/target/
 **/*.rs.bk
 *.pdb
+# END DepScan build artifacts
 
 # JetBrains IDEs
 .idea/

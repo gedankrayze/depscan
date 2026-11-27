@@ -93,18 +93,18 @@ Cargo-dist 0.34.0 generates the release plan; the MSI definition is maintained s
 
 Windows CI checks MSI installation, repair, upgrades, uninstall, rollback, and PATH
 registry-type preservation. See [native MSI verification](docs/maintenance.md#windows-msi-verification)
-for the local procedure. v3.0.1 fixes [DS-127](docs/issues/DS-127.md); the immutable
-v3.0.0 MSI remains affected. See the [v3.0.1 release notes](docs/releases/v3.0.1.md).
+for the local procedure. v3.0.1 and later fix [DS-127](docs/issues/DS-127.md); the immutable
+v3.0.0 MSI remains affected. See the [v3.0.2 release notes](docs/releases/v3.0.2.md).
 
 After a release, verify a downloaded artifact before running it:
 
 ```bash
-gh release download v3.0.1 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
+gh release download v3.0.2 --repo gedankrayze/depscan --pattern 'depscan-cli-aarch64-apple-darwin.tar.xz*'
 grep -v '^[[:space:]]*$' depscan-cli-aarch64-apple-darwin.tar.xz.sha256 | shasum -a 256 -c -
 gh attestation verify depscan-cli-aarch64-apple-darwin.tar.xz --repo gedankrayze/depscan
 ```
 
-Security updates require a new binary: v3.0.1 retains the eMudhra intermediate-key
+Security updates require a new binary: v3.0.2 retains the eMudhra intermediate-key
 distrust fix and patched Tokio, and enforces a patched native Rustls dependency floor.
 Keep operating-system and CI-runner trust stores
 updated too; release installers use the runner's HTTPS client before DepScan starts.
@@ -136,9 +136,9 @@ steps:
     with:
       persist-credentials: false
   - id: depscan
-    uses: gedankrayze/depscan@v3.0.1
+    uses: gedankrayze/depscan@v3.0.2
     with:
-      version: v3.0.1
+      version: v3.0.2
       path: .
       format: sarif
       output: depscan.sarif
@@ -280,10 +280,18 @@ tests, action and release verifiers, and patch hygiene; release mode adds packag
 release-binary verification. Run focused tests while iterating, then one full gate on the
 frozen tree.
 
+Each mode first runs [`scripts/setup-project.py`](scripts/setup-project.py), which copies
+the marked build artifact rules from `.gitignore` into Git's local `info/exclude` file.
+This keeps root and nested `target/` outputs, Rust backups, and debug symbols out of
+Git-based snapshots even on older branches without `.gitignore`. Setup preserves existing
+local exclusions and is safe to rerun, including from linked worktrees. To install it
+without building, run `python3 scripts/setup-project.py` after cloning.
+
 Repository-specific agent guidance lives in [`AGENTS.md`](AGENTS.md), with focused change,
 pull-request-triage, and release skills under [`.agents/skills`](.agents/skills). Optional
 Codex project hooks under [`.codex`](.codex) provide session context and block direct-main,
-force-push, and release-tag mutation commands. Review and trust non-managed hooks through
+force-push, and release-tag mutation commands. The session hook also runs project setup.
+Review and trust non-managed hooks through
 `/hooks`; hooks are guardrails, while protected branches, tag rules, and CI remain the
 authoritative controls.
 

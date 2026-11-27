@@ -10,6 +10,7 @@ required_files=(
   .agents/skills/depscan-pr-triage/SKILL.md
   .agents/skills/depscan-release/SKILL.md
   scripts/dev-gate.sh
+  scripts/setup-project.py
   scripts/pre-push-check.sh
   scripts/check-dependency-freshness.sh
   scripts/check-issue-size.py
