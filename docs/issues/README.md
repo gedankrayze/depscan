@@ -160,3 +160,4 @@ preserves access to the complete originals of 39 condensed closed records.
 | [DS-128](DS-128.md) | P2 | Closed | Align and qualify the v3.0.1 MSI maintenance release |
 | [DS-129](DS-129.md) | P2 | Closed | Install snapshot exclusions during project setup |
 | [DS-130](DS-130.md) | P2 | Closed | Complete dependency freshness after incoming PR integration |
+| [DS-131](DS-131.md) | P2 | Closed | Align and qualify the v3.0.2 maintenance release |
