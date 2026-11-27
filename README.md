@@ -280,10 +280,18 @@ tests, action and release verifiers, and patch hygiene; release mode adds packag
 release-binary verification. Run focused tests while iterating, then one full gate on the
 frozen tree.
 
+Each mode first runs [`scripts/setup-project.py`](scripts/setup-project.py), which copies
+the marked build artifact rules from `.gitignore` into Git's local `info/exclude` file.
+This keeps root and nested `target/` outputs, Rust backups, and debug symbols out of
+Git-based snapshots even on older branches without `.gitignore`. Setup preserves existing
+local exclusions and is safe to rerun, including from linked worktrees. To install it
+without building, run `python3 scripts/setup-project.py` after cloning.
+
 Repository-specific agent guidance lives in [`AGENTS.md`](AGENTS.md), with focused change,
 pull-request-triage, and release skills under [`.agents/skills`](.agents/skills). Optional
 Codex project hooks under [`.codex`](.codex) provide session context and block direct-main,
-force-push, and release-tag mutation commands. Review and trust non-managed hooks through
+force-push, and release-tag mutation commands. The session hook also runs project setup.
+Review and trust non-managed hooks through
 `/hooks`; hooks are guardrails, while protected branches, tag rules, and CI remain the
 authoritative controls.
 

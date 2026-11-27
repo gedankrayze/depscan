@@ -31,6 +31,7 @@ purge_packaging_caches() {
 }
 
 quick_gates() {
+  run python3 scripts/setup-project.py
   run bash scripts/check-rust-architecture.sh
   run bash scripts/verify-agent-automation.sh
   run bash scripts/verify-ci-policy.sh
@@ -40,6 +41,7 @@ quick_gates() {
 }
 
 full_gates() {
+  run python3 scripts/setup-project.py
   run bash scripts/check-rust-architecture.sh
   run bash scripts/verify-agent-automation.sh
   run bash scripts/verify-ci-policy.sh

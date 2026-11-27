@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +18,33 @@ SPEC.loader.exec_module(session_context)
 
 
 class SessionContextTests(unittest.TestCase):
+    def test_startup_installs_exclusions_and_keeps_hook_output_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+            source = HOOK.parents[2]
+            shutil.copy2(source / ".gitignore", root / ".gitignore")
+            (root / "scripts").mkdir()
+            shutil.copy2(source / "scripts/setup-project.py", root / "scripts/setup-project.py")
+            result = subprocess.run(
+                [sys.executable, str(HOOK)], cwd=root, check=True, capture_output=True, text=True,
+            )
+            output = json.loads(result.stdout)["hookSpecificOutput"]
+            self.assertEqual(output["hookEventName"], "SessionStart")
+            self.assertNotIn("setup failed", output["additionalContext"])
+            self.assertIn(b"**/target/", (root / ".git/info/exclude").read_bytes())
+
+    def test_startup_reports_setup_failure_in_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+            result = subprocess.run(
+                [sys.executable, str(HOOK)], cwd=root, check=True, capture_output=True, text=True,
+            )
+            output = json.loads(result.stdout)["hookSpecificOutput"]
+            self.assertIn("Snapshot exclusion setup failed", output["additionalContext"])
+            self.assertIn("python3 scripts/setup-project.py", output["additionalContext"])
+
     def test_reports_branch_dirty_count_and_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

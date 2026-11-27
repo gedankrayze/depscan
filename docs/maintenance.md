@@ -1,5 +1,23 @@
 # Dependency freshness and post-push cleanup
 
+## Clone setup and snapshot exclusions
+
+The marked build artifact section in `.gitignore` is the source of truth for snapshot
+exclusions. Every `scripts/dev-gate.sh` mode and the trusted Codex session-start hook run
+`python3 scripts/setup-project.py`. Contributors can also run that command directly
+after cloning; it needs only Python 3 and Git.
+
+Git does not execute project setup during a clone. The checked-in `.gitignore` protects
+the fresh checkout immediately; setup installs the same build patterns into Git's local
+`info/exclude`, so they remain active across branch switches. Linked worktrees use the
+common repository's exclusion file. Existing entries are preserved; repeated setup adds
+only missing patterns under an exclusive lock and atomically replaces the file. It does
+not change global Git configuration, install Git hooks, or modify the index or refs.
+
+Git-based snapshot tools must respect ignore rules; already tracked files and explicit
+force-add operations bypass ignores. Keep build outputs untracked and never force-add
+them for snapshots. This prevents new captures; it does not prune old Git objects.
+
 ## Before every authorized push
 
 Run `bash scripts/pre-push-check.sh` immediately before pushing. Process incoming
